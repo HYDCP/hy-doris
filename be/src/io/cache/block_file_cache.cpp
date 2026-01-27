@@ -1118,6 +1118,7 @@ bool BlockFileCache::try_reserve(const UInt128Wrapper& hash, const CacheContext&
         !try_reserve_from_other_queue(context.cache_type, size, cur_time, cache_lock)) {
         return false;
     }
+
     query_context->reserve(hash, offset, size, cache_lock);
     return true;
 }
