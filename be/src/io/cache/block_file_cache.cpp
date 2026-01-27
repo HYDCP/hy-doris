@@ -1119,6 +1119,7 @@ bool BlockFileCache::try_reserve(const UInt128Wrapper& hash, const CacheContext&
         return false;
     }
     query_context->reserve(hash, offset, size, cache_lock);
+
     return true;
 }
 
