@@ -177,6 +177,7 @@ BlockFileCache::BlockFileCache(const std::string& cache_base_path,
     _evict_by_size_metrics_matrix[FileCacheType::INDEX][FileCacheType::NORMAL] =
             std::make_shared<bvar::Adder<size_t>>(_cache_base_path.c_str(),
                                                   "file_cache_evict_by_size_index_to_normal");
+
     _evict_by_size_metrics_matrix[FileCacheType::INDEX][FileCacheType::TTL] =
             std::make_shared<bvar::Adder<size_t>>(_cache_base_path.c_str(),
                                                   "file_cache_evict_by_size_index_to_ttl");
