@@ -62,6 +62,7 @@ BlockFileCache::BlockFileCache(const std::string& cache_base_path,
           _max_query_cache_size(cache_settings.max_query_cache_size) {
     _cur_cache_size_metrics = std::make_shared<bvar::Status<size_t>>(_cache_base_path.c_str(),
                                                                      "file_cache_cache_size", 0);
+
     _cache_capacity_metrics = std::make_shared<bvar::Status<size_t>>(
             _cache_base_path.c_str(), "file_cache_capacity", _capacity);
 
