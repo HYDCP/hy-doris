@@ -141,6 +141,7 @@ BlockFileCache::BlockFileCache(const std::string& cache_base_path,
     _evict_by_self_lru_metrics_matrix[FileCacheType::DISPOSABLE] =
             std::make_shared<bvar::Adder<size_t>>(_cache_base_path.c_str(),
                                                   "file_cache_evict_by_self_lru_disposable");
+
     _evict_by_self_lru_metrics_matrix[FileCacheType::NORMAL] =
             std::make_shared<bvar::Adder<size_t>>(_cache_base_path.c_str(),
                                                   "file_cache_evict_by_self_lru_normal");
