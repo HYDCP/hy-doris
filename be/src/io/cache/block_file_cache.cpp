@@ -97,6 +97,7 @@ BlockFileCache::BlockFileCache(const std::string& cache_base_path,
             _cache_base_path.c_str(), "file_cache_total_evict_size");
     _gc_evict_bytes_metrics = std::make_shared<bvar::Adder<size_t>>(_cache_base_path.c_str(),
                                                                     "file_cache_gc_evict_bytes");
+
     _gc_evict_count_metrics = std::make_shared<bvar::Adder<size_t>>(_cache_base_path.c_str(),
                                                                     "file_cache_gc_evict_count");
 
