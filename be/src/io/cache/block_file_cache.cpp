@@ -232,6 +232,7 @@ BlockFileCache::BlockFileCache(const std::string& cache_base_path,
     _no_warmup_num_hit_blocks_1h = std::make_shared<bvar::Window<bvar::Adder<size_t>>>(
             _cache_base_path.c_str(), "file_cache_no_warmup_num_hit_blocks_1h",
             _no_warmup_num_hit_blocks.get(), 3600);
+
     _no_warmup_num_read_blocks_1h = std::make_shared<bvar::Window<bvar::Adder<size_t>>>(
             _cache_base_path.c_str(), "file_cache_no_warmup_num_read_blocks_1h",
             _no_warmup_num_read_blocks.get(), 3600);
