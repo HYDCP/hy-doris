@@ -247,6 +247,7 @@ BlockFileCache::BlockFileCache(const std::string& cache_base_path,
             _cache_base_path.c_str(), "file_cache_no_warmup_hit_ratio", 0.0);
     _no_warmup_hit_ratio_5m = std::make_shared<bvar::Status<double>>(
             _cache_base_path.c_str(), "file_cache_no_warmup_hit_ratio_5m", 0.0);
+
     _no_warmup_hit_ratio_1h = std::make_shared<bvar::Status<double>>(
             _cache_base_path.c_str(), "file_cache_no_warmup_hit_ratio_1h", 0.0);
 
