@@ -122,6 +122,7 @@ BlockFileCache::BlockFileCache(const std::string& cache_base_path,
     _evict_by_time_metrics_matrix[FileCacheType::NORMAL][FileCacheType::TTL] =
             std::make_shared<bvar::Adder<size_t>>(_cache_base_path.c_str(),
                                                   "file_cache_evict_by_time_normal_to_ttl");
+
     _evict_by_time_metrics_matrix[FileCacheType::INDEX][FileCacheType::DISPOSABLE] =
             std::make_shared<bvar::Adder<size_t>>(_cache_base_path.c_str(),
                                                   "file_cache_evict_by_time_index_to_disposable");
