@@ -20,6 +20,9 @@ suite("test_datev1_calc", "nonConcurrent") {
     sql """
         admin set frontend config("enable_date_conversion" = "false");
     """
+    sql """
+        admin set frontend config ("disable_datev1"="false")
+    """
 
     def table1 = "test_datev1_calc_tbl"
 

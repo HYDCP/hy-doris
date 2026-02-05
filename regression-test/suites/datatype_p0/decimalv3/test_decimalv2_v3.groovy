@@ -19,6 +19,9 @@ suite("test_decimalv2_v3", "nonConcurrent") {
     sql """
         admin set frontend config("enable_decimal_conversion" = "false");
     """
+    sql """
+        admin set frontend config("disable_decimalv2" = "false");
+    """
 
     // test cast decimalv2 to decimal32
     def prepare_test_decimalv2_v3_1 = {

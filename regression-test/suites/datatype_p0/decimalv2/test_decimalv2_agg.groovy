@@ -20,6 +20,9 @@ suite("test_decimalv2_agg", "nonConcurrent") {
     sql """
         admin set frontend config("enable_decimal_conversion" = "false");
     """
+    sql """
+        admin set frontend config("disable_decimalv2" = "false");
+    """
 
     sql """
         drop table if exists test_decimalv2_agg;

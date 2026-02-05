@@ -20,6 +20,9 @@ suite("test_datev1_common", "nonConcurrent") {
     sql """
         admin set frontend config("enable_date_conversion" = "false");
     """
+    sql """
+        admin set frontend config ("disable_datev1"="false")
+    """
 
     def table_normal = "test_datev1_common_normal_tbl"
     def table_dup = "test_datev1_common_dup_tbl" // duplicate key

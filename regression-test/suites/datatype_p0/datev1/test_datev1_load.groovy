@@ -23,6 +23,9 @@ suite("test_datev1_load", "nonConcurrent") {
     sql """
         admin set frontend config("enable_date_conversion" = "false");
     """
+    sql """
+        admin set frontend config ("disable_datev1"="false")
+    """
 
     def tableName = "test_datev1_load_tbl"
     sql """ DROP TABLE IF EXISTS ${tableName} """

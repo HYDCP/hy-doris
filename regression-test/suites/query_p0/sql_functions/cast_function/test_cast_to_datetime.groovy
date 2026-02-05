@@ -16,6 +16,10 @@
 // under the License.
 
 suite("test_cast_to_datetime", "nonConcurrent") {
+    sql """
+        admin set frontend config ("disable_datev1"="false")
+    """
+
     // cast string of invalid datetime to datetime
     qt_cast_string_to_datetime_invalid0 """ select cast("627492340" as datetime); """
     qt_cast_string_to_datetime_invalid1 """ select cast("" as datetime); """

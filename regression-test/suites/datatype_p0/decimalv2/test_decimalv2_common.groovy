@@ -20,6 +20,9 @@ suite("test_decimalv2_common", "nonConcurrent") {
     sql """
         admin set frontend config("enable_decimal_conversion" = "false");
     """
+    sql """
+        admin set frontend config("disable_decimalv2" = "false");
+    """
     sql "set check_overflow_for_decimal=false;"
 
     def table_normal = "test_decimalv2_common_normal_tbl"
