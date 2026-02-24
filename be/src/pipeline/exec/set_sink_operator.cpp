@@ -49,31 +49,33 @@ Status SetSinkOperatorX<is_intersect>::sink(RuntimeState* state, vectorized::Blo
         }
     }
 
-    if (eos || local_state._mutable_block.allocated_bytes() >= BUILD_BLOCK_MAX_SIZE) {
+    if (eos) {
         SCOPED_TIMER(local_state._build_timer);
         build_block = local_state._mutable_block.to_block();
         RETURN_IF_ERROR(_process_build_block(local_state, build_block, state));
         local_state._mutable_block.clear();
 
-        if (eos) {
-            if constexpr (is_intersect) {
-                valid_element_in_hash_tbl = 0;
-            } else {
-                std::visit(
-                        [&](auto&& arg) {
-                            using HashTableCtxType = std::decay_t<decltype(arg)>;
-                            if constexpr (!std::is_same_v<HashTableCtxType, std::monostate>) {
-                                valid_element_in_hash_tbl = arg.hash_table->size();
-                            }
-                        },
-                        *local_state._shared_state->hash_table_variants);
-            }
-            local_state._shared_state->probe_finished_children_dependency[_cur_child_id + 1]
-                    ->set_ready();
-            if (_child_quantity == 1) {
-                local_state._dependency->set_ready_to_read();
-            }
+        if constexpr (is_intersect) {
+            valid_element_in_hash_tbl = 0;
+        } else {
+            std::visit(
+                    [&](auto&& arg) {
+                        using HashTableCtxType = std::decay_t<decltype(arg)>;
+                        if constexpr (!std::is_same_v<HashTableCtxType, std::monostate>) {
+                            valid_element_in_hash_tbl = arg.hash_table->size();
+                        }
+                    },
+                    *local_state._shared_state->hash_table_variants);
         }
+        local_state._shared_state->probe_finished_children_dependency[_cur_child_id + 1]
+                ->set_ready();
+        if (_child_quantity == 1) {
+            local_state._dependency->set_ready_to_read();
+        }
+    } else if (local_state._mutable_block.allocated_bytes() >= BUILD_BLOCK_MAX_SIZE) {
+        return Status::NotSupported(
+                "Set operator build block exceeds 4GB limit and does not support spilling or "
+                "multi-block build yet.");
     }
     return Status::OK();
 }
