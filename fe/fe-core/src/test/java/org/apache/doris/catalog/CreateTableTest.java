@@ -17,6 +17,7 @@
 
 package org.apache.doris.catalog;
 
+import org.apache.doris.catalog.DataProperty.MediumAllocationMode;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.ConfigBase;
@@ -296,29 +297,10 @@ public class CreateTableTest extends TestWithFeService {
         ConfigBase.setMutableConfig("disable_storage_medium_check", "false");
         ExceptionChecker
                 .expectThrowsWithMsg(DdlException.class,
-                        "Failed to find enough backend, please check the replication num,replication tag and storage medium and avail capacity of backends "
-                                + "or maybe all be on same host."
-                                + Env.getCurrentSystemInfo().getDetailsForCreateReplica(new ReplicaAllocation((short) 1)) + "\n"
-                                + "Create failed replications:\n"
-                                + "replication tag: {\"location\" : \"default\"}, replication num: 1, storage medium: SSD",
+                        "Invalid medium_allocation_mode value: 'invalid_mode'. Valid options are: 'strict', 'adaptive'",
                         () -> createTable(
                                 "create table test.tb7(key1 int, key2 varchar(10)) distributed by hash(key1) \n"
-                                        + "buckets 1 properties('replication_num' = '1', 'storage_medium' = 'ssd');"));
-
-        ExceptionChecker
-                .expectThrowsWithMsg(DdlException.class,
-                        "Failed to find enough backend, please check the replication num,replication tag and storage medium and avail capacity of backends "
-                                + "or maybe all be on same host."
-                                + Env.getCurrentSystemInfo().getDetailsForCreateReplica(new ReplicaAllocation((short) 1)) + "\n"
-                                + "Create failed replications:\n"
-                                + "replication tag: {\"location\" : \"default\"}, replication num: 1, storage medium: SSD",
-                        () -> createTable("create table test.tb7_1(key1 int, key2 varchar(10))\n"
-                                + "PARTITION BY RANGE(`key1`) (\n"
-                                + "    PARTITION `p1` VALUES LESS THAN (\"10\"),\n"
-                                + "    PARTITION `p2` VALUES LESS THAN (\"20\"),\n"
-                                + "    PARTITION `p3` VALUES LESS THAN (\"30\"))\n"
-                                + "distributed by hash(key1)\n"
-                                + "buckets 1 properties('replication_num' = '1', 'storage_medium' = 'ssd');"));
+                                        + "buckets 1 properties('replication_num' = '1', 'medium_allocation_mode' = 'invalid_mode');"));
 
         ExceptionChecker
                 .expectThrowsWithMsg(DdlException.class, "sequence column only support UNIQUE_KEYS",
@@ -989,5 +971,195 @@ public class CreateTableTest extends TestWithFeService {
                         + "(k1 int, k2 int)\n"
                         + "duplicate key(k1)\n"
                         + "distributed by hash(k1) buckets 1\n", true));
+    }
+
+    @Test
+    public void testCreateTableTrimPropertyKey() throws Exception {
+        String sql = "create table test.tbl_trim_property_key\n"
+                + "(`uuid` varchar(255) NULL,\n"
+                + "`action_datetime` date NULL\n"
+                + ")\n"
+                + "DUPLICATE KEY(uuid)\n"
+                + "PARTITION BY RANGE(action_datetime)()\n"
+                + "DISTRIBUTED BY HASH(uuid) BUCKETS 3\n"
+                + "PROPERTIES\n"
+                + "(\n"
+                + "\"min_load_replica_num \" = \"1\",\n"
+                + "\" dynamic_partition.enable\" = \"true\",\n"
+                + "\" dynamic_partition.time_unit \" = \"DAY\",\n"
+                + "\"dynamic_partition.end\" = \"3\",\n"
+                + "\"dynamic_partition.prefix\" = \"p\",\n"
+                + "\"dynamic_partition.start\" = \"-3\"\n"
+                + ");";
+        createTable(sql);
+        Database db =
+                Env.getCurrentInternalCatalog().getDbOrAnalysisException("test");
+        OlapTable table = (OlapTable) db.getTableOrAnalysisException("tbl_trim_property_key");
+        Assert.assertEquals(1, table.getMinLoadReplicaNum());
+        Assert.assertTrue(table.getTableProperty().getDynamicPartitionProperty().getEnable());
+        Assert.assertEquals("DAY", table.getTableProperty().getDynamicPartitionProperty().getTimeUnit());
+        Assert.assertEquals(3, table.getTableProperty().getDynamicPartitionProperty().getEnd());
+
+        ExceptionChecker.expectThrowsWithMsg(DdlException.class,
+                "Invalid dynamic partition properties: dynamic_partition. enable",
+                () -> createTable("create table test.tbl_trim_property_key_invalid\n"
+                        + "(`uuid` varchar(255) NULL,\n"
+                        + "`action_datetime` date NULL\n"
+                        + ")\n"
+                        + "DUPLICATE KEY(uuid)\n"
+                        + "PARTITION BY RANGE(action_datetime)()\n"
+                        + "DISTRIBUTED BY HASH(uuid) BUCKETS 3\n"
+                        + "PROPERTIES\n"
+                        + "(\n"
+                        + "\"dynamic_partition. enable\" = \"true\",\n"
+                        + "\"dynamic_partition.time_unit\" = \"DAY\",\n"
+                        + "\"dynamic_partition.end\" = \"3\",\n"
+                        + "\"dynamic_partition.prefix\" = \"p\",\n"
+                        + "\"dynamic_partition.start\" = \"-3\"\n"
+                        + ");"));
+    }
+
+    @Test
+    public void testCreateTableTrimPropertyKeyWithNereids() throws Exception {
+        String sql = "create table test.tbl_trim_property_key_with_nereids\n"
+                + "(`uuid` varchar(255) NULL,\n"
+                + "`action_datetime` date NULL\n"
+                + ")\n"
+                + "DUPLICATE KEY(uuid)\n"
+                + "PARTITION BY RANGE(action_datetime)()\n"
+                + "DISTRIBUTED BY HASH(uuid) BUCKETS 3\n"
+                + "PROPERTIES\n"
+                + "(\n"
+                + "\"min_load_replica_num \" = \"1\",\n"
+                + "\" dynamic_partition.enable\" = \"true\",\n"
+                + "\" dynamic_partition.time_unit \" = \"DAY\",\n"
+                + "\"dynamic_partition.end\" = \"3\",\n"
+                + "\"dynamic_partition.prefix\" = \"p\",\n"
+                + "\"dynamic_partition.start\" = \"-3\"\n"
+                + ");";
+        createTable(sql, true);
+        Database db =
+                Env.getCurrentInternalCatalog().getDbOrAnalysisException("test");
+        OlapTable table = (OlapTable) db.getTableOrAnalysisException("tbl_trim_property_key_with_nereids");
+        Assert.assertEquals(1, table.getMinLoadReplicaNum());
+        Assert.assertTrue(table.getTableProperty().getDynamicPartitionProperty().getEnable());
+        Assert.assertEquals("DAY", table.getTableProperty().getDynamicPartitionProperty().getTimeUnit());
+        Assert.assertEquals(3, table.getTableProperty().getDynamicPartitionProperty().getEnd());
+
+        ExceptionChecker.expectThrowsWithMsg(DdlException.class,
+                "Invalid dynamic partition properties: dynamic_partition. enable",
+                () -> createTable("create table test.tbl_trim_property_key_invalid\n"
+                        + "(`uuid` varchar(255) NULL,\n"
+                        + "`action_datetime` date NULL\n"
+                        + ")\n"
+                        + "DUPLICATE KEY(uuid)\n"
+                        + "PARTITION BY RANGE(action_datetime)()\n"
+                        + "DISTRIBUTED BY HASH(uuid) BUCKETS 3\n"
+                        + "PROPERTIES\n"
+                        + "(\n"
+                        + "\"dynamic_partition. enable\" = \"true\",\n"
+                        + "\"dynamic_partition.time_unit\" = \"DAY\",\n"
+                        + "\"dynamic_partition.end\" = \"3\",\n"
+                        + "\"dynamic_partition.prefix\" = \"p\",\n"
+                        + "\"dynamic_partition.start\" = \"-3\"\n"
+                        + ");", true));
+    }
+
+    @Test
+    public void testCreateTableOfSequenceMapping() throws Exception {
+        ExceptionChecker.expectThrowsWithMsg(DdlException.class, "sequence mapping do not support merge on write",
+                () -> createTable("CREATE TABLE test.test_seq_map \n"
+                        + "(`a` bigint(20) NULL,\n"
+                        + "`b` int(11) NULL,\n"
+                        + "`c` int(11) NULL,\n"
+                        + "`d` int(11) NULL,\n"
+                        + "`s1` int(11) NULL\n"
+                        + ") ENGINE=OLAP\n"
+                        + "UNIQUE KEY(`a`, `b`)\n"
+                        + "COMMENT \"OLAP\"\n"
+                        + "DISTRIBUTED BY HASH(`a`, `b`) BUCKETS 1\n"
+                        + "PROPERTIES (\n"
+                        + "\"enable_unique_key_merge_on_write\" = \"true\",\n"
+                        + "\"replication_num\" = \"1\",\n"
+                        + "\"sequence_mapping.s1\" = \"c,d\"\n"
+                        + ");", true));
+
+        ExceptionChecker.expectThrowsNoException(
+                () -> createTable("CREATE TABLE test.test_seq_map \n"
+                        + "(`a` bigint(20) NULL,\n"
+                        + "`b` int(11) NULL,\n"
+                        + "`c` int(11) NULL,\n"
+                        + "`d` int(11) NULL,\n"
+                        + "`s1` int(11) NULL\n"
+                        + ") ENGINE=OLAP\n"
+                        + "UNIQUE KEY(`a`, `b`)\n"
+                        + "COMMENT \"OLAP\"\n"
+                        + "DISTRIBUTED BY HASH(`a`, `b`) BUCKETS 1\n"
+                        + "PROPERTIES (\n"
+                        + "\"enable_unique_key_merge_on_write\" = \"false\",\n"
+                        + "\"replication_num\" = \"1\",\n"
+                        + "\"sequence_mapping.s1\" = \"c,d\"\n"
+                        + ");", true));
+    }
+
+    @Test
+    public void testStorageMediumProperty() throws Exception {
+        // 1. Test create table with 'storage_medium' property.
+        // This should implicitly set 'storage_medium_specified' to true.
+        ExceptionChecker.expectThrowsNoException(
+                () -> createTable("create table test.tbl_storage_medium_specified\n" + "(k1 date, k2 int)\n"
+                        + "partition by range(k1)\n" + "(partition p1 values less than('2024-01-01'))\n"
+                        + "distributed by hash(k2) buckets 1\n"
+                        + "properties('replication_num' = '1', 'storage_medium' = 'HDD', 'medium_allocation_mode' = 'strict'); "));
+        Database db = Env.getCurrentInternalCatalog().getDbOrDdlException("test");
+        OlapTable table = (OlapTable) db.getTableOrDdlException("tbl_storage_medium_specified");
+        Assert.assertEquals("HDD", table.getTableProperty().getStorageMedium().name());
+        Assert.assertEquals(MediumAllocationMode.STRICT, table.getTableProperty().getMediumAllocationMode());
+        Partition p1 = table.getPartition("p1");
+        Assert.assertEquals("HDD", table.getPartitionInfo().getDataProperty(p1.getId()).getStorageMedium().name());
+
+        // 2. Test create table with partition-level storage_medium override.
+        ExceptionChecker.expectThrowsNoException(() -> createTable("create table test.tbl_storage_medium_override\n"
+                + "(k1 date, k2 int)\n" + "partition by range(k1)\n"
+                + "(partition p1 values less than ('2024-01-01'),\n"
+                + " partition p2 values less than ('2024-02-01'))\n"
+                + "distributed by hash(k2) buckets 1\n"
+                + "properties('replication_num' = '1', 'storage_medium' = 'SSD'); "));
+        OlapTable table2 = (OlapTable) db.getTableOrDdlException("tbl_storage_medium_override");
+        Partition part1 = table2.getPartition("p1");
+        Partition part2 = table2.getPartition("p2");
+        Assert.assertEquals(MediumAllocationMode.ADAPTIVE, table2.getTableProperty().getMediumAllocationMode());
+        Assert.assertEquals("HDD", table2.getPartitionInfo().getDataProperty(part1.getId()).getStorageMedium().name());
+        Assert.assertEquals("HDD", table2.getPartitionInfo().getDataProperty(part2.getId()).getStorageMedium().name());
+
+        // 3. Test create table with 'storage_medium_specified' explicitly set.
+        // This property is allowed to be set by user.
+        ExceptionChecker.expectThrowsNoException(
+                () -> createTable("create table test.tbl_explicitly_specified\n" + "(k1 int, k2 int)\n"
+                        + "distributed by hash(k1) buckets 1\n"
+                        + "properties('replication_num' = '1', 'storage_medium' = 'SSD', 'medium_allocation_mode' = 'adaptive'); "));
+        OlapTable table3 = (OlapTable) db.getTableOrDdlException("tbl_explicitly_specified");
+        Assert.assertEquals("SSD", table3.getTableProperty().getStorageMedium().name());
+        Assert.assertEquals(MediumAllocationMode.ADAPTIVE, table3.getTableProperty().getMediumAllocationMode());
+    }
+
+    @Test
+    public void testAlterPartWithMediumAllocationMode() throws DdlException {
+        ExceptionChecker.expectThrowsNoException(() -> createTable("create table test.tbl_alter_allocation\n"
+                + "(k1 date, k2 int)\n" + "partition by range(k1)\n"
+                + "(partition p1 values less than ('2024-01-01'),\n"
+                + " partition p2 values less than ('2024-02-01'))\n"
+                + "distributed by hash(k2) buckets 1\n"
+                + "properties('replication_num' = '1', 'storage_medium' = 'SSD'); "));
+
+        ExceptionChecker.expectThrowsNoException(
+                () -> {
+                    alterTableSync("alter table test.tbl_alter_allocation modify partition p1 set ('medium_allocation_mode' = 'strict')");
+                });
+
+        Database db = Env.getCurrentInternalCatalog().getDbOrDdlException("test");
+        OlapTable tb = (OlapTable) db.getTableOrDdlException("tbl_alter_allocation");
+        Partition p1 = tb.getPartition("p1");
+        Assert.assertEquals(MediumAllocationMode.STRICT, tb.getPartitionInfo().getDataProperty(p1.getId()).getMediumAllocationMode());
     }
 }
