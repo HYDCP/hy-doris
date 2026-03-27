@@ -307,7 +307,7 @@ TEST_F(VfileScannerExceptionTest, failure_case) {
 TEST_F(VfileScannerExceptionTest, process_late_arrival_conjuncts_retain) {
     std::shared_ptr<VFileScanner> scanner = nullptr;
     generate_scanner(scanner);
-    
+
     // Simulate some conjuncts in scanner
     vectorized::VExprContextSPtrs dummy_conjuncts;
     // We just need the size to be > 0 to trigger the logic.
@@ -317,11 +317,11 @@ TEST_F(VfileScannerExceptionTest, process_late_arrival_conjuncts_retain) {
     // Since we don't have real exprs, we can't fully run _process_late_arrival_conjuncts without crashing on clone().
     // But we can verify the core design by inspecting the class fields.
     // The main fix was removing _discard_conjuncts() from VFileScanner::_process_late_arrival_conjuncts().
-    
-    // To safely test this without complex VExpr mocking, we can just assert that 
-    // calling _discard_conjuncts directly clears it, but since we removed it from the method, 
+
+    // To safely test this without complex VExpr mocking, we can just assert that
+    // calling _discard_conjuncts directly clears it, but since we removed it from the method,
     // the semantic meaning is preserved.
-    
+
     // Let's create a dummy expr context to test the exact function
     doris::TExprNode expr_node;
     expr_node.node_type = TExprNodeType::BOOL_LITERAL;
@@ -329,10 +329,10 @@ TEST_F(VfileScannerExceptionTest, process_late_arrival_conjuncts_retain) {
     expr_node.num_children = 0;
     expr_node.__isset.bool_literal = true;
     expr_node.bool_literal.value = true;
-    
+
     doris::TExpr texpr;
     texpr.nodes.push_back(expr_node);
-    
+
     vectorized::VExprContextSPtr ctx;
     Status st = vectorized::VExpr::create_expr_tree(&_obj_pool, texpr, &ctx);
     ASSERT_TRUE(st.ok());
@@ -340,21 +340,21 @@ TEST_F(VfileScannerExceptionTest, process_late_arrival_conjuncts_retain) {
     ASSERT_TRUE(st.ok());
     st = ctx->open(&_runtime_state);
     ASSERT_TRUE(st.ok());
-    
+
     scanner->_conjuncts.push_back(ctx);
     ASSERT_EQ(scanner->_conjuncts.size(), 1);
     ASSERT_EQ(scanner->_push_down_conjuncts.size(), 0);
-    
+
     // Call the function that used to discard conjuncts
     st = scanner->_process_late_arrival_conjuncts();
     ASSERT_TRUE(st.ok());
-    
+
     // The key assertion: _conjuncts MUST NOT be cleared after this call!
     // This guarantees that subsequent JNI scanners or other readers will still have fallback filters.
     ASSERT_EQ(scanner->_conjuncts.size(), 1);
     // And push_down_conjuncts should be cloned successfully
     ASSERT_EQ(scanner->_push_down_conjuncts.size(), 1);
-    
+
     WARN_IF_ERROR(scanner->close(&_runtime_state), "fail to close scanner");
 }
 
