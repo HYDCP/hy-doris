@@ -311,13 +311,8 @@ public:
     void set_storage_engine(std::unique_ptr<BaseStorageEngine>&& engine);
     void set_inverted_index_searcher_cache(
             segment_v2::InvertedIndexSearcherCache* inverted_index_searcher_cache);
-    void set_cache_manager(CacheManager* cm) { this->_cache_manager = cm; }
     void set_process_profile(ProcessProfile* pp) { this->_process_profile = pp; }
-    void set_tablet_schema_cache(TabletSchemaCache* c) { this->_tablet_schema_cache = c; }
     void set_delete_bitmap_agg_cache(DeleteBitmapAggCache* c) { _delete_bitmap_agg_cache = c; }
-    void set_tablet_column_object_pool(TabletColumnObjectPool* c) {
-        this->_tablet_column_object_pool = c;
-    }
     void set_storage_page_cache(StoragePageCache* c) { this->_storage_page_cache = c; }
     void set_segment_loader(SegmentLoader* sl) { this->_segment_loader = sl; }
     void set_routine_load_task_executor(RoutineLoadTaskExecutor* r) {
@@ -337,6 +332,11 @@ public:
         _non_block_close_thread_pool = std::move(pool);
     }
 #endif
+    void set_cache_manager(CacheManager* cm) { this->_cache_manager = cm; }
+        void set_tablet_schema_cache(TabletSchemaCache* c) { this->_tablet_schema_cache = c; }
+	    void set_tablet_column_object_pool(TabletColumnObjectPool* c) {
+		            this->_tablet_column_object_pool = c;
+			        }
     LoadStreamMapPool* load_stream_map_pool() { return _load_stream_map_pool.get(); }
 
     vectorized::DeltaWriterV2Pool* delta_writer_v2_pool() { return _delta_writer_v2_pool.get(); }
