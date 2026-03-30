@@ -150,12 +150,12 @@ Status TabletMetaManager::traverse_headers(
 Status TabletMetaManager::load_json_meta(DataDir* store, const std::string& meta_path) {
     std::ifstream infile(meta_path);
     if (!infile.is_open()) {
-	return Status::Error<HEADER_LOAD_JSON_HEADER>("fail to open json meta file: {}", meta_path);
+        return Status::Error<HEADER_LOAD_JSON_HEADER>("fail to open json meta file: {}", meta_path);
     }
     char buffer[102400];
     std::string json_meta;
     while (infile.getline(buffer, 102400)) {
-    	json_meta = json_meta + buffer;
+        json_meta = json_meta + buffer;
     }
     boost::algorithm::trim(json_meta);
     TabletMetaPB tablet_meta_pb;

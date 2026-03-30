@@ -40,11 +40,11 @@
 #include "olap/rowset/segment_v2/binary_plain_page.h"
 #include "olap/rowset/segment_v2/column_reader.h"
 #include "olap/storage_engine.h"
+#include "olap/tablet_column_object_pool.h"
 #include "olap/tablet_meta.h"
 #include "olap/tablet_meta_manager.h"
-#include "olap/utils.h"
-#include "olap/tablet_column_object_pool.h"
 #include "olap/tablet_schema_cache.h"
+#include "olap/utils.h"
 #include "runtime/exec_env.h"
 #include "runtime/memory/cache_manager.h"
 #include "util/coding.h"
@@ -119,15 +119,15 @@ void get_meta(DataDir* data_dir) {
     std::string value;
     Status s =
             TabletMetaManager::get_json_meta(data_dir, FLAGS_tablet_id, FLAGS_schema_hash, &value);
-        if (!s.ok()) {
-		        if (s.is<doris::ErrorCode::META_KEY_NOT_FOUND>()) {
-				            std::cout << "no tablet meta for tablet_id:" << FLAGS_tablet_id
-						                          << ", schema_hash:" << FLAGS_schema_hash << std::endl;
-					            } else {
-							                std::cout << "get meta failed: " << s.to_string() << std::endl;
-									        }
-			        return;
-				    }
+    if (!s.ok()) {
+        if (s.is<doris::ErrorCode::META_KEY_NOT_FOUND>()) {
+            std::cout << "no tablet meta for tablet_id:" << FLAGS_tablet_id
+                      << ", schema_hash:" << FLAGS_schema_hash << std::endl;
+        } else {
+            std::cout << "get meta failed: " << s.to_string() << std::endl;
+        }
+        return;
+    }
     std::cout << value << std::endl;
 }
 
@@ -169,7 +169,7 @@ Status init_data_dir(StorageEngine& engine, const std::string& dir, std::unique_
     res = p->init();
     if (!res.ok()) {
         std::cout << "data_dir load failed: " << res.to_string() << std::endl;
-	return res;
+        return res;
     }
 
     p.swap(*ret);
@@ -334,42 +334,41 @@ int main(int argc, char** argv) {
     gflags::SetUsageMessage(usage);
     google::ParseCommandLineFlags(&argc, &argv, true);
 
-        if (getenv("DORIS_HOME") == nullptr) {
-		        fprintf(stderr, "you need set DORIS_HOME environment variable.\n");
-			        exit(-1);
-				    }
+    if (getenv("DORIS_HOME") == nullptr) {
+        fprintf(stderr, "you need set DORIS_HOME environment variable.\n");
+        exit(-1);
+    }
 
-	    std::string conffile = std::string(getenv("DORIS_HOME")) + "/conf/be.conf";
-	        if (!doris::config::init(conffile.c_str(), true, true, true)) {
-			        fprintf(stderr, "error read config file. \n");
-				        return -1;
-					    }
+    std::string conffile = std::string(getenv("DORIS_HOME")) + "/conf/be.conf";
+    if (!doris::config::init(conffile.c_str(), true, true, true)) {
+        fprintf(stderr, "error read config file. \n");
+        return -1;
+    }
 
-		    std::string custom_conffile = doris::config::custom_config_dir + "/be_custom.conf";
-		        if (!doris::config::init(custom_conffile.c_str(), true, false, false)) {
-				        fprintf(stderr, "error read custom config file. \n");
-					        return -1;
-			}
+    std::string custom_conffile = doris::config::custom_config_dir + "/be_custom.conf";
+    if (!doris::config::init(custom_conffile.c_str(), true, false, false)) {
+        fprintf(stderr, "error read custom config file. \n");
+        return -1;
+    }
 
-	
     if (doris::config::sys_log_dir == "") {
-	            std::string log_dir = std::string(getenv("DORIS_HOME")) + "/log";
-		            doris::config::sys_log_dir = log_dir;
-			        }
+        std::string log_dir = std::string(getenv("DORIS_HOME")) + "/log";
+        doris::config::sys_log_dir = log_dir;
+    }
 
-        if (!doris::init_glog("meta_tool")) {
-		        fprintf(stderr, "init glog failed.\n");
-			        return -1;
-				    }
+    if (!doris::init_glog("meta_tool")) {
+        fprintf(stderr, "init glog failed.\n");
+        return -1;
+    }
 
-	doris::ExecEnv::GetInstance()->init_mem_tracker();
-           doris::ExecEnv::GetInstance()->set_cache_manager(doris::CacheManager::create_global_instance());
-	       doris::ExecEnv::GetInstance()->set_tablet_schema_cache(
-			                   doris::TabletSchemaCache::create_global_schema_cache(
-						                       doris::config::tablet_schema_cache_capacity));
-	           doris::ExecEnv::GetInstance()->set_tablet_column_object_pool(
-				               doris::TabletColumnObjectPool::create_global_column_cache(
-						                           doris::config::tablet_schema_cache_capacity));    
+    doris::ExecEnv::GetInstance()->init_mem_tracker();
+    doris::ExecEnv::GetInstance()->set_cache_manager(doris::CacheManager::create_global_instance());
+    doris::ExecEnv::GetInstance()->set_tablet_schema_cache(
+            doris::TabletSchemaCache::create_global_schema_cache(
+                    doris::config::tablet_schema_cache_capacity));
+    doris::ExecEnv::GetInstance()->set_tablet_column_object_pool(
+            doris::TabletColumnObjectPool::create_global_column_cache(
+                    doris::config::tablet_schema_cache_capacity));
 
     if (FLAGS_operation == "show_meta") {
         show_meta();

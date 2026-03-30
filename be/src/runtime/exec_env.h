@@ -333,10 +333,10 @@ public:
     }
 #endif
     void set_cache_manager(CacheManager* cm) { this->_cache_manager = cm; }
-        void set_tablet_schema_cache(TabletSchemaCache* c) { this->_tablet_schema_cache = c; }
-	    void set_tablet_column_object_pool(TabletColumnObjectPool* c) {
-		            this->_tablet_column_object_pool = c;
-			        }
+    void set_tablet_schema_cache(TabletSchemaCache* c) { this->_tablet_schema_cache = c; }
+    void set_tablet_column_object_pool(TabletColumnObjectPool* c) {
+        this->_tablet_column_object_pool = c;
+    }
     LoadStreamMapPool* load_stream_map_pool() { return _load_stream_map_pool.get(); }
 
     vectorized::DeltaWriterV2Pool* delta_writer_v2_pool() { return _delta_writer_v2_pool.get(); }
