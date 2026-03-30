@@ -119,6 +119,7 @@ void get_meta(DataDir* data_dir) {
     std::string value;
     Status s =
             TabletMetaManager::get_json_meta(data_dir, FLAGS_tablet_id, FLAGS_schema_hash, &value);
+    // Check if status is ok, and handle META_KEY_NOT_FOUND appropriately without causing coredump
     if (!s.ok()) {
         if (s.is<doris::ErrorCode::META_KEY_NOT_FOUND>()) {
             std::cout << "no tablet meta for tablet_id:" << FLAGS_tablet_id
@@ -334,6 +335,7 @@ int main(int argc, char** argv) {
     gflags::SetUsageMessage(usage);
     google::ParseCommandLineFlags(&argc, &argv, true);
 
+    // Initialize environment variables and configuration files for proper meta_tool operation
     if (getenv("DORIS_HOME") == nullptr) {
         fprintf(stderr, "you need set DORIS_HOME environment variable.\n");
         exit(-1);
@@ -361,6 +363,7 @@ int main(int argc, char** argv) {
         return -1;
     }
 
+    // Initialize memory tracker and cache managers to prevent coredump during tablet operations
     doris::ExecEnv::GetInstance()->init_mem_tracker();
     doris::ExecEnv::GetInstance()->set_cache_manager(doris::CacheManager::create_global_instance());
     doris::ExecEnv::GetInstance()->set_tablet_schema_cache(

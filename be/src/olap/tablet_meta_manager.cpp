@@ -149,11 +149,13 @@ Status TabletMetaManager::traverse_headers(
 
 Status TabletMetaManager::load_json_meta(DataDir* store, const std::string& meta_path) {
     std::ifstream infile(meta_path);
+    // Check if the file is successfully opened to prevent dead loop or reading errors
     if (!infile.is_open()) {
         return Status::Error<HEADER_LOAD_JSON_HEADER>("fail to open json meta file: {}", meta_path);
     }
     char buffer[102400];
     std::string json_meta;
+    // Read line by line until EOF to avoid dead loop on file read errors
     while (infile.getline(buffer, 102400)) {
         json_meta = json_meta + buffer;
     }
