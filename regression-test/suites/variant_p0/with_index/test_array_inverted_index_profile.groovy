@@ -123,7 +123,7 @@ suite("test_variant_arrayInvertedIdx_profile", "p0,nonConcurrent"){
 
                 check { profileString, exception ->
                     log.info(profileString)
-                    assertTrue(profileString.contains("RowsInvertedIndexFiltered:  6"))
+                    assertTrue(profileString.contains("RowsInvertedIndexFiltered: 6"))
                 }
             }
         } else {
@@ -134,7 +134,7 @@ suite("test_variant_arrayInvertedIdx_profile", "p0,nonConcurrent"){
 
                 check { profileString, exception ->
                     log.info(profileString)
-                    assertTrue(profileString.contains("RowsInvertedIndexFiltered:  5"))
+                    assertTrue(profileString.contains("RowsInvertedIndexFiltered: 5"))
                 }
             }
         }

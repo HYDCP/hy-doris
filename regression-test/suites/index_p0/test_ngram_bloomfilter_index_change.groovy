@@ -103,7 +103,7 @@ suite("test_ngram_bloomfilter_index_change") {
 
         check { profileString, exception ->
             log.info(profileString)
-            assertTrue(profileString.contains("RowsBloomFilterFiltered:  0"))
+            assertTrue(profileString.contains("RowsBloomFilterFiltered: 0"))
         }
     }
     sql "set enable_add_index_for_new_data = true"
@@ -129,7 +129,7 @@ suite("test_ngram_bloomfilter_index_change") {
 
         check { profileString, exception ->
             log.info(profileString)
-            assertTrue(profileString.contains("RowsBloomFilterFiltered:  10"))
+            assertTrue(profileString.contains("RowsBloomFilterFiltered: 10"))
         }
     }
 
@@ -146,7 +146,7 @@ suite("test_ngram_bloomfilter_index_change") {
 
         check { profileString, exception ->
             log.info(profileString)
-            assertTrue(profileString.contains("RowsBloomFilterFiltered:  0"))
+            assertTrue(profileString.contains("RowsBloomFilterFiltered: 0"))
         }
     }
 
@@ -193,7 +193,7 @@ suite("test_ngram_bloomfilter_index_change") {
 
         check { profileString, exception ->
             log.info(profileString)
-            assertTrue(profileString.contains("RowsBloomFilterFiltered:  0"))
+            assertTrue(profileString.contains("RowsBloomFilterFiltered: 0"))
         }
     }
 
@@ -210,7 +210,7 @@ suite("test_ngram_bloomfilter_index_change") {
 
         check { profileString, exception ->
             log.info(profileString)
-            assertTrue(profileString.contains("RowsBloomFilterFiltered:  10"))
+            assertTrue(profileString.contains("RowsBloomFilterFiltered: 10"))
         }
     }
 
@@ -228,7 +228,7 @@ suite("test_ngram_bloomfilter_index_change") {
 
         check { profileString, exception ->
             log.info(profileString)
-            assertTrue(profileString.contains("RowsBloomFilterFiltered:  20"))
+            assertTrue(profileString.contains("RowsBloomFilterFiltered: 20"))
         }
     }
 
@@ -245,7 +245,7 @@ suite("test_ngram_bloomfilter_index_change") {
 
         check { profileString, exception ->
             log.info(profileString)
-            assertTrue(profileString.contains("RowsBloomFilterFiltered:  0"))
+            assertTrue(profileString.contains("RowsBloomFilterFiltered: 0"))
         }
     }
 
@@ -297,7 +297,7 @@ suite("test_ngram_bloomfilter_index_change") {
 
         check { profileString, exception ->
             log.info(profileString)
-            assertTrue(profileString.contains("RowsBloomFilterFiltered:  10"))
+            assertTrue(profileString.contains("RowsBloomFilterFiltered: 10"))
         }
     }
 
@@ -315,7 +315,7 @@ suite("test_ngram_bloomfilter_index_change") {
 
         check { profileString, exception ->
             log.info(profileString)
-            assertTrue(profileString.contains("RowsBloomFilterFiltered:  20"))
+            assertTrue(profileString.contains("RowsBloomFilterFiltered: 20"))
         }
     }
 
