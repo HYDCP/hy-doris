@@ -39,9 +39,15 @@ Status SetSinkOperatorX<is_intersect>::sink(RuntimeState* state, vectorized::Blo
     auto& valid_element_in_hash_tbl = local_state._shared_state->valid_element_in_hash_tbl;
 
     if (in_block->rows() != 0) {
+        // Initialize mutable block with same structure if it is empty
+        if (local_state._mutable_block.empty()) {
+            auto tmp_build_block = *(in_block->create_same_struct_block(0, false));
+            local_state._mutable_block = vectorized::MutableBlock::build_mutable_block(&tmp_build_block);
+        }
+
         {
             SCOPED_TIMER(local_state._merge_block_timer);
-            RETURN_IF_ERROR(local_state._mutable_block.merge(*in_block));
+            RETURN_IF_ERROR(local_state._mutable_block.merge_ignore_overflow(std::move(*in_block)));
         }
         if (local_state._mutable_block.rows() > std::numeric_limits<uint32_t>::max()) {
             return Status::NotSupported("set operator do not support build table rows over:" +
@@ -49,14 +55,13 @@ Status SetSinkOperatorX<is_intersect>::sink(RuntimeState* state, vectorized::Blo
         }
     }
 
-    if (eos || local_state._mutable_block.allocated_bytes() >= BUILD_BLOCK_MAX_SIZE) {
+    if (eos) {
         SCOPED_TIMER(local_state._build_timer);
         build_block = local_state._mutable_block.to_block();
         RETURN_IF_ERROR(_process_build_block(local_state, build_block, state));
         local_state._mutable_block.clear();
 
-        if (eos) {
-            if constexpr (is_intersect) {
+        if constexpr (is_intersect) {
                 valid_element_in_hash_tbl = 0;
             } else {
                 std::visit(
@@ -68,11 +73,10 @@ Status SetSinkOperatorX<is_intersect>::sink(RuntimeState* state, vectorized::Blo
                         },
                         *local_state._shared_state->hash_table_variants);
             }
-            local_state._shared_state->probe_finished_children_dependency[_cur_child_id + 1]
-                    ->set_ready();
-            if (_child_quantity == 1) {
-                local_state._dependency->set_ready_to_read();
-            }
+        local_state._shared_state->probe_finished_children_dependency[_cur_child_id + 1]
+                ->set_ready();
+        if (_child_quantity == 1) {
+            local_state._dependency->set_ready_to_read();
         }
     }
     return Status::OK();
@@ -88,6 +92,10 @@ Status SetSinkOperatorX<is_intersect>::_process_build_block(
     }
 
     vectorized::materialize_block_inplace(block);
+    // Dispose the overflow of ColumnString
+    for (auto& data : block) {
+        data.column = std::move(*data.column).mutate()->convert_column_if_overflow();
+    }
     vectorized::ColumnRawPtrs raw_ptrs(_child_exprs.size());
     RETURN_IF_ERROR(_extract_build_column(local_state, block, raw_ptrs, rows));
 
