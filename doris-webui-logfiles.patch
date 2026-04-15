@@ -1,0 +1,1793 @@
+From 1d2cab695561e05dc11d3e80929e0be229be89c3 Mon Sep 17 00:00:00 2001
+From: wenzhenghu <wenzhenghu.zju@gmail.com>
+Date: Wed, 15 Apr 2026 08:48:52 +0000
+Subject: [PATCH] =?UTF-8?q?feat:=20Doris=E6=97=A5=E5=BF=97=E6=96=87?=
+ =?UTF-8?q?=E4=BB=B6=E4=B8=8B=E8=BD=BD=E5=8A=9F=E8=83=BD=E8=AE=BE=E8=AE=A1?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-authored-by: traeagent <traeagent@users.noreply.github.com>
+---
+ be/src/common/config.cpp                      |   1 +
+ be/src/common/config.h                        |   1 +
+ .../service/http/action/log_file_action.cpp   | 621 ++++++++++++++++++
+ be/src/service/http/action/log_file_action.h  |  70 ++
+ be/src/service/http/default_path_handlers.cpp |  84 +++
+ be/src/service/http_service.cpp               |  39 ++
+ be/src/service/http_service.h                 |   1 +
+ .../java/org/apache/doris/common/Config.java  |   3 +
+ fe/fe-core/pom.xml                            |   4 +
+ .../httpv2/controller/LogFilesController.java | 374 +++++++++++
+ .../doris/httpv2/LogFilesControllerTest.java  |  50 ++
+ ui/src/api/api.ts                             |  19 +
+ ui/src/pages/layout/index.tsx                 |   2 +-
+ ui/src/pages/log-files/index.tsx              | 285 ++++++++
+ ui/src/router/index.ts                        |   9 +-
+ 15 files changed, 1561 insertions(+), 2 deletions(-)
+ create mode 100644 be/src/service/http/action/log_file_action.cpp
+ create mode 100644 be/src/service/http/action/log_file_action.h
+ create mode 100644 fe/fe-core/src/main/java/org/apache/doris/httpv2/controller/LogFilesController.java
+ create mode 100644 fe/fe-core/src/test/java/org/apache/doris/httpv2/LogFilesControllerTest.java
+ create mode 100644 ui/src/pages/log-files/index.tsx
+
+diff --git a/be/src/common/config.cpp b/be/src/common/config.cpp
+index 560cbf2d..8f29450e 100644
+--- a/be/src/common/config.cpp
++++ b/be/src/common/config.cpp
+@@ -1441,6 +1441,7 @@ DEFINE_mInt64(ingest_binlog_elapsed_threshold_ms, "-1");
+ 
+ // Download binlog rate limit, unit is KB/s, 0 means no limit
+ DEFINE_Int32(download_binlog_rate_limit_kbs, "0");
++DEFINE_Int32(web_log_download_rate_limit_kbs, "20480");
+ 
+ DEFINE_mInt32(buffered_reader_read_timeout_ms, "600000");
+ 
+diff --git a/be/src/common/config.h b/be/src/common/config.h
+index 95bf9466..152ddf2b 100644
+--- a/be/src/common/config.h
++++ b/be/src/common/config.h
+@@ -1531,6 +1531,7 @@ DECLARE_mInt64(ingest_binlog_elapsed_threshold_ms);
+ 
+ // Download binlog rate limit, unit is KB/s
+ DECLARE_Int32(download_binlog_rate_limit_kbs);
++DECLARE_Int32(web_log_download_rate_limit_kbs);
+ 
+ DECLARE_mInt32(buffered_reader_read_timeout_ms);
+ 
+diff --git a/be/src/service/http/action/log_file_action.cpp b/be/src/service/http/action/log_file_action.cpp
+new file mode 100644
+index 00000000..75b10b84
+--- /dev/null
++++ b/be/src/service/http/action/log_file_action.cpp
+@@ -0,0 +1,621 @@
++// Licensed to the Apache Software Foundation (ASF) under one
++// or more contributor license agreements.  See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership.  The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License.  You may obtain a copy of the License at
++//
++//   http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing,
++// software distributed under the License is distributed on an
++// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, either express or implied.  See the License for the
++// specific language governing permissions and limitations
++// under the License.
++
++#include "service/http/action/log_file_action.h"
++
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <cstdio>
++#include <cstdlib>
++#include <fcntl.h>
++#include <fstream>
++#include <limits>
++#include <sstream>
++#include <string>
++#include <sys/stat.h>
++#include <utility>
++#include <unistd.h>
++#include <vector>
++#include <zlib.h>
++
++#include <fmt/format.h>
++
++#include "common/config.h"
++#include "common/logging.h"
++#include "io/fs/local_file_system.h"
++#include "runtime/exec_env.h"
++#include "service/http/http_channel.h"
++#include "service/http/http_headers.h"
++#include "service/http/http_method.h"
++#include "service/http/http_request.h"
++#include "service/http/http_status.h"
++#include "util/defer_op.h"
++#include "util/easy_json.h"
++#include "util/path_util.h"
++#include "util/string_util.h"
++
++namespace doris {
++
++namespace {
++
++std::atomic<bool> g_log_download_in_progress {false};
++
++class GzipFileWriter {
++public:
++    GzipFileWriter(FILE* fp, int level) : _fp(fp) {
++        memset(&_zs, 0, sizeof(_zs));
++        _ok = (deflateInit2(&_zs, level, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) == Z_OK);
++    }
++
++    ~GzipFileWriter() {
++        if (_ok) {
++            deflateEnd(&_zs);
++        }
++    }
++
++    bool ok() const { return _ok; }
++
++    Status write(const void* data, size_t len) {
++        if (!_ok) {
++            return Status::InternalError("gzip init failed");
++        }
++        _zs.next_in = (Bytef*)data;
++        _zs.avail_in = static_cast<uInt>(len);
++        unsigned char out[64 * 1024];
++        while (_zs.avail_in > 0) {
++            _zs.next_out = out;
++            _zs.avail_out = sizeof(out);
++            int rc = deflate(&_zs, Z_NO_FLUSH);
++            if (rc != Z_OK) {
++                return Status::InternalError("gzip deflate failed: {}", rc);
++            }
++            size_t produced = sizeof(out) - _zs.avail_out;
++            if (produced > 0 && fwrite(out, 1, produced, _fp) != produced) {
++                return Status::IOError("write gzip output failed");
++            }
++        }
++        return Status::OK();
++    }
++
++    Status finish() {
++        if (!_ok) {
++            return Status::InternalError("gzip init failed");
++        }
++        unsigned char out[64 * 1024];
++        int rc;
++        do {
++            _zs.next_out = out;
++            _zs.avail_out = sizeof(out);
++            rc = deflate(&_zs, Z_FINISH);
++            if (rc != Z_OK && rc != Z_STREAM_END) {
++                return Status::InternalError("gzip finish failed: {}", rc);
++            }
++            size_t produced = sizeof(out) - _zs.avail_out;
++            if (produced > 0 && fwrite(out, 1, produced, _fp) != produced) {
++                return Status::IOError("write gzip output failed");
++            }
++        } while (rc != Z_STREAM_END);
++        return Status::OK();
++    }
++
++private:
++    FILE* _fp = nullptr;
++    z_stream _zs;
++    bool _ok = false;
++};
++
++struct TarHeader {
++    char name[100];
++    char mode[8];
++    char uid[8];
++    char gid[8];
++    char size[12];
++    char mtime[12];
++    char chksum[8];
++    char typeflag;
++    char linkname[100];
++    char magic[6];
++    char version[2];
++    char uname[32];
++    char gname[32];
++    char devmajor[8];
++    char devminor[8];
++    char prefix[155];
++    char pad[12];
++};
++
++void write_octal(char* buf, size_t len, uint64_t value) {
++    snprintf(buf, len, "%0*lo", static_cast<int>(len - 1), static_cast<unsigned long>(value));
++}
++
++Status build_tar_header(TarHeader* h, const std::string& entry_name, int64_t file_size,
++                        int64_t mtime_sec) {
++    memset(h, 0, sizeof(TarHeader));
++    std::string name = entry_name;
++    if (name.size() <= 100) {
++        memcpy(h->name, name.data(), name.size());
++    } else if (name.size() <= 255) {
++        size_t split_pos = name.rfind('/');
++        if (split_pos == std::string::npos || split_pos == 0) {
++            return Status::InvalidArgument("tar entry name too long");
++        }
++        std::string prefix = name.substr(0, split_pos);
++        std::string base = name.substr(split_pos + 1);
++        if (prefix.size() > 155 || base.size() > 100) {
++            return Status::InvalidArgument("tar entry name too long");
++        }
++        memcpy(h->prefix, prefix.data(), prefix.size());
++        memcpy(h->name, base.data(), base.size());
++    } else {
++        return Status::InvalidArgument("tar entry name too long");
++    }
++
++    write_octal(h->mode, sizeof(h->mode), 0644);
++    write_octal(h->uid, sizeof(h->uid), 0);
++    write_octal(h->gid, sizeof(h->gid), 0);
++    write_octal(h->size, sizeof(h->size), static_cast<uint64_t>(file_size));
++    write_octal(h->mtime, sizeof(h->mtime), static_cast<uint64_t>(mtime_sec));
++    memset(h->chksum, ' ', sizeof(h->chksum));
++    h->typeflag = '0';
++    memcpy(h->magic, "ustar", 5);
++    memcpy(h->version, "00", 2);
++
++    unsigned int sum = 0;
++    const unsigned char* p = reinterpret_cast<const unsigned char*>(h);
++    for (size_t i = 0; i < 512; ++i) {
++        sum += p[i];
++    }
++    snprintf(h->chksum, sizeof(h->chksum), "%06o", sum);
++    h->chksum[6] = '\0';
++    h->chksum[7] = ' ';
++    return Status::OK();
++}
++
++std::string get_base_log_dir() {
++    std::string dir = config::sys_log_dir;
++    if (dir.empty()) {
++        const char* env = std::getenv("LOG_DIR");
++        if (env != nullptr) {
++            dir = env;
++        }
++    }
++    return dir;
++}
++
++Status resolve_in_base(const std::string& base_dir, const std::string& input_path, std::string* out) {
++    if (base_dir.empty()) {
++        return Status::InternalError("LOG_DIR is empty");
++    }
++    std::string rel = input_path;
++    if (rel.empty()) {
++        rel = "/";
++    }
++    if (rel[0] == '/') {
++        rel = rel.substr(1);
++    }
++    std::string joined = fmt::format("{}/{}", base_dir, rel);
++    std::string canonical;
++    RETURN_IF_ERROR(io::global_local_filesystem()->canonicalize(joined, &canonical));
++    std::string canonical_base;
++    RETURN_IF_ERROR(io::global_local_filesystem()->canonicalize(base_dir, &canonical_base));
++    if (!io::LocalFileSystem::contain_path(canonical_base, canonical)) {
++        return Status::InvalidArgument("invalid path");
++    }
++    *out = canonical;
++    return Status::OK();
++}
++
++int64_t get_tail_bytes(HttpRequest* req) {
++    const auto& p = req->param("tail_bytes");
++    if (p.empty()) {
++        return 1024 * 1024;
++    }
++    auto v = safe_stoi(p, "tail_bytes");
++    if (!v.has_value()) {
++        return 1024 * 1024;
++    }
++    int64_t n = v.value();
++    if (n < 64 * 1024) {
++        n = 64 * 1024;
++    }
++    if (n > 4 * 1024 * 1024) {
++        n = 4 * 1024 * 1024;
++    }
++    return n;
++}
++
++std::string sanitize_file_name(std::string name) {
++    for (char& c : name) {
++        if (c == '/' || c == '\\' || c == '\r' || c == '\n') {
++            c = '_';
++        }
++    }
++    if (name.empty()) {
++        name = "download";
++    }
++    return name;
++}
++
++Status send_file_attachment(HttpRequest* req, const std::string& abs_file, const std::string& download_name,
++                            bufferevent_rate_limit_group* rate_limit_group, const std::string& content_type) {
++    int fd = open(abs_file.c_str(), O_RDONLY);
++    if (fd < 0) {
++        return Status::NotFound("failed to open file");
++    }
++    struct stat st;
++    if (fstat(fd, &st) < 0) {
++        close(fd);
++        return Status::NotFound("failed to stat file");
++    }
++    int64_t file_size = st.st_size;
++    req->add_output_header(HttpHeaders::CONTENT_TYPE, content_type.c_str());
++    req->add_output_header("Content-Disposition",
++                           fmt::format("attachment; filename={}", download_name).c_str());
++
++    if (req->method() == HttpMethod::HEAD) {
++        close(fd);
++        req->add_output_header(HttpHeaders::CONTENT_LENGTH, std::to_string(file_size).c_str());
++        HttpChannel::send_reply(req);
++        return Status::OK();
++    }
++
++    HttpChannel::send_file(req, fd, 0, file_size, rate_limit_group);
++    return Status::OK();
++}
++
++} // namespace
++
++LogFilesAction::LogFilesAction(ExecEnv* exec_env) : HttpHandlerWithAuth(exec_env) {
++    _base_log_dir = get_base_log_dir();
++}
++
++void LogFilesAction::handle(HttpRequest* req) {
++    std::string abs_dir;
++    auto st = resolve_in_base(_base_log_dir, req->param("path"), &abs_dir);
++    if (!st.ok()) {
++        HttpChannel::send_reply(req, HttpStatus::BAD_REQUEST, st.to_string_no_stack());
++        return;
++    }
++
++    bool exists = false;
++    st = io::global_local_filesystem()->exists(abs_dir, &exists);
++    if (!st.ok() || !exists) {
++        HttpChannel::send_reply(req, HttpStatus::NOT_FOUND, "path not exist");
++        return;
++    }
++
++    bool is_dir = false;
++    st = io::global_local_filesystem()->is_directory(abs_dir, &is_dir);
++    if (!st.ok() || !is_dir) {
++        HttpChannel::send_reply(req, HttpStatus::BAD_REQUEST, "path is not directory");
++        return;
++    }
++
++    std::vector<io::FileInfo> files;
++    st = io::global_local_filesystem()->list(abs_dir, false, &files, &exists);
++    if (!st.ok()) {
++        HttpChannel::send_reply(req, HttpStatus::INTERNAL_SERVER_ERROR, st.to_string_no_stack());
++        return;
++    }
++
++    int max_entries = 2000;
++    const auto& max_entries_param = req->param("max_entries");
++    if (!max_entries_param.empty()) {
++        auto v = safe_stoi(max_entries_param, "max_entries");
++        if (v.has_value() && v.value() > 0) {
++            max_entries = v.value();
++        }
++    }
++
++    std::string input_path = req->param("path");
++    if (input_path.empty()) {
++        input_path = "/";
++    }
++    if (input_path.back() != '/') {
++        input_path.push_back('/');
++    }
++
++    EasyJson ej;
++    ej["status"] = "OK";
++    ej["base_log_dir"] = _base_log_dir;
++    ej["path"] = input_path;
++    EasyJson entries = ej.Set("entries", EasyJson::kArray);
++    int count = 0;
++    for (const auto& f : files) {
++        if (count >= max_entries) {
++            break;
++        }
++        EasyJson item = entries.PushBack(EasyJson::kObject);
++        item["name"] = f.file_name;
++        item["is_dir"] = !f.is_file;
++        item["size"] = f.file_size;
++        item["path"] = input_path + f.file_name + (f.is_file ? "" : "/");
++        count++;
++    }
++    req->add_output_header(HttpHeaders::CONTENT_TYPE, "application/json; charset=utf-8");
++    HttpChannel::send_reply(req, HttpStatus::OK, ej.ToString());
++}
++
++LogFileViewAction::LogFileViewAction(ExecEnv* exec_env) : HttpHandlerWithAuth(exec_env) {
++    _base_log_dir = get_base_log_dir();
++}
++
++void LogFileViewAction::handle(HttpRequest* req) {
++    std::string abs_file;
++    auto st = resolve_in_base(_base_log_dir, req->param("path"), &abs_file);
++    if (!st.ok()) {
++        HttpChannel::send_reply(req, HttpStatus::BAD_REQUEST, st.to_string_no_stack());
++        return;
++    }
++
++    bool exists = false;
++    st = io::global_local_filesystem()->exists(abs_file, &exists);
++    if (!st.ok() || !exists) {
++        HttpChannel::send_reply(req, HttpStatus::NOT_FOUND, "file not exist");
++        return;
++    }
++
++    bool is_dir = false;
++    st = io::global_local_filesystem()->is_directory(abs_file, &is_dir);
++    if (!st.ok() || is_dir) {
++        HttpChannel::send_reply(req, HttpStatus::BAD_REQUEST, "path is directory");
++        return;
++    }
++
++    std::ifstream ifs(abs_file, std::ios::binary);
++    if (!ifs.is_open()) {
++        HttpChannel::send_reply(req, HttpStatus::NOT_FOUND, "failed to open file");
++        return;
++    }
++    ifs.seekg(0, std::ios::end);
++    std::streamoff file_size = ifs.tellg();
++    int64_t n = get_tail_bytes(req);
++    std::streamoff start = file_size > n ? (file_size - n) : 0;
++    ifs.seekg(start, std::ios::beg);
++    std::string content;
++    content.assign(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
++    req->add_output_header(HttpHeaders::CONTENT_TYPE, "text/plain; charset=utf-8");
++    HttpChannel::send_reply(req, HttpStatus::OK, content);
++}
++
++LogFileDownloadAction::LogFileDownloadAction(ExecEnv* exec_env,
++                                             std::shared_ptr<bufferevent_rate_limit_group> rate_limit_group)
++        : HttpHandlerWithAuth(exec_env), _rate_limit_group(std::move(rate_limit_group)) {
++    _base_log_dir = get_base_log_dir();
++}
++
++void LogFileDownloadAction::handle(HttpRequest* req) {
++    bool expected = false;
++    if (!g_log_download_in_progress.compare_exchange_strong(expected, true)) {
++        HttpChannel::send_reply(req, HttpStatus::SERVICE_UNAVAILABLE, "another download is in progress");
++        return;
++    }
++    Defer defer([&]() { g_log_download_in_progress.store(false); });
++
++    std::string abs_file;
++    auto st = resolve_in_base(_base_log_dir, req->param("path"), &abs_file);
++    if (!st.ok()) {
++        HttpChannel::send_reply(req, HttpStatus::BAD_REQUEST, st.to_string_no_stack());
++        return;
++    }
++
++    bool exists = false;
++    st = io::global_local_filesystem()->exists(abs_file, &exists);
++    if (!st.ok() || !exists) {
++        HttpChannel::send_reply(req, HttpStatus::NOT_FOUND, "file not exist");
++        return;
++    }
++    bool is_dir = false;
++    st = io::global_local_filesystem()->is_directory(abs_file, &is_dir);
++    if (!st.ok() || is_dir) {
++        HttpChannel::send_reply(req, HttpStatus::BAD_REQUEST, "path is directory");
++        return;
++    }
++
++    std::string name = req->param("download_name");
++    if (name.empty()) {
++        name = path_util::base_name(abs_file);
++    }
++    name = sanitize_file_name(name);
++    st = send_file_attachment(req, abs_file, name, _rate_limit_group.get(), "application/octet-stream");
++    if (!st.ok()) {
++        HttpChannel::send_reply(req, HttpStatus::NOT_FOUND, st.to_string_no_stack());
++        return;
++    }
++}
++
++LogFileArchiveAction::LogFileArchiveAction(ExecEnv* exec_env,
++                                           std::shared_ptr<bufferevent_rate_limit_group> rate_limit_group)
++        : HttpHandlerWithAuth(exec_env), _rate_limit_group(std::move(rate_limit_group)) {
++    _base_log_dir = get_base_log_dir();
++}
++
++void LogFileArchiveAction::handle(HttpRequest* req) {
++    bool expected = false;
++    if (!g_log_download_in_progress.compare_exchange_strong(expected, true)) {
++        HttpChannel::send_reply(req, HttpStatus::SERVICE_UNAVAILABLE, "another download is in progress");
++        return;
++    }
++    Defer defer([&]() { g_log_download_in_progress.store(false); });
++
++    std::string body;
++    try {
++        body = req->get_request_body();
++    } catch (...) {
++        HttpChannel::send_reply(req, HttpStatus::BAD_REQUEST, "invalid request body");
++        return;
++    }
++    if (body.empty()) {
++        HttpChannel::send_reply(req, HttpStatus::BAD_REQUEST, "paths is empty");
++        return;
++    }
++
++    if (starts_with(body, "paths=")) {
++        body = body.substr(strlen("paths="));
++    }
++
++    std::vector<std::string> raw_paths = split(body, "\n");
++    std::vector<std::pair<std::string, std::string>> files;
++    files.reserve(raw_paths.size());
++    for (auto& p : raw_paths) {
++        std::string_view sv = trim(p);
++        if (sv.empty()) {
++            continue;
++        }
++        std::string abs_file;
++        auto st = resolve_in_base(_base_log_dir, std::string(sv), &abs_file);
++        if (!st.ok()) {
++            HttpChannel::send_reply(req, HttpStatus::BAD_REQUEST, st.to_string_no_stack());
++            return;
++        }
++        bool exists = false;
++        st = io::global_local_filesystem()->exists(abs_file, &exists);
++        if (!st.ok() || !exists) {
++            HttpChannel::send_reply(req, HttpStatus::NOT_FOUND, "file not exist");
++            return;
++        }
++        bool is_dir = false;
++        st = io::global_local_filesystem()->is_directory(abs_file, &is_dir);
++        if (!st.ok() || is_dir) {
++            HttpChannel::send_reply(req, HttpStatus::BAD_REQUEST, "path is directory");
++            return;
++        }
++        std::string entry_name = path_util::base_name(abs_file);
++        files.emplace_back(abs_file, entry_name);
++        if (files.size() >= 64) {
++            break;
++        }
++    }
++    if (files.empty()) {
++        HttpChannel::send_reply(req, HttpStatus::BAD_REQUEST, "paths is empty");
++        return;
++    }
++
++    auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
++                      std::chrono::system_clock::now().time_since_epoch())
++                      .count();
++    std::string tmp_file = fmt::format("{}/be_logs_{}.tar.gz", _base_log_dir, ts);
++    FILE* fp = fopen(tmp_file.c_str(), "wb");
++    if (fp == nullptr) {
++        HttpChannel::send_reply(req, HttpStatus::INTERNAL_SERVER_ERROR, "failed to create temp file");
++        return;
++    }
++
++    Status st;
++    {
++        GzipFileWriter gzip(fp, 1);
++        if (!gzip.ok()) {
++            fclose(fp);
++            HttpChannel::send_reply(req, HttpStatus::INTERNAL_SERVER_ERROR, "gzip init failed");
++            return;
++        }
++
++        unsigned char zero_block[512];
++        memset(zero_block, 0, sizeof(zero_block));
++        unsigned char buf[64 * 1024];
++
++        for (const auto& it : files) {
++            const std::string& abs_file = it.first;
++            const std::string& entry_name = it.second;
++            struct stat st_buf;
++            if (stat(abs_file.c_str(), &st_buf) != 0) {
++                st = Status::NotFound("failed to stat file");
++                break;
++            }
++            TarHeader header;
++            st = build_tar_header(&header, entry_name, st_buf.st_size, st_buf.st_mtime);
++            if (!st.ok()) {
++                break;
++            }
++            st = gzip.write(&header, 512);
++            if (!st.ok()) {
++                break;
++            }
++
++            int fd = open(abs_file.c_str(), O_RDONLY);
++            if (fd < 0) {
++                st = Status::NotFound("failed to open file");
++                break;
++            }
++            int64_t remaining = st_buf.st_size;
++            while (remaining > 0) {
++                ssize_t r = read(fd, buf, sizeof(buf));
++                if (r < 0) {
++                    close(fd);
++                    st = Status::IOError("failed to read file");
++                    break;
++                }
++                if (r == 0) {
++                    break;
++                }
++                remaining -= r;
++                st = gzip.write(buf, r);
++                if (!st.ok()) {
++                    close(fd);
++                    break;
++                }
++            }
++            close(fd);
++            if (!st.ok()) {
++                break;
++            }
++
++            int64_t pad = (512 - (st_buf.st_size % 512)) % 512;
++            if (pad > 0) {
++                st = gzip.write(zero_block, pad);
++                if (!st.ok()) {
++                    break;
++                }
++            }
++        }
++
++        if (st.ok()) {
++            st = gzip.write(zero_block, 512);
++        }
++        if (st.ok()) {
++            st = gzip.write(zero_block, 512);
++        }
++        if (st.ok()) {
++            st = gzip.finish();
++        }
++    }
++    fclose(fp);
++
++    if (!st.ok()) {
++        unlink(tmp_file.c_str());
++        HttpChannel::send_reply(req, HttpStatus::INTERNAL_SERVER_ERROR, st.to_string_no_stack());
++        return;
++    }
++
++    std::string name = req->param("download_name");
++    if (name.empty()) {
++        name = "be_logs.tar.gz";
++    }
++    name = sanitize_file_name(name);
++    if (!ends_with(to_lower(name), ".tar.gz")) {
++        name = name + ".tar.gz";
++    }
++    st = send_file_attachment(req, tmp_file, name, _rate_limit_group.get(), "application/gzip");
++    unlink(tmp_file.c_str());
++    if (!st.ok()) {
++        HttpChannel::send_reply(req, HttpStatus::INTERNAL_SERVER_ERROR, st.to_string_no_stack());
++        return;
++    }
++}
++
++} // namespace doris
+diff --git a/be/src/service/http/action/log_file_action.h b/be/src/service/http/action/log_file_action.h
+new file mode 100644
+index 00000000..3347e1de
+--- /dev/null
++++ b/be/src/service/http/action/log_file_action.h
+@@ -0,0 +1,70 @@
++// Licensed to the Apache Software Foundation (ASF) under one
++// or more contributor license agreements.  See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership.  The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License.  You may obtain a copy of the License at
++//
++//   http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing,
++// software distributed under the License is distributed on an
++// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, either express or implied.  See the License for the
++// specific language governing permissions and limitations
++// under the License.
++
++#pragma once
++
++#include <atomic>
++#include <memory>
++
++#include "service/http/http_handler.h"
++
++struct bufferevent_rate_limit_group;
++
++namespace doris {
++
++class ExecEnv;
++
++class LogFilesAction : public HttpHandlerWithAuth {
++public:
++    explicit LogFilesAction(ExecEnv* exec_env);
++    void handle(HttpRequest* req) override;
++
++private:
++    std::string _base_log_dir;
++};
++
++class LogFileViewAction : public HttpHandlerWithAuth {
++public:
++    explicit LogFileViewAction(ExecEnv* exec_env);
++    void handle(HttpRequest* req) override;
++
++private:
++    std::string _base_log_dir;
++};
++
++class LogFileDownloadAction : public HttpHandlerWithAuth {
++public:
++    LogFileDownloadAction(ExecEnv* exec_env, std::shared_ptr<bufferevent_rate_limit_group> rate_limit_group);
++    void handle(HttpRequest* req) override;
++
++private:
++    std::string _base_log_dir;
++    std::shared_ptr<bufferevent_rate_limit_group> _rate_limit_group;
++};
++
++class LogFileArchiveAction : public HttpHandlerWithAuth {
++public:
++    LogFileArchiveAction(ExecEnv* exec_env, std::shared_ptr<bufferevent_rate_limit_group> rate_limit_group);
++    void handle(HttpRequest* req) override;
++
++private:
++    std::string _base_log_dir;
++    std::shared_ptr<bufferevent_rate_limit_group> _rate_limit_group;
++};
++
++} // namespace doris
++
+diff --git a/be/src/service/http/default_path_handlers.cpp b/be/src/service/http/default_path_handlers.cpp
+index 53a00719..7d9eb5eb 100644
+--- a/be/src/service/http/default_path_handlers.cpp
++++ b/be/src/service/http/default_path_handlers.cpp
+@@ -82,6 +82,88 @@ void logs_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* ou
+     (*output) << "<br/>Couldn't open INFO log file: ";
+ }
+ 
++void log_files_page_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* output) {
++    (*output) << "<h2>Log Files</h2>" << std::endl;
++    (*output) << "<div style=\"margin-bottom: 10px;\">" << std::endl;
++    (*output) << "Path: <input id=\"logPath\" style=\"width: 360px;\" value=\"/\"/>" << std::endl;
++    (*output) << "<button id=\"refreshLogs\" style=\"margin-left: 10px;\">Refresh</button>" << std::endl;
++    (*output) << "<button id=\"downloadArchive\" style=\"margin-left: 10px;\">Download tar.gz</button>"
++              << std::endl;
++    (*output) << "<button id=\"clearSelected\" style=\"margin-left: 10px;\">Clear</button>" << std::endl;
++    (*output) << "</div>" << std::endl;
++    (*output) << "<div style=\"display:flex; gap: 12px;\">" << std::endl;
++    (*output) << "<div style=\"flex: 1;\">" << std::endl;
++    (*output) << "<table class=\"table table-striped\" id=\"logFilesTable\">" << std::endl;
++    (*output) << "<thead><tr><th></th><th>Name</th><th>Type</th><th>Size</th><th>Action</th></tr></thead>"
++              << std::endl;
++    (*output) << "<tbody></tbody>" << std::endl;
++    (*output) << "</table>" << std::endl;
++    (*output) << "</div>" << std::endl;
++    (*output) << "<div style=\"flex: 1;\">" << std::endl;
++    (*output) << "<h4>Preview</h4>" << std::endl;
++    (*output) << "<pre id=\"logPreview\" style=\"height: 700px; overflow: auto;\"></pre>" << std::endl;
++    (*output) << "</div>" << std::endl;
++    (*output) << "</div>" << std::endl;
++
++    (*output) << "<form id=\"archiveForm\" method=\"POST\" action=\"/api/log_file/archive\" enctype=\"text/plain\""
++              << " style=\"display:none;\">" << std::endl;
++    (*output) << "<textarea name=\"paths\" id=\"archivePaths\"></textarea>" << std::endl;
++    (*output) << "</form>" << std::endl;
++
++    (*output) << "<script>" << std::endl;
++    (*output) << "let selected = new Set();" << std::endl;
++    (*output) << "function normalizeDir(p) { if (!p) return '/'; if (!p.startsWith('/')) p='/' + p;"
++              << " return p.endsWith('/') ? p : p + '/'; }" << std::endl;
++    (*output) << "function refresh() {" << std::endl;
++    (*output) << "  const p = normalizeDir($('#logPath').val()); $('#logPath').val(p);" << std::endl;
++    (*output) << "  $.ajax({url: '/api/log_files', method:'GET', data:{path:p}, dataType:'json',"
++              << " success: function(resp) {" << std::endl;
++    (*output) << "    const tbody = $('#logFilesTable tbody'); tbody.empty();" << std::endl;
++    (*output) << "    const entries = resp.entries || [];" << std::endl;
++    (*output) << "    entries.forEach(function(e) {" << std::endl;
++    (*output) << "      const isDir = !!e.is_dir; const ep = e.path || '';" << std::endl;
++    (*output) << "      const name = e.name || '';" << std::endl;
++    (*output) << "      const size = e.size || 0;" << std::endl;
++    (*output) << "      const tr = $('<tr></tr>');" << std::endl;
++    (*output) << "      const cb = $('<input type=\"checkbox\"/>');" << std::endl;
++    (*output) << "      if (!isDir) { cb.prop('checked', selected.has(ep));"
++              << " cb.on('change', function(){ if(this.checked){selected.add(ep);} else {selected.delete(ep);} }); }"
++              << " else { cb.prop('disabled', true); }" << std::endl;
++    (*output) << "      tr.append($('<td></td>').append(cb));" << std::endl;
++    (*output) << "      tr.append($('<td></td>').text(name));" << std::endl;
++    (*output) << "      tr.append($('<td></td>').text(isDir ? 'DIR' : 'FILE'));" << std::endl;
++    (*output) << "      tr.append($('<td></td>').text(size));" << std::endl;
++    (*output) << "      const act = $('<td></td>');" << std::endl;
++    (*output) << "      if (isDir) {" << std::endl;
++    (*output) << "        const btn = $('<button type=\"button\">Open</button>');"
++              << " btn.on('click', function(){ $('#logPath').val(normalizeDir(ep)); refresh(); }); act.append(btn);"
++              << std::endl;
++    (*output) << "      } else {" << std::endl;
++    (*output) << "        const viewBtn = $('<button type=\"button\">View</button>');"
++              << " viewBtn.on('click', function(){ $.ajax({url:'/api/log_file/view', method:'GET',"
++              << " data:{path:ep}, success:function(txt){ $('#logPreview').text(txt); },"
++              << " error:function(r){ alert(r.responseText); }}); });" << std::endl;
++    (*output) << "        const dlBtn = $('<button type=\"button\" style=\"margin-left: 6px;\">Download</button>');"
++              << " dlBtn.on('click', function(){ window.location.href = '/api/log_file/download?path='"
++              << " + encodeURIComponent(ep); });" << std::endl;
++    (*output) << "        act.append(viewBtn).append(dlBtn);" << std::endl;
++    (*output) << "      }" << std::endl;
++    (*output) << "      tr.append(act);" << std::endl;
++    (*output) << "      tbody.append(tr);" << std::endl;
++    (*output) << "    });" << std::endl;
++    (*output) << "  }, error: function(r){ alert(r.responseText); } });" << std::endl;
++    (*output) << "}" << std::endl;
++    (*output) << "$('#refreshLogs').on('click', refresh);" << std::endl;
++    (*output) << "$('#clearSelected').on('click', function(){ selected.clear(); refresh(); });" << std::endl;
++    (*output) << "$('#downloadArchive').on('click', function(){" << std::endl;
++    (*output) << "  if (selected.size === 0) { alert('no file selected'); return; }" << std::endl;
++    (*output) << "  $('#archivePaths').val(Array.from(selected).join('\\n'));" << std::endl;
++    (*output) << "  document.getElementById('archiveForm').submit();" << std::endl;
++    (*output) << "});" << std::endl;
++    (*output) << "refresh();" << std::endl;
++    (*output) << "</script>" << std::endl;
++}
++
+ // Registered to handle "/varz", and prints out all command-line flags and their values
+ void config_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* output) {
+     (*output) << "<h2>Configurations</h2>";
+@@ -397,6 +479,8 @@ void cpu_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* out
+ void add_default_path_handlers(WebPageHandler* web_page_handler) {
+     // TODO(yingchun): logs_handler is not implemented yet, so not show it on navigate bar
+     web_page_handler->register_page("/logs", "Logs", logs_handler, false /* is_on_nav_bar */);
++    web_page_handler->register_page("/log_files", "Log Files", log_files_page_handler,
++                                    true /* is_on_nav_bar */);
+     if (!config::hide_webserver_config_page) {
+         web_page_handler->register_page("/varz", "Configs", config_handler,
+                                         true /* is_on_nav_bar */);
+diff --git a/be/src/service/http_service.cpp b/be/src/service/http_service.cpp
+index 314da597..23caeb26 100644
+--- a/be/src/service/http_service.cpp
++++ b/be/src/service/http_service.cpp
+@@ -21,6 +21,7 @@
+ #include <event2/http.h>
+ #include <gen_cpp/FrontendService_types.h>
+ 
++#include <limits>
+ #include <string>
+ #include <vector>
+ 
+@@ -57,6 +58,7 @@
+ #include "service/http/action/jeprofile_actions.h"
+ #include "service/http/action/load_channel_action.h"
+ #include "service/http/action/load_stream_action.h"
++#include "service/http/action/log_file_action.h"
+ #include "service/http/action/meta_action.h"
+ #include "service/http/action/metrics_action.h"
+ #include "service/http/action/pad_rowset_action.h"
+@@ -107,6 +109,27 @@ std::shared_ptr<bufferevent_rate_limit_group> get_rate_limit_group(event_base* e
+     return {bufferevent_rate_limit_group_new(event_base, token_bucket.get()),
+             bufferevent_rate_limit_group_free};
+ }
++
++std::shared_ptr<bufferevent_rate_limit_group> get_web_log_rate_limit_group(event_base* event_base) {
++    auto rate_limit = config::web_log_download_rate_limit_kbs;
++    if (rate_limit <= 0) {
++        return nullptr;
++    }
++
++    auto max_value = std::numeric_limits<int32_t>::max() / 1024 * 10;
++    if (rate_limit > max_value) {
++        LOG(WARNING) << "rate limit is too large, set to max value.";
++        rate_limit = max_value;
++    }
++    struct timeval cfg_tick = {0, 100 * 1000}; // 100ms
++    rate_limit = rate_limit / 10 * 1024;
++
++    auto token_bucket = std::unique_ptr<ev_token_bucket_cfg, decltype(&ev_token_bucket_cfg_free)>(
++            ev_token_bucket_cfg_new(rate_limit, rate_limit * 2, rate_limit, rate_limit * 2, &cfg_tick),
++            ev_token_bucket_cfg_free);
++    return {bufferevent_rate_limit_group_new(event_base, token_bucket.get()),
++            bufferevent_rate_limit_group_free};
++}
+ } // namespace
+ 
+ HttpService::HttpService(ExecEnv* env, int port, int num_threads)
+@@ -124,6 +147,7 @@ Status HttpService::start() {
+ 
+     auto event_base = _ev_http_server->get_event_bases()[0];
+     _rate_limit_group = get_rate_limit_group(event_base.get());
++    _web_log_rate_limit_group = get_web_log_rate_limit_group(event_base.get());
+ 
+     // register load
+     StreamLoadAction* streamload_action = _pool.add(new StreamLoadAction(_env));
+@@ -338,6 +362,21 @@ void HttpService::register_local_handler(StorageEngine& engine) {
+     _ev_http_server->register_handler(HttpMethod::POST, "/api/_tablet/_batch_download",
+                                       batch_download_action);
+ 
++    LogFilesAction* log_files_action = _pool.add(new LogFilesAction(_env));
++    _ev_http_server->register_handler(HttpMethod::GET, "/api/log_files", log_files_action);
++
++    LogFileViewAction* log_file_view_action = _pool.add(new LogFileViewAction(_env));
++    _ev_http_server->register_handler(HttpMethod::GET, "/api/log_file/view", log_file_view_action);
++
++    LogFileDownloadAction* log_file_download_action =
++            _pool.add(new LogFileDownloadAction(_env, _web_log_rate_limit_group));
++    _ev_http_server->register_handler(HttpMethod::GET, "/api/log_file/download", log_file_download_action);
++    _ev_http_server->register_handler(HttpMethod::HEAD, "/api/log_file/download", log_file_download_action);
++
++    LogFileArchiveAction* log_file_archive_action =
++            _pool.add(new LogFileArchiveAction(_env, _web_log_rate_limit_group));
++    _ev_http_server->register_handler(HttpMethod::POST, "/api/log_file/archive", log_file_archive_action);
++
+     if (config::enable_single_replica_load) {
+         DownloadAction* single_replica_download_action = _pool.add(new DownloadAction(
+                 _env, nullptr, allow_paths, config::single_replica_load_download_num_workers));
+diff --git a/be/src/service/http_service.h b/be/src/service/http_service.h
+index b50b5c55..c83271db 100644
+--- a/be/src/service/http_service.h
++++ b/be/src/service/http_service.h
+@@ -56,6 +56,7 @@ private:
+     std::unique_ptr<WebPageHandler> _web_page_handler;
+ 
+     std::shared_ptr<bufferevent_rate_limit_group> _rate_limit_group;
++    std::shared_ptr<bufferevent_rate_limit_group> _web_log_rate_limit_group;
+ 
+     bool stopped = false;
+ };
+diff --git a/fe/fe-common/src/main/java/org/apache/doris/common/Config.java b/fe/fe-common/src/main/java/org/apache/doris/common/Config.java
+index 724d1eb0..8ed296a7 100644
+--- a/fe/fe-common/src/main/java/org/apache/doris/common/Config.java
++++ b/fe/fe-common/src/main/java/org/apache/doris/common/Config.java
+@@ -98,6 +98,9 @@ public class Config extends ConfigBase {
+     @ConfField(description = {"Whether to enable compression for FE log files"})
+     public static boolean sys_log_enable_compress = false;
+ 
++    @ConfField(description = {"Rate limit for FE web log file download, in KB/s. 0 means no limit"})
++    public static int web_log_download_rate_limit_kbs = 20480;
++
+     @ConfField(description = {"The path of the FE audit log file, used to store fe.audit.log"})
+     public static String audit_log_dir = System.getenv("LOG_DIR");
+     @ConfField(description = {"The maximum number of FE audit log files. "
+diff --git a/fe/fe-core/pom.xml b/fe/fe-core/pom.xml
+index 662bc861..e77d7c2b 100644
+--- a/fe/fe-core/pom.xml
++++ b/fe/fe-core/pom.xml
+@@ -238,6 +238,10 @@ under the License.
+             <groupId>commons-io</groupId>
+             <artifactId>commons-io</artifactId>
+         </dependency>
++        <dependency>
++            <groupId>org.apache.commons</groupId>
++            <artifactId>commons-compress</artifactId>
++        </dependency>
+         <dependency>
+             <groupId>com.googlecode.json-simple</groupId>
+             <artifactId>json-simple</artifactId>
+diff --git a/fe/fe-core/src/main/java/org/apache/doris/httpv2/controller/LogFilesController.java b/fe/fe-core/src/main/java/org/apache/doris/httpv2/controller/LogFilesController.java
+new file mode 100644
+index 00000000..e96ac194
+--- /dev/null
++++ b/fe/fe-core/src/main/java/org/apache/doris/httpv2/controller/LogFilesController.java
+@@ -0,0 +1,374 @@
++// Licensed to the Apache Software Foundation (ASF) under one
++// or more contributor license agreements.  See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership.  The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License.  You may obtain a copy of the License at
++//
++//   http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing,
++// software distributed under the License is distributed on an
++// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, either express or implied.  See the License for the
++// specific language governing permissions and limitations
++// under the License.
++
++package org.apache.doris.httpv2.controller;
++
++import org.apache.doris.common.Config;
++import org.apache.doris.httpv2.entity.ResponseEntityBuilder;
++
++import com.google.common.base.Strings;
++import com.google.common.util.concurrent.RateLimiter;
++import jakarta.servlet.http.HttpServletRequest;
++import jakarta.servlet.http.HttpServletResponse;
++import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
++import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
++import org.apache.commons.compress.compressors.gzip.GzipCompressorOutputStream;
++import org.springframework.http.MediaType;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestMethod;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.io.BufferedInputStream;
++import java.io.IOException;
++import java.io.OutputStream;
++import java.io.RandomAccessFile;
++import java.net.URLEncoder;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.DirectoryStream;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.nio.file.attribute.BasicFileAttributes;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.concurrent.Semaphore;
++
++@RestController
++@RequestMapping("/rest/v1")
++public class LogFilesController {
++    private static final Semaphore DOWNLOAD_SEMAPHORE = new Semaphore(1);
++    private static final int DEFAULT_MAX_ENTRIES = 2000;
++    private static final int DEFAULT_TAIL_BYTES = 1024 * 1024;
++    private static final int MAX_TAIL_BYTES = 4 * 1024 * 1024;
++    private static final int MIN_TAIL_BYTES = 64 * 1024;
++
++    @RequestMapping(path = "/log_files", method = RequestMethod.GET)
++    public Object list(@RequestParam(value = "path", required = false) String path,
++                       @RequestParam(value = "include_dir", required = false, defaultValue = "true") boolean includeDir,
++                       @RequestParam(value = "include_file", required = false, defaultValue = "true") boolean includeFile,
++                       @RequestParam(value = "max_entries", required = false) Integer maxEntries) {
++        int limit = maxEntries == null ? DEFAULT_MAX_ENTRIES : Math.max(1, maxEntries);
++        Path baseDir;
++        Path dir;
++        try {
++            baseDir = getBaseLogDir();
++            dir = resolveInBase(baseDir, path);
++        } catch (RuntimeException e) {
++            return ResponseEntityBuilder.okWithCommonError(e.getMessage());
++        }
++        if (!Files.exists(dir) || !Files.isDirectory(dir)) {
++            return ResponseEntityBuilder.okWithCommonError("path does not exist or is not a directory: " + path);
++        }
++
++        Map<String, Object> result = new HashMap<>();
++        List<String> columnNames = new ArrayList<>();
++        columnNames.add("Name");
++        columnNames.add("Size");
++        columnNames.add("Last Modified");
++        columnNames.add("Type");
++        result.put("column_names", columnNames);
++
++        List<Map<String, Object>> rows = new ArrayList<>();
++        boolean truncated = false;
++        try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir)) {
++            for (Path p : ds) {
++                if (rows.size() >= limit) {
++                    truncated = true;
++                    break;
++                }
++                BasicFileAttributes attrs;
++                try {
++                    attrs = Files.readAttributes(p, BasicFileAttributes.class);
++                } catch (IOException e) {
++                    continue;
++                }
++                boolean isDir = attrs.isDirectory();
++                if (isDir && !includeDir) {
++                    continue;
++                }
++                if (!isDir && !includeFile) {
++                    continue;
++                }
++                String name = p.getFileName().toString();
++                Map<String, Object> row = new LinkedHashMap<>();
++                row.put("Name", name);
++                row.put("Size", isDir ? 0 : attrs.size());
++                row.put("Last Modified", attrs.lastModifiedTime().toMillis());
++                row.put("Type", isDir ? "DIR" : "FILE");
++                String rel = "/" + baseDir.relativize(p).toString().replace('\\', '/');
++                row.put("__path", rel);
++                rows.add(row);
++            }
++        } catch (IOException e) {
++            return ResponseEntityBuilder.okWithCommonError("failed to list directory: " + e.getMessage());
++        }
++        result.put("rows", rows);
++        result.put("truncated", truncated);
++        result.put("base_log_dir", baseDir.toString());
++        result.put("path", normalizePath(path));
++        return ResponseEntityBuilder.ok(result);
++    }
++
++    @RequestMapping(path = "/log_file/view", method = RequestMethod.GET)
++    public Object view(@RequestParam(value = "path") String path,
++                       @RequestParam(value = "tail_bytes", required = false) Integer tailBytes) {
++        int n = tailBytes == null ? DEFAULT_TAIL_BYTES : tailBytes;
++        n = Math.min(MAX_TAIL_BYTES, Math.max(MIN_TAIL_BYTES, n));
++        Path baseDir;
++        Path file;
++        try {
++            baseDir = getBaseLogDir();
++            file = resolveInBase(baseDir, path);
++        } catch (RuntimeException e) {
++            return ResponseEntityBuilder.okWithCommonError(e.getMessage());
++        }
++        if (!Files.exists(file) || Files.isDirectory(file)) {
++            return ResponseEntityBuilder.okWithCommonError("path does not exist or is not a file: " + path);
++        }
++        try {
++            String content = readTail(file, n);
++            return ResponseEntityBuilder.ok(content);
++        } catch (IOException e) {
++            return ResponseEntityBuilder.okWithCommonError("failed to read file: " + e.getMessage());
++        }
++    }
++
++    @RequestMapping(path = "/log_file/download", method = RequestMethod.GET)
++    public void download(@RequestParam(value = "path") String path,
++                         @RequestParam(value = "download_name", required = false) String downloadName,
++                         HttpServletRequest request, HttpServletResponse response) throws IOException {
++        if (!DOWNLOAD_SEMAPHORE.tryAcquire()) {
++            response.sendError(429, "another download is in progress");
++            return;
++        }
++        try {
++            Path baseDir;
++            Path file;
++            try {
++                baseDir = getBaseLogDir();
++                file = resolveInBase(baseDir, path);
++            } catch (RuntimeException e) {
++                response.sendError(400, e.getMessage());
++                return;
++            }
++            if (!Files.exists(file) || Files.isDirectory(file)) {
++                response.sendError(404, "path does not exist or is not a file");
++                return;
++            }
++            String name = Strings.isNullOrEmpty(downloadName) ? file.getFileName().toString() : sanitizeFileName(downloadName);
++            streamFileWithLimit(file, name, response);
++        } finally {
++            DOWNLOAD_SEMAPHORE.release();
++        }
++    }
++
++    @RequestMapping(path = "/log_file/archive", method = RequestMethod.POST)
++    public void archive(@RequestBody ArchiveRequest archiveRequest,
++                        HttpServletRequest request, HttpServletResponse response) throws IOException {
++        if (archiveRequest == null) {
++            response.sendError(400, "invalid request");
++            return;
++        }
++        archiveInternal(archiveRequest.paths, archiveRequest.download_name, response);
++    }
++
++    @RequestMapping(path = "/log_file/archive", method = RequestMethod.POST, consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE)
++    public void archiveForm(@RequestParam(value = "path") List<String> paths,
++                            @RequestParam(value = "download_name", required = false) String downloadName,
++                            HttpServletResponse response) throws IOException {
++        archiveInternal(paths, downloadName, response);
++    }
++
++    private void archiveInternal(List<String> paths, String downloadName, HttpServletResponse response) throws IOException {
++        if (paths == null || paths.isEmpty()) {
++            response.sendError(400, "paths is empty");
++            return;
++        }
++        if (!DOWNLOAD_SEMAPHORE.tryAcquire()) {
++            response.sendError(429, "another download is in progress");
++            return;
++        }
++        try {
++            Path baseDir;
++            try {
++                baseDir = getBaseLogDir();
++            } catch (RuntimeException e) {
++                response.sendError(500, e.getMessage());
++                return;
++            }
++            List<Path> files = new ArrayList<>();
++            for (String p : paths) {
++                Path file;
++                try {
++                    file = resolveInBase(baseDir, p);
++                } catch (RuntimeException e) {
++                    response.sendError(400, e.getMessage());
++                    return;
++                }
++                if (!Files.exists(file) || Files.isDirectory(file)) {
++                    response.sendError(404, "path does not exist or is not a file: " + p);
++                    return;
++                }
++                files.add(file);
++            }
++
++            String outName = Strings.isNullOrEmpty(downloadName)
++                    ? "fe_logs.tar.gz"
++                    : sanitizeFileName(downloadName);
++            if (!outName.toLowerCase(Locale.ROOT).endsWith(".tar.gz")) {
++                outName = outName + ".tar.gz";
++            }
++
++            response.setContentType("application/gzip");
++            response.setHeader("Content-Disposition", "attachment; filename=" + encodeAttachmentFilename(outName));
++
++            RateLimiter limiter = createRateLimiter();
++            try (OutputStream os = response.getOutputStream();
++                 GzipCompressorOutputStream gzip = new GzipCompressorOutputStream(os);
++                 TarArchiveOutputStream tar = new TarArchiveOutputStream(gzip)) {
++                tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_POSIX);
++                byte[] buf = new byte[64 * 1024];
++                for (Path f : files) {
++                    String entryName = baseDir.relativize(f).toString().replace('\\', '/');
++                    if (Strings.isNullOrEmpty(entryName)) {
++                        entryName = f.getFileName().toString();
++                    }
++                    TarArchiveEntry entry = new TarArchiveEntry(f.toFile(), entryName);
++                    tar.putArchiveEntry(entry);
++                    try (BufferedInputStream bis = new BufferedInputStream(Files.newInputStream(f))) {
++                        int r;
++                        while ((r = bis.read(buf)) >= 0) {
++                            if (r == 0) {
++                                continue;
++                            }
++                            if (limiter != null) {
++                                limiter.acquire(r);
++                            }
++                            tar.write(buf, 0, r);
++                        }
++                    }
++                    tar.closeArchiveEntry();
++                }
++                tar.finish();
++            }
++        } finally {
++            DOWNLOAD_SEMAPHORE.release();
++        }
++    }
++
++    public static class ArchiveRequest {
++        public List<String> paths;
++        public String format;
++        public String download_name;
++    }
++
++    private static String readTail(Path file, int tailBytes) throws IOException {
++        try (RandomAccessFile raf = new RandomAccessFile(file.toFile(), "r")) {
++            long fileSize = raf.length();
++            long startPos = fileSize < tailBytes ? 0L : fileSize - tailBytes;
++            raf.seek(startPos);
++            byte[] data = new byte[(int) (fileSize - startPos)];
++            raf.readFully(data);
++            return new String(data, StandardCharsets.UTF_8);
++        }
++    }
++
++    private static void streamFileWithLimit(Path file, String downloadName, HttpServletResponse response)
++            throws IOException {
++        response.setContentType(MediaType.APPLICATION_OCTET_STREAM_VALUE);
++        response.setHeader("Content-Disposition", "attachment; filename=" + encodeAttachmentFilename(downloadName));
++
++        RateLimiter limiter = createRateLimiter();
++        byte[] buf = new byte[64 * 1024];
++        try (OutputStream os = response.getOutputStream();
++             BufferedInputStream bis = new BufferedInputStream(Files.newInputStream(file))) {
++            int r;
++            while ((r = bis.read(buf)) >= 0) {
++                if (r == 0) {
++                    continue;
++                }
++                if (limiter != null) {
++                    limiter.acquire(r);
++                }
++                os.write(buf, 0, r);
++            }
++        }
++    }
++
++    private static RateLimiter createRateLimiter() {
++        int kbs = Config.web_log_download_rate_limit_kbs;
++        if (kbs <= 0) {
++            return null;
++        }
++        long bytesPerSec = (long) kbs * 1024L;
++        return RateLimiter.create((double) bytesPerSec);
++    }
++
++    private static Path getBaseLogDir() {
++        String base = Strings.isNullOrEmpty(Config.sys_log_dir) ? System.getenv("LOG_DIR") : Config.sys_log_dir;
++        if (Strings.isNullOrEmpty(base)) {
++            throw new IllegalStateException("LOG_DIR is empty");
++        }
++        return Paths.get(base).normalize();
++    }
++
++    private static Path resolveInBase(Path baseDir, String inputPath) {
++        String p = normalizePath(inputPath);
++        if (p.startsWith("/")) {
++            p = p.substring(1);
++        }
++        Path resolved = baseDir.resolve(p).normalize();
++        if (!resolved.startsWith(baseDir)) {
++            throw new IllegalArgumentException("invalid path");
++        }
++        return resolved;
++    }
++
++    private static String normalizePath(String path) {
++        if (Strings.isNullOrEmpty(path)) {
++            return "/";
++        }
++        String p = path.trim();
++        if (p.isEmpty()) {
++            return "/";
++        }
++        if (!p.startsWith("/")) {
++            p = "/" + p;
++        }
++        return p;
++    }
++
++    private static String sanitizeFileName(String name) {
++        String n = name.replace('\\', '_').replace('/', '_');
++        n = n.replace("\r", "_").replace("\n", "_");
++        if (n.isEmpty()) {
++            return "download";
++        }
++        return n;
++    }
++
++    private static String encodeAttachmentFilename(String fileName) {
++        String encoded = URLEncoder.encode(fileName, StandardCharsets.UTF_8);
++        return encoded.replace("+", "%20");
++    }
++}
+diff --git a/fe/fe-core/src/test/java/org/apache/doris/httpv2/LogFilesControllerTest.java b/fe/fe-core/src/test/java/org/apache/doris/httpv2/LogFilesControllerTest.java
+new file mode 100644
+index 00000000..eb645325
+--- /dev/null
++++ b/fe/fe-core/src/test/java/org/apache/doris/httpv2/LogFilesControllerTest.java
+@@ -0,0 +1,50 @@
++// Licensed to the Apache Software Foundation (ASF) under one
++// or more contributor license agreements.  See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership.  The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License.  You may obtain a copy of the License at
++//
++//   http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing,
++// software distributed under the License is distributed on an
++// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++// KIND, either express or implied.  See the License for the
++// specific language governing permissions and limitations
++// under the License.
++
++package org.apache.doris.httpv2;
++
++import org.apache.doris.common.Config;
++import org.apache.doris.httpv2.controller.LogFilesController;
++
++import org.junit.jupiter.api.Assertions;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++
++import java.io.File;
++import java.lang.reflect.Method;
++import java.nio.file.Path;
++
++public class LogFilesControllerTest {
++
++    @TempDir
++    public File tempDir;
++
++    @Test
++    public void testResolveInBase() throws Exception {
++        Config.sys_log_dir = tempDir.getAbsolutePath();
++        Path base = tempDir.toPath().normalize();
++        Method method = LogFilesController.class.getDeclaredMethod("resolveInBase", Path.class, String.class);
++        method.setAccessible(true);
++
++        Object resolved = method.invoke(null, base, "/a.log");
++        Assertions.assertEquals(base.resolve("a.log").normalize(), resolved);
++
++        Assertions.assertThrows(Exception.class, () -> method.invoke(null, base, "/../etc/passwd"));
++        Assertions.assertThrows(Exception.class, () -> method.invoke(null, base, "../etc/passwd"));
++    }
++}
++
+diff --git a/ui/src/api/api.ts b/ui/src/api/api.ts
+index f9e6d0c4..c8dc4abb 100644
+--- a/ui/src/api/api.ts
++++ b/ui/src/api/api.ts
+@@ -76,6 +76,23 @@ export function queryProfile<T>(data: any): Promise<Result<T>> {
+     return request(LocalUrl, data);
+ }
+ 
++export function getLogFiles<T>(data: any): Promise<Result<T>> {
++    const localPath = data?.path ? encodeURIComponent(data.path) : encodeURIComponent('/');
++    return request(`/rest/v1/log_files?path=${localPath}`, {
++        method: 'GET',
++        ...data
++    });
++}
++
++export function viewLogFile<T>(data: any): Promise<Result<T>> {
++    const localPath = encodeURIComponent(data.path);
++    const tailBytes = data?.tail_bytes ? `&tail_bytes=${data.tail_bytes}` : '';
++    return request(`/rest/v1/log_file/view?path=${localPath}${tailBytes}`, {
++        method: 'GET',
++        ...data
++    });
++}
++
+ //session
+ export function getSession<T>(data: any): Promise<Result<T>> {
+     return request('/rest/v1/session', data);
+@@ -142,6 +159,8 @@ export const AdHocAPI = {
+     doQuery,
+     doUp,
+     getLog,
++    getLogFiles,
++    viewLogFile,
+     queryProfile,
+     logOut,
+     getHardwareInfo,
+diff --git a/ui/src/pages/layout/index.tsx b/ui/src/pages/layout/index.tsx
+index 5feeb45a..8ba5725d 100644
+--- a/ui/src/pages/layout/index.tsx
++++ b/ui/src/pages/layout/index.tsx
+@@ -41,7 +41,7 @@ function Layouts(props: any) {
+     //Jump page
+     function handleClick(e) {
+         setCurrent(e.key);
+-        if (e.key.includes('/System')) {
++        if (e.key.includes('/System') || e.key.includes('/LogFiles')) {
+             history.push(`${e.key}?path=/`);
+             return;
+         }
+diff --git a/ui/src/pages/log-files/index.tsx b/ui/src/pages/log-files/index.tsx
+new file mode 100644
+index 00000000..6ace7451
+--- /dev/null
++++ b/ui/src/pages/log-files/index.tsx
+@@ -0,0 +1,285 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++import React, { useEffect, useMemo, useRef, useState } from 'react';
++import { Button, Col, Row, Space, Typography, Tag } from 'antd';
++import Table from 'Src/components/table';
++import { getLogFiles, viewLogFile } from 'Src/api/api';
++import { Result } from '@src/interfaces/http.interface';
++import { getBasePath } from 'Src/utils/utils';
++import { useHistory } from 'react-router-dom';
++
++const { Title, Text } = Typography;
++
++function getPathFromSearch(): string {
++    const sp = new URLSearchParams(location.search);
++    const p = sp.get('path') || '/';
++    if (p === '/') {
++        return '/';
++    }
++    return p.endsWith('/') ? p : p + '/';
++}
++
++function getParentPath(p: string): string {
++    if (!p || p === '/') {
++        return '/';
++    }
++    const s = p.endsWith('/') ? p.slice(0, -1) : p;
++    const idx = s.lastIndexOf('/');
++    if (idx <= 0) {
++        return '/';
++    }
++    return s.slice(0, idx) + '/';
++}
++
++function openDownload(url: string) {
++    const tagA = document.createElement('a');
++    tagA.style.display = 'none';
++    tagA.href = url;
++    document.body.appendChild(tagA);
++    tagA.click();
++    document.body.removeChild(tagA);
++}
++
++function submitArchive(paths: string[]) {
++    const basePath = getBasePath();
++    const form = document.createElement('form');
++    form.method = 'POST';
++    form.action = `${basePath}/rest/v1/log_file/archive`;
++    form.style.display = 'none';
++    paths.forEach((p) => {
++        const input = document.createElement('input');
++        input.name = 'path';
++        input.value = p;
++        form.appendChild(input);
++    });
++    const downloadName = document.createElement('input');
++    downloadName.name = 'download_name';
++    downloadName.value = 'fe_logs.tar.gz';
++    form.appendChild(downloadName);
++    document.body.appendChild(form);
++    form.submit();
++    document.body.removeChild(form);
++}
++
++export default function LogFiles() {
++    const container = useRef<HTMLDivElement>(null);
++    const history = useHistory();
++    const [allTableData, setAllTableData] = useState({
++        column_names: [],
++        rows: [],
++    });
++    const [packPaths, setPackPaths] = useState<string[]>([]);
++
++    const currentPath = useMemo(() => getPathFromSearch(), [location.search]);
++
++    const refresh = function (ac?: AbortController) {
++        getLogFiles({
++            path: currentPath,
++            signal: ac?.signal,
++        })
++            .then((res: Result<any>) => {
++                if (res && res.msg === 'success') {
++                    const data = res.data || {};
++                    const colNames = (data.column_names || []).slice();
++                    if (!colNames.includes('Action')) {
++                        colNames.push('Action');
++                    }
++                    const rows = (data.rows || []).map((row) => {
++                        if (row.Type === 'FILE') {
++                            const filePath = row.__path;
++                            const isAdded = packPaths.includes(filePath);
++                            row.Action = (
++                                <Space>
++                                    <Button
++                                        size="small"
++                                        onClick={() => {
++                                            viewLogFile({
++                                                path: filePath,
++                                            }).then((r: Result<any>) => {
++                                                if (
++                                                    r &&
++                                                    r.msg === 'success' &&
++                                                    typeof r.data === 'string'
++                                                ) {
++                                                    if (
++                                                        container.current !==
++                                                        null
++                                                    ) {
++                                                        container.current.innerText =
++                                                            r.data;
++                                                    }
++                                                }
++                                            });
++                                        }}
++                                    >
++                                        View
++                                    </Button>
++                                    <Button
++                                        size="small"
++                                        onClick={() => {
++                                            const basePath = getBasePath();
++                                            openDownload(
++                                                `${basePath}/rest/v1/log_file/download?path=${encodeURIComponent(
++                                                    filePath
++                                                )}`
++                                            );
++                                        }}
++                                    >
++                                        Download
++                                    </Button>
++                                    <Button
++                                        size="small"
++                                        onClick={() => {
++                                            setPackPaths((prev) => {
++                                                if (prev.includes(filePath)) {
++                                                    return prev.filter(
++                                                        (x) => x !== filePath
++                                                    );
++                                                }
++                                                return prev.concat(filePath);
++                                            });
++                                        }}
++                                    >
++                                        {isAdded ? 'Remove' : 'Add'}
++                                    </Button>
++                                </Space>
++                            );
++                        } else if (row.Type === 'DIR') {
++                            const dirPath = row.__path;
++                            row.Action = (
++                                <Button
++                                    size="small"
++                                    onClick={() => {
++                                        const p = dirPath.endsWith('/')
++                                            ? dirPath
++                                            : dirPath + '/';
++                                        history.push(
++                                            `/LogFiles?path=${encodeURIComponent(
++                                                p
++                                            )}`
++                                        );
++                                    }}
++                                >
++                                    Open
++                                </Button>
++                            );
++                        } else {
++                            row.Action = '';
++                        }
++                        return row;
++                    });
++                    setAllTableData({
++                        column_names: colNames,
++                        rows,
++                    });
++                } else {
++                    setAllTableData({
++                        column_names: [],
++                        rows: [],
++                    });
++                }
++            })
++            .catch(() => {});
++    };
++
++    useEffect(() => {
++        const ac = new AbortController();
++        refresh(ac);
++        return () => ac.abort();
++    }, [location.search, packPaths.length]);
++
++    return (
++        <Typography style={{ padding: '30px' }}>
++            <Title>Log Files</Title>
++            <Row style={{ paddingBottom: '15px' }}>
++                <Col span={12}>
++                    <Space>
++                        <Text strong={true}>Current path:</Text>
++                        <Tag>{currentPath}</Tag>
++                    </Space>
++                </Col>
++                <Col span={12} style={{ textAlign: 'right' }}>
++                    <Space>
++                        <Button
++                            onClick={() => {
++                                const parent = getParentPath(currentPath);
++                                history.push(
++                                    `/LogFiles?path=${encodeURIComponent(
++                                        parent
++                                    )}`
++                                );
++                            }}
++                            disabled={currentPath === '/'}
++                        >
++                            Back
++                        </Button>
++                        <Button
++                            onClick={() => {
++                                refresh();
++                            }}
++                        >
++                            Refresh
++                        </Button>
++                        <Button
++                            type="primary"
++                            onClick={() => submitArchive(packPaths)}
++                            disabled={packPaths.length === 0}
++                        >
++                            Download tar.gz
++                        </Button>
++                        <Button
++                            onClick={() => {
++                                setPackPaths([]);
++                            }}
++                            disabled={packPaths.length === 0}
++                        >
++                            Clear
++                        </Button>
++                    </Space>
++                </Col>
++            </Row>
++            <Row gutter={16}>
++                <Col span={14}>
++                    <Table
++                        rowKey={(record) => record.__path || record.Name}
++                        isSort={true}
++                        isFilter={true}
++                        allTableData={allTableData}
++                    />
++                </Col>
++                <Col span={10}>
++                    <Title level={5}>Preview</Title>
++                    <pre
++                        ref={container}
++                        style={{
++                            background: '#f9f9f9',
++                            padding: '20px',
++                            whiteSpace: 'pre-wrap',
++                            fontFamily:
++                                "Menlo, Monaco, 'Courier New', monospace",
++                            height: '800px',
++                            overflowY: 'scroll',
++                        }}
++                    ></pre>
++                </Col>
++            </Row>
++        </Typography>
++    );
++}
+diff --git a/ui/src/router/index.ts b/ui/src/router/index.ts
+index 1d54fde6..9e2cbacb 100644
+--- a/ui/src/router/index.ts
++++ b/ui/src/router/index.ts
+@@ -24,6 +24,7 @@ const Home = asyncComponent(() => import('../pages/home'));
+ const System = asyncComponent(() => import('../pages/system'));
+ const Backend = asyncComponent(() => import('../pages/backend'));
+ const Logs = asyncComponent(() => import('../pages/logs'));
++const LogFiles = asyncComponent(() => import('../pages/log-files'));
+ const QueryProfile = asyncComponent(() => import('../pages/query-profile'));
+ const Session = asyncComponent(() => import('../pages/session'));
+ const Configuration = asyncComponent(() => import('../pages/configuration'));
+@@ -78,6 +79,12 @@ export default {
+                     component: Logs,
+                     title: 'Log',
+                 },
++                {
++                    path: '/LogFiles',
++                    component: LogFiles,
++                    title: 'LogFiles',
++                    search: '?path=/',
++                },
+                 {
+                     path: '/QueryProfile',
+                     component: QueryProfile,
+@@ -120,4 +127,4 @@ export default {
+         },
+         
+     ],
+-};
+\ No newline at end of file
++};
+-- 
+2.43.0
+
