@@ -98,6 +98,9 @@ public class Config extends ConfigBase {
     @ConfField(description = {"Whether to enable compression for FE log files"})
     public static boolean sys_log_enable_compress = false;
 
+    @ConfField(description = {"Rate limit for FE web log file download, in KB/s. 0 means no limit"})
+    public static int web_log_download_rate_limit_kbs = 20480;
+
     @ConfField(description = {"The path of the FE audit log file, used to store fe.audit.log"})
     public static String audit_log_dir = System.getenv("LOG_DIR");
     @ConfField(description = {"The maximum number of FE audit log files. "

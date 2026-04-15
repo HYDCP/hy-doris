@@ -76,6 +76,23 @@ export function queryProfile<T>(data: any): Promise<Result<T>> {
     return request(LocalUrl, data);
 }
 
+export function getLogFiles<T>(data: any): Promise<Result<T>> {
+    const localPath = data?.path ? encodeURIComponent(data.path) : encodeURIComponent('/');
+    return request(`/rest/v1/log_files?path=${localPath}`, {
+        method: 'GET',
+        ...data
+    });
+}
+
+export function viewLogFile<T>(data: any): Promise<Result<T>> {
+    const localPath = encodeURIComponent(data.path);
+    const tailBytes = data?.tail_bytes ? `&tail_bytes=${data.tail_bytes}` : '';
+    return request(`/rest/v1/log_file/view?path=${localPath}${tailBytes}`, {
+        method: 'GET',
+        ...data
+    });
+}
+
 //session
 export function getSession<T>(data: any): Promise<Result<T>> {
     return request('/rest/v1/session', data);
@@ -142,6 +159,8 @@ export const AdHocAPI = {
     doQuery,
     doUp,
     getLog,
+    getLogFiles,
+    viewLogFile,
     queryProfile,
     logOut,
     getHardwareInfo,

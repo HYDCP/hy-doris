@@ -1531,6 +1531,7 @@ DECLARE_mInt64(ingest_binlog_elapsed_threshold_ms);
 
 // Download binlog rate limit, unit is KB/s
 DECLARE_Int32(download_binlog_rate_limit_kbs);
+DECLARE_Int32(web_log_download_rate_limit_kbs);
 
 DECLARE_mInt32(buffered_reader_read_timeout_ms);
 

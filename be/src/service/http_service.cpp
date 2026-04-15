@@ -21,6 +21,7 @@
 #include <event2/http.h>
 #include <gen_cpp/FrontendService_types.h>
 
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -57,6 +58,7 @@
 #include "service/http/action/jeprofile_actions.h"
 #include "service/http/action/load_channel_action.h"
 #include "service/http/action/load_stream_action.h"
+#include "service/http/action/log_file_action.h"
 #include "service/http/action/meta_action.h"
 #include "service/http/action/metrics_action.h"
 #include "service/http/action/pad_rowset_action.h"
@@ -107,6 +109,27 @@ std::shared_ptr<bufferevent_rate_limit_group> get_rate_limit_group(event_base* e
     return {bufferevent_rate_limit_group_new(event_base, token_bucket.get()),
             bufferevent_rate_limit_group_free};
 }
+
+std::shared_ptr<bufferevent_rate_limit_group> get_web_log_rate_limit_group(event_base* event_base) {
+    auto rate_limit = config::web_log_download_rate_limit_kbs;
+    if (rate_limit <= 0) {
+        return nullptr;
+    }
+
+    auto max_value = std::numeric_limits<int32_t>::max() / 1024 * 10;
+    if (rate_limit > max_value) {
+        LOG(WARNING) << "rate limit is too large, set to max value.";
+        rate_limit = max_value;
+    }
+    struct timeval cfg_tick = {0, 100 * 1000}; // 100ms
+    rate_limit = rate_limit / 10 * 1024;
+
+    auto token_bucket = std::unique_ptr<ev_token_bucket_cfg, decltype(&ev_token_bucket_cfg_free)>(
+            ev_token_bucket_cfg_new(rate_limit, rate_limit * 2, rate_limit, rate_limit * 2, &cfg_tick),
+            ev_token_bucket_cfg_free);
+    return {bufferevent_rate_limit_group_new(event_base, token_bucket.get()),
+            bufferevent_rate_limit_group_free};
+}
 } // namespace
 
 HttpService::HttpService(ExecEnv* env, int port, int num_threads)
@@ -124,6 +147,7 @@ Status HttpService::start() {
 
     auto event_base = _ev_http_server->get_event_bases()[0];
     _rate_limit_group = get_rate_limit_group(event_base.get());
+    _web_log_rate_limit_group = get_web_log_rate_limit_group(event_base.get());
 
     // register load
     StreamLoadAction* streamload_action = _pool.add(new StreamLoadAction(_env));
@@ -337,6 +361,21 @@ void HttpService::register_local_handler(StorageEngine& engine) {
                                       batch_download_action);
     _ev_http_server->register_handler(HttpMethod::POST, "/api/_tablet/_batch_download",
                                       batch_download_action);
+
+    LogFilesAction* log_files_action = _pool.add(new LogFilesAction(_env));
+    _ev_http_server->register_handler(HttpMethod::GET, "/api/log_files", log_files_action);
+
+    LogFileViewAction* log_file_view_action = _pool.add(new LogFileViewAction(_env));
+    _ev_http_server->register_handler(HttpMethod::GET, "/api/log_file/view", log_file_view_action);
+
+    LogFileDownloadAction* log_file_download_action =
+            _pool.add(new LogFileDownloadAction(_env, _web_log_rate_limit_group));
+    _ev_http_server->register_handler(HttpMethod::GET, "/api/log_file/download", log_file_download_action);
+    _ev_http_server->register_handler(HttpMethod::HEAD, "/api/log_file/download", log_file_download_action);
+
+    LogFileArchiveAction* log_file_archive_action =
+            _pool.add(new LogFileArchiveAction(_env, _web_log_rate_limit_group));
+    _ev_http_server->register_handler(HttpMethod::POST, "/api/log_file/archive", log_file_archive_action);
 
     if (config::enable_single_replica_load) {
         DownloadAction* single_replica_download_action = _pool.add(new DownloadAction(

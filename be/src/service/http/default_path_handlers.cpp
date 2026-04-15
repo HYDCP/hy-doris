@@ -82,6 +82,88 @@ void logs_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* ou
     (*output) << "<br/>Couldn't open INFO log file: ";
 }
 
+void log_files_page_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* output) {
+    (*output) << "<h2>Log Files</h2>" << std::endl;
+    (*output) << "<div style=\"margin-bottom: 10px;\">" << std::endl;
+    (*output) << "Path: <input id=\"logPath\" style=\"width: 360px;\" value=\"/\"/>" << std::endl;
+    (*output) << "<button id=\"refreshLogs\" style=\"margin-left: 10px;\">Refresh</button>" << std::endl;
+    (*output) << "<button id=\"downloadArchive\" style=\"margin-left: 10px;\">Download tar.gz</button>"
+              << std::endl;
+    (*output) << "<button id=\"clearSelected\" style=\"margin-left: 10px;\">Clear</button>" << std::endl;
+    (*output) << "</div>" << std::endl;
+    (*output) << "<div style=\"display:flex; gap: 12px;\">" << std::endl;
+    (*output) << "<div style=\"flex: 1;\">" << std::endl;
+    (*output) << "<table class=\"table table-striped\" id=\"logFilesTable\">" << std::endl;
+    (*output) << "<thead><tr><th></th><th>Name</th><th>Type</th><th>Size</th><th>Action</th></tr></thead>"
+              << std::endl;
+    (*output) << "<tbody></tbody>" << std::endl;
+    (*output) << "</table>" << std::endl;
+    (*output) << "</div>" << std::endl;
+    (*output) << "<div style=\"flex: 1;\">" << std::endl;
+    (*output) << "<h4>Preview</h4>" << std::endl;
+    (*output) << "<pre id=\"logPreview\" style=\"height: 700px; overflow: auto;\"></pre>" << std::endl;
+    (*output) << "</div>" << std::endl;
+    (*output) << "</div>" << std::endl;
+
+    (*output) << "<form id=\"archiveForm\" method=\"POST\" action=\"/api/log_file/archive\" enctype=\"text/plain\""
+              << " style=\"display:none;\">" << std::endl;
+    (*output) << "<textarea name=\"paths\" id=\"archivePaths\"></textarea>" << std::endl;
+    (*output) << "</form>" << std::endl;
+
+    (*output) << "<script>" << std::endl;
+    (*output) << "let selected = new Set();" << std::endl;
+    (*output) << "function normalizeDir(p) { if (!p) return '/'; if (!p.startsWith('/')) p='/' + p;"
+              << " return p.endsWith('/') ? p : p + '/'; }" << std::endl;
+    (*output) << "function refresh() {" << std::endl;
+    (*output) << "  const p = normalizeDir($('#logPath').val()); $('#logPath').val(p);" << std::endl;
+    (*output) << "  $.ajax({url: '/api/log_files', method:'GET', data:{path:p}, dataType:'json',"
+              << " success: function(resp) {" << std::endl;
+    (*output) << "    const tbody = $('#logFilesTable tbody'); tbody.empty();" << std::endl;
+    (*output) << "    const entries = resp.entries || [];" << std::endl;
+    (*output) << "    entries.forEach(function(e) {" << std::endl;
+    (*output) << "      const isDir = !!e.is_dir; const ep = e.path || '';" << std::endl;
+    (*output) << "      const name = e.name || '';" << std::endl;
+    (*output) << "      const size = e.size || 0;" << std::endl;
+    (*output) << "      const tr = $('<tr></tr>');" << std::endl;
+    (*output) << "      const cb = $('<input type=\"checkbox\"/>');" << std::endl;
+    (*output) << "      if (!isDir) { cb.prop('checked', selected.has(ep));"
+              << " cb.on('change', function(){ if(this.checked){selected.add(ep);} else {selected.delete(ep);} }); }"
+              << " else { cb.prop('disabled', true); }" << std::endl;
+    (*output) << "      tr.append($('<td></td>').append(cb));" << std::endl;
+    (*output) << "      tr.append($('<td></td>').text(name));" << std::endl;
+    (*output) << "      tr.append($('<td></td>').text(isDir ? 'DIR' : 'FILE'));" << std::endl;
+    (*output) << "      tr.append($('<td></td>').text(size));" << std::endl;
+    (*output) << "      const act = $('<td></td>');" << std::endl;
+    (*output) << "      if (isDir) {" << std::endl;
+    (*output) << "        const btn = $('<button type=\"button\">Open</button>');"
+              << " btn.on('click', function(){ $('#logPath').val(normalizeDir(ep)); refresh(); }); act.append(btn);"
+              << std::endl;
+    (*output) << "      } else {" << std::endl;
+    (*output) << "        const viewBtn = $('<button type=\"button\">View</button>');"
+              << " viewBtn.on('click', function(){ $.ajax({url:'/api/log_file/view', method:'GET',"
+              << " data:{path:ep}, success:function(txt){ $('#logPreview').text(txt); },"
+              << " error:function(r){ alert(r.responseText); }}); });" << std::endl;
+    (*output) << "        const dlBtn = $('<button type=\"button\" style=\"margin-left: 6px;\">Download</button>');"
+              << " dlBtn.on('click', function(){ window.location.href = '/api/log_file/download?path='"
+              << " + encodeURIComponent(ep); });" << std::endl;
+    (*output) << "        act.append(viewBtn).append(dlBtn);" << std::endl;
+    (*output) << "      }" << std::endl;
+    (*output) << "      tr.append(act);" << std::endl;
+    (*output) << "      tbody.append(tr);" << std::endl;
+    (*output) << "    });" << std::endl;
+    (*output) << "  }, error: function(r){ alert(r.responseText); } });" << std::endl;
+    (*output) << "}" << std::endl;
+    (*output) << "$('#refreshLogs').on('click', refresh);" << std::endl;
+    (*output) << "$('#clearSelected').on('click', function(){ selected.clear(); refresh(); });" << std::endl;
+    (*output) << "$('#downloadArchive').on('click', function(){" << std::endl;
+    (*output) << "  if (selected.size === 0) { alert('no file selected'); return; }" << std::endl;
+    (*output) << "  $('#archivePaths').val(Array.from(selected).join('\\n'));" << std::endl;
+    (*output) << "  document.getElementById('archiveForm').submit();" << std::endl;
+    (*output) << "});" << std::endl;
+    (*output) << "refresh();" << std::endl;
+    (*output) << "</script>" << std::endl;
+}
+
 // Registered to handle "/varz", and prints out all command-line flags and their values
 void config_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* output) {
     (*output) << "<h2>Configurations</h2>";
@@ -397,6 +479,8 @@ void cpu_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* out
 void add_default_path_handlers(WebPageHandler* web_page_handler) {
     // TODO(yingchun): logs_handler is not implemented yet, so not show it on navigate bar
     web_page_handler->register_page("/logs", "Logs", logs_handler, false /* is_on_nav_bar */);
+    web_page_handler->register_page("/log_files", "Log Files", log_files_page_handler,
+                                    true /* is_on_nav_bar */);
     if (!config::hide_webserver_config_page) {
         web_page_handler->register_page("/varz", "Configs", config_handler,
                                         true /* is_on_nav_bar */);

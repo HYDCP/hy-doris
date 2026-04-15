@@ -24,6 +24,7 @@ const Home = asyncComponent(() => import('../pages/home'));
 const System = asyncComponent(() => import('../pages/system'));
 const Backend = asyncComponent(() => import('../pages/backend'));
 const Logs = asyncComponent(() => import('../pages/logs'));
+const LogFiles = asyncComponent(() => import('../pages/log-files'));
 const QueryProfile = asyncComponent(() => import('../pages/query-profile'));
 const Session = asyncComponent(() => import('../pages/session'));
 const Configuration = asyncComponent(() => import('../pages/configuration'));
@@ -77,6 +78,12 @@ export default {
                     path: '/Log',
                     component: Logs,
                     title: 'Log',
+                },
+                {
+                    path: '/LogFiles',
+                    component: LogFiles,
+                    title: 'LogFiles',
+                    search: '?path=/',
                 },
                 {
                     path: '/QueryProfile',

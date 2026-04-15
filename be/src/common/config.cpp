@@ -1441,6 +1441,7 @@ DEFINE_mInt64(ingest_binlog_elapsed_threshold_ms, "-1");
 
 // Download binlog rate limit, unit is KB/s, 0 means no limit
 DEFINE_Int32(download_binlog_rate_limit_kbs, "0");
+DEFINE_Int32(web_log_download_rate_limit_kbs, "20480");
 
 DEFINE_mInt32(buffered_reader_read_timeout_ms, "600000");
 

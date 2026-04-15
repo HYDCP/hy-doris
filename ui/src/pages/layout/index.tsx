@@ -41,7 +41,7 @@ function Layouts(props: any) {
     //Jump page
     function handleClick(e) {
         setCurrent(e.key);
-        if (e.key.includes('/System')) {
+        if (e.key.includes('/System') || e.key.includes('/LogFiles')) {
             history.push(`${e.key}?path=/`);
             return;
         }

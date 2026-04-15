@@ -56,6 +56,7 @@ private:
     std::unique_ptr<WebPageHandler> _web_page_handler;
 
     std::shared_ptr<bufferevent_rate_limit_group> _rate_limit_group;
+    std::shared_ptr<bufferevent_rate_limit_group> _web_log_rate_limit_group;
 
     bool stopped = false;
 };
