@@ -438,14 +438,6 @@ public class Config extends ConfigBase {
             "The maximum HTTP POST size of Jetty, in bytes, the default value is 100MB."})
     public static int jetty_server_max_http_post_size = 100 * 1024 * 1024;
 
-    @ConfField(mutable = true, description = {
-            "Jetty 在应用未消费完请求体时，额外尝试读取剩余内容的最大次数。"
-                    + "0 表示保持 Jetty 默认行为，-1 表示不限制，正数表示最大读取次数。",
-            "The maximum number of extra reads Jetty performs for unconsumed request content. "
-                    + "0 keeps Jetty's default behavior, -1 means unlimited, and a positive value limits "
-                    + "the read attempts."})
-    public static int jetty_server_max_unconsumed_request_content_reads = 0;
-
     @ConfField(description = {"Jetty 的最大 HTTP header 大小，单位是字节，默认值是 1MB。",
             "The maximum HTTP header size of Jetty, in bytes, the default value is 1MB."})
     public static int jetty_server_max_http_header_size = 1048576;
