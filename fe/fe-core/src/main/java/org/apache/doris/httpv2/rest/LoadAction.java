@@ -731,6 +731,13 @@ public class LoadAction extends RestBaseController {
     private void drainStreamLoadRequestBodyAfterRedirect(HttpServletRequest request, String redirectTarget,
             String dbName, String tableName, String label) {
         long drainLimit = Config.stream_load_redirect_bounded_drain_max_bytes;
+        if (!shouldDrainRequestBodyAfterRedirect(request, drainLimit)) {
+            LOG.info("skip bounded drain after stream load redirect, target: {}, db: {}, tbl: {}, label: {},"
+                            + " max_drain_bytes: {}, content_length: {}, transfer_encoding: {}",
+                    redirectTarget, dbName, tableName, label, drainLimit, request.getContentLengthLong(),
+                    request.getHeader("Transfer-Encoding"));
+            return;
+        }
         LOG.info("write stream load redirect and start bounded drain, target: {}, db: {}, tbl: {}, label: {},"
                         + " max_drain_bytes: {}",
                 redirectTarget, dbName, tableName, label, drainLimit);
@@ -740,6 +747,21 @@ public class LoadAction extends RestBaseController {
                         + " drained_bytes: {}, elapsed_ms: {}, exit_reason: {}",
                 redirectTarget, dbName, tableName, label, drainResult.getDrainedBytes(),
                 drainResult.getElapsedMillis(), drainResult.getExitReason());
+    }
+
+    private boolean shouldDrainRequestBodyAfterRedirect(HttpServletRequest request, long drainLimit) {
+        long contentLength = request.getContentLengthLong();
+        if (contentLength == 0) {
+            return false;
+        }
+        if (contentLength > drainLimit) {
+            return false;
+        }
+        String transferEncoding = request.getHeader("Transfer-Encoding");
+        if (contentLength < 0 && Strings.isNullOrEmpty(transferEncoding)) {
+            return false;
+        }
+        return true;
     }
 
     private Backend selectBackendForGroupCommit(String clusterName, HttpServletRequest req, long tableId)
