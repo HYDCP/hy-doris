@@ -116,6 +116,23 @@ public class LoadActionTest {
     }
 
     @Test
+    public void testCreateRedirectResponseDrainsWhenContentLengthIsZeroButChunked() throws Exception {
+        Config.stream_load_redirect_bounded_drain_max_bytes = 8;
+        Config.stream_load_redirect_bounded_drain_max_idle_time_ms = 0;
+        LoadAction loadAction = new LoadAction();
+        HttpServletRequest request = mockStreamLoadRequest(0, "chunked", true);
+        HttpServletResponse response = Mockito.mock(HttpServletResponse.class);
+
+        Object result = invokeCreateRedirectResponse(loadAction, request, response,
+                new TNetworkAddress("be-host", 8040), true, "db1", "tbl1", "label1");
+
+        Assertions.assertNull(result);
+        Mockito.verify(response).setHeader("Location", "http://be-host:8040/api/db1/tbl1/_stream_load?foo=bar");
+        Mockito.verify(response).flushBuffer();
+        Mockito.verify(request).getInputStream();
+    }
+
+    @Test
     public void testCreateRedirectResponseSkipsDrainWhenContentLengthExceedsLimit() throws Exception {
         Config.stream_load_redirect_bounded_drain_max_bytes = 8;
         Config.stream_load_redirect_bounded_drain_max_idle_time_ms = 0;

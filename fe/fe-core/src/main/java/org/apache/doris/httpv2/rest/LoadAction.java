@@ -751,14 +751,11 @@ public class LoadAction extends RestBaseController {
 
     private boolean shouldDrainRequestBodyAfterRedirect(HttpServletRequest request, long drainLimit) {
         long contentLength = request.getContentLengthLong();
-        if (contentLength == 0) {
-            return false;
-        }
         if (contentLength > drainLimit) {
             return false;
         }
         String transferEncoding = request.getHeader("Transfer-Encoding");
-        if (contentLength < 0 && Strings.isNullOrEmpty(transferEncoding)) {
+        if (contentLength <= 0 && Strings.isNullOrEmpty(transferEncoding)) {
             return false;
         }
         return true;
