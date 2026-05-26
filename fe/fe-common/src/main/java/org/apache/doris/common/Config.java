@@ -3318,7 +3318,7 @@ public class Config extends ConfigBase {
             "The maximum idle wait time in milliseconds after FE detects no readable request body bytes "
                     + "during Stream Load redirect drain. 0 disables the extra idle wait, while a positive value "
                     + "keeps a bounded grace window for slow clients or delayed request body chunks."})
-    public static int stream_load_redirect_bounded_drain_max_idle_time_ms = 1000;
+    public static int stream_load_redirect_bounded_drain_max_idle_time_ms = 10000;
 
     @ConfField(mutable = true, description = {
             "存算分离模式下是否启用group commit的streamload BE转发功能。"
