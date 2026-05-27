@@ -286,6 +286,6 @@ public class StmtExecutorTest extends TestWithFeService {
         sessionVariable.setInsertVisibleTimeoutReturnMode(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR);
         AnalysisException exception = Assertions.assertThrows(AnalysisException.class,
                 () -> StmtExecutor.handleInsertVisibleTimeout(sessionVariable));
-        Assertions.assertEquals(StmtExecutor.INSERT_VISIBLE_TIMEOUT_ERROR_MSG, exception.getMessage());
+        Assertions.assertEquals(StmtExecutor.INSERT_VISIBLE_TIMEOUT_ERROR_MSG, exception.getDetailMessage());
     }
 }
