@@ -212,6 +212,9 @@ public class OlapInsertExecutor extends AbstractInsertExecutor {
                 ctx.getSessionVariable().getInsertVisibleTimeoutMs())) {
             txnStatus = TransactionStatus.VISIBLE;
         } else {
+            // When publish times out after a successful commit, the session variable controls whether
+            // Nereids keeps the legacy OK+COMMITTED behavior or reports the timeout as an explicit error.
+            StmtExecutor.handleInsertVisibleTimeout(ctx.getSessionVariable());
             txnStatus = TransactionStatus.COMMITTED;
         }
         if (Config.isCloudMode()) {

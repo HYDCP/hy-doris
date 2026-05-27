@@ -20,6 +20,7 @@ package org.apache.doris.qe;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.InternalSchemaInitializer;
 import org.apache.doris.catalog.PrimitiveType;
+import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.mysql.MysqlChannel;
@@ -275,5 +276,16 @@ public class StmtExecutorTest extends TestWithFeService {
 
         StmtExecutor executor = new StmtExecutor(mockCtx, stmt, false);
         executor.sendBinaryResultRow(resultSet);
+    }
+
+    @Test
+    public void testInsertVisibleTimeoutErrorHelper() {
+        SessionVariable sessionVariable = VariableMgr.newSessionVariable();
+        Assertions.assertDoesNotThrow(() -> StmtExecutor.handleInsertVisibleTimeout(sessionVariable));
+
+        sessionVariable.setInsertVisibleTimeoutReturnMode(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR);
+        AnalysisException exception = Assertions.assertThrows(AnalysisException.class,
+                () -> StmtExecutor.handleInsertVisibleTimeout(sessionVariable));
+        Assertions.assertEquals(StmtExecutor.INSERT_VISIBLE_TIMEOUT_ERROR_MSG, exception.getMessage());
     }
 }

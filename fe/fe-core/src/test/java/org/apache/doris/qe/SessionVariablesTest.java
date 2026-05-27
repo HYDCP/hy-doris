@@ -136,8 +136,11 @@ public class SessionVariablesTest extends TestWithFeService {
         Assertions.assertEquals(numOfForwardVars, vars.size());
 
         vars.put(SessionVariable.ENABLE_PROFILE, "true");
+        vars.put(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE, "ERROR");
         sessionVariable.setForwardedSessionVariables(vars);
         Assertions.assertTrue(sessionVariable.enableProfile);
+        Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR,
+                sessionVariable.getInsertVisibleTimeoutReturnMode());
     }
 
     @Test
@@ -164,5 +167,29 @@ public class SessionVariablesTest extends TestWithFeService {
 
         Assertions.assertEquals("test",
                 sessionVariableClone.getSessionOriginValue().get(txIsolationSessionVariableField));
+    }
+
+    @Test
+    public void testInsertVisibleTimeoutReturnMode() throws Exception {
+        connectContext.setThreadLocalInfo();
+        SessionVariable sessionVar = connectContext.getSessionVariable();
+
+        String sql = "set insert_visible_timeout_return_mode='ERROR'";
+        SetStmt setStmt = (SetStmt) parseAndAnalyzeStmt(sql, connectContext);
+        SetExecutor setExecutor = new SetExecutor(connectContext, setStmt);
+        setExecutor.execute();
+        Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR,
+                sessionVar.getInsertVisibleTimeoutReturnMode());
+
+        SessionVariable restored = new SessionVariable();
+        restored.readFromJson("{\"insert_visible_timeout_return_mode\":\"ERROR\"}");
+        Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR,
+                restored.getInsertVisibleTimeoutReturnMode());
+
+        sql = "set insert_visible_timeout_return_mode='unexpected'";
+        setStmt = (SetStmt) parseAndAnalyzeStmt(sql, connectContext);
+        SetExecutor invalidSetExecutor = new SetExecutor(connectContext, setStmt);
+        ExceptionChecker.expectThrowsWithMsg(DdlException.class,
+                "insertVisibleTimeoutReturnMode value is invalid", invalidSetExecutor::execute);
     }
 }

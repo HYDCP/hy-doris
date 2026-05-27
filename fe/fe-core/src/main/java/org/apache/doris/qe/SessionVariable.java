@@ -222,6 +222,9 @@ public class SessionVariable implements Serializable, Writable {
 
     // max ms to wait transaction publish finish when exec insert stmt.
     public static final String INSERT_VISIBLE_TIMEOUT_MS = "insert_visible_timeout_ms";
+    public static final String INSERT_VISIBLE_TIMEOUT_RETURN_MODE = "insert_visible_timeout_return_mode";
+    public static final String INSERT_VISIBLE_TIMEOUT_RETURN_MODE_COMMITTED = "committed";
+    public static final String INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR = "error";
 
     public static final String DELETE_WITHOUT_PARTITION = "delete_without_partition";
 
@@ -794,6 +797,11 @@ public class SessionVariable implements Serializable, Writable {
 
     @VariableMgr.VarAttr(name = INSERT_VISIBLE_TIMEOUT_MS, needForward = true)
     public long insertVisibleTimeoutMs = DEFAULT_INSERT_VISIBLE_TIMEOUT_MS;
+
+    // This mode only changes how normal internal-table inserts report publish timeout to clients.
+    @VariableMgr.VarAttr(name = INSERT_VISIBLE_TIMEOUT_RETURN_MODE, needForward = true,
+            checker = "checkInsertVisibleTimeoutReturnMode", setter = "setInsertVisibleTimeoutReturnMode")
+    public String insertVisibleTimeoutReturnMode = INSERT_VISIBLE_TIMEOUT_RETURN_MODE_COMMITTED;
 
     // max memory used on every backend.
     @VariableMgr.VarAttr(name = EXEC_MEM_LIMIT)
@@ -3736,6 +3744,18 @@ public class SessionVariable implements Serializable, Writable {
         }
     }
 
+    public String getInsertVisibleTimeoutReturnMode() {
+        return insertVisibleTimeoutReturnMode;
+    }
+
+    public boolean isInsertVisibleTimeoutReturnError() {
+        return INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR.equals(insertVisibleTimeoutReturnMode);
+    }
+
+    public void setInsertVisibleTimeoutReturnMode(String insertVisibleTimeoutReturnMode) {
+        this.insertVisibleTimeoutReturnMode = normalizeInsertVisibleTimeoutReturnMode(insertVisibleTimeoutReturnMode);
+    }
+
     public boolean getIsSingleSetVar() {
         return isSingleSetVar;
     }
@@ -4481,6 +4501,8 @@ public class SessionVariable implements Serializable, Writable {
         } catch (Exception e) {
             throw new IOException("failed to read session variable: " + e.getMessage());
         }
+        // Normalize serialized string enums so restored sessions keep the same semantics.
+        insertVisibleTimeoutReturnMode = normalizeInsertVisibleTimeoutReturnMode(insertVisibleTimeoutReturnMode);
     }
 
     /**
@@ -4551,6 +4573,8 @@ public class SessionVariable implements Serializable, Writable {
         } catch (IllegalAccessException e) {
             LOG.error("failed to set forward variables", e);
         }
+        // Normalize forwarded string enums because forwarded assignments bypass dedicated setters.
+        insertVisibleTimeoutReturnMode = normalizeInsertVisibleTimeoutReturnMode(insertVisibleTimeoutReturnMode);
     }
 
     /**
@@ -4844,6 +4868,23 @@ public class SessionVariable implements Serializable, Writable {
         }
     }
 
+    public void checkInsertVisibleTimeoutReturnMode(String mode) {
+        if (StringUtils.isEmpty(mode)) {
+            LOG.warn("insertVisibleTimeoutReturnMode value is empty");
+            throw new UnsupportedOperationException("insertVisibleTimeoutReturnMode value is empty");
+        }
+        if (!INSERT_VISIBLE_TIMEOUT_RETURN_MODE_COMMITTED.equalsIgnoreCase(mode)
+                && !INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR.equalsIgnoreCase(mode)) {
+            LOG.warn("insertVisibleTimeoutReturnMode value is invalid, the invalid value is {}", mode);
+            throw new UnsupportedOperationException(
+                    "insertVisibleTimeoutReturnMode value is invalid, the invalid value is " + mode);
+        }
+    }
+
+    public String normalizeInsertVisibleTimeoutReturnMode(String mode) {
+        return mode == null ? null : mode.toLowerCase();
+    }
+
     public void checkBatchSize(String batchSize) {
         Long batchSizeValue = Long.valueOf(batchSize);
         if (batchSizeValue < 1 || batchSizeValue > 65535) {
@@ -5075,4 +5116,3 @@ public class SessionVariable implements Serializable, Writable {
         return defaultVariantMaxSparseColumnStatisticsSize;
     }
 }
-
