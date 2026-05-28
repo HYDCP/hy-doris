@@ -509,6 +509,10 @@ public class SessionVariable implements Serializable, Writable {
 
     public static final String ENABLE_STRONG_CONSISTENCY = "enable_strong_consistency_read";
 
+    public static final String EXTERNAL_TABLE_DML_RETURN_STATUS = "external_table_dml_return_status";
+    public static final String EXTERNAL_TABLE_DML_RETURN_STATUS_VISIBLE = "visible";
+    public static final String EXTERNAL_TABLE_DML_RETURN_STATUS_COMMITTED = "committed";
+
     public static final String GROUP_COMMIT = "group_commit";
 
     public static final String ENABLE_PREPARED_STMT_AUDIT_LOG = "enable_prepared_stmt_audit_log";
@@ -1973,7 +1977,16 @@ public class SessionVariable implements Serializable, Writable {
                     + "within the same session, that is, changes to data within the same session are visible in "
                     + "real time. If you want strong consistent reads between sessions, set this variable to true. "
     })
-    public boolean enableStrongConsistencyRead = false;
+    public boolean enableStrongConsistencyRead = true;
+
+    // This session variable only controls how successful external table DML reports status to the client.
+    @VariableMgr.VarAttr(name = EXTERNAL_TABLE_DML_RETURN_STATUS, needForward = true,
+            checker = "checkExternalTableDmlReturnStatus", setter = "setExternalTableDmlReturnStatus",
+            description = {"控制外表 CTAS 与 INSERT INTO SELECT 成功时返回给客户端的状态。",
+                    "Controls the status returned to the client for successful external table CTAS and "
+                            + "INSERT INTO SELECT statements."},
+            options = {EXTERNAL_TABLE_DML_RETURN_STATUS_VISIBLE, EXTERNAL_TABLE_DML_RETURN_STATUS_COMMITTED})
+    public String externalTableDmlReturnStatus = EXTERNAL_TABLE_DML_RETURN_STATUS_VISIBLE;
 
     @VariableMgr.VarAttr(name = PARALLEL_SYNC_ANALYZE_TASK_NUM)
     public int parallelSyncAnalyzeTaskNum = 2;
@@ -3722,6 +3735,18 @@ public class SessionVariable implements Serializable, Writable {
         this.sqlDialect = sqlDialect == null ? null : sqlDialect.toLowerCase();
     }
 
+    public String getExternalTableDmlReturnStatus() {
+        return externalTableDmlReturnStatus;
+    }
+
+    public boolean isExternalTableDmlReturnVisible() {
+        return EXTERNAL_TABLE_DML_RETURN_STATUS_VISIBLE.equals(externalTableDmlReturnStatus);
+    }
+
+    public void setExternalTableDmlReturnStatus(String externalTableDmlReturnStatus) {
+        this.externalTableDmlReturnStatus = normalizeExternalTableDmlReturnStatus(externalTableDmlReturnStatus);
+    }
+
     /**
      * getInsertVisibleTimeoutMs.
      **/
@@ -4498,6 +4523,8 @@ public class SessionVariable implements Serializable, Writable {
                         throw new IOException("invalid type: " + field.getType().getSimpleName());
                 }
             }
+            // Normalize serialized string enums so forwarded and restored sessions keep the same semantics.
+            externalTableDmlReturnStatus = normalizeExternalTableDmlReturnStatus(externalTableDmlReturnStatus);
         } catch (Exception e) {
             throw new IOException("failed to read session variable: " + e.getMessage());
         }
@@ -4570,6 +4597,8 @@ public class SessionVariable implements Serializable, Writable {
                         throw new IllegalArgumentException("Unknown field type: " + f.getType().getSimpleName());
                 }
             }
+            // Normalize forwarded string enums because forwarded assignments bypass dedicated setters.
+            externalTableDmlReturnStatus = normalizeExternalTableDmlReturnStatus(externalTableDmlReturnStatus);
         } catch (IllegalAccessException e) {
             LOG.error("failed to set forward variables", e);
         }
@@ -4885,11 +4914,31 @@ public class SessionVariable implements Serializable, Writable {
         return mode == null ? null : mode.toLowerCase();
     }
 
+    public void checkExternalTableDmlReturnStatus(String externalTableDmlReturnStatus) {
+        if (StringUtils.isEmpty(externalTableDmlReturnStatus)) {
+            throw new UnsupportedOperationException("externalTableDmlReturnStatus value is empty");
+        }
+        String normalized = normalizeExternalTableDmlReturnStatus(externalTableDmlReturnStatus);
+        if (!EXTERNAL_TABLE_DML_RETURN_STATUS_VISIBLE.equals(normalized)
+                && !EXTERNAL_TABLE_DML_RETURN_STATUS_COMMITTED.equals(normalized)) {
+            throw new UnsupportedOperationException(
+                    "externalTableDmlReturnStatus value is invalid, the invalid value is "
+                            + externalTableDmlReturnStatus);
+        }
+    }
+
     public void checkBatchSize(String batchSize) {
         Long batchSizeValue = Long.valueOf(batchSize);
         if (batchSizeValue < 1 || batchSizeValue > 65535) {
             throw new InvalidParameterException("batch_size should be between 1 and 65535)");
         }
+    }
+
+    // Normalize the user input so the execution path can compare the configured mode directly.
+    private String normalizeExternalTableDmlReturnStatus(String externalTableDmlReturnStatus) {
+        return externalTableDmlReturnStatus == null
+                ? null
+                : externalTableDmlReturnStatus.toLowerCase(Locale.ROOT);
     }
 
     public boolean isEnableInsertGroupCommit() {
