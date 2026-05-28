@@ -212,10 +212,10 @@ public class OlapInsertExecutor extends AbstractInsertExecutor {
                 ctx.getSessionVariable().getInsertVisibleTimeoutMs())) {
             txnStatus = TransactionStatus.VISIBLE;
         } else {
-            // When publish times out after a successful commit, the session variable controls whether
-            // Nereids keeps the legacy OK+COMMITTED behavior or reports the timeout as an explicit error.
-            StmtExecutor.handleInsertVisibleTimeout(ctx.getSessionVariable());
             txnStatus = TransactionStatus.COMMITTED;
+            // Keep the committed internal status before raising the client-side timeout error so that
+            // the timeout path stays aligned with explicit transaction commit semantics.
+            StmtExecutor.handleInsertVisibleTimeout(ctx.getSessionVariable());
         }
         if (Config.isCloudMode()) {
             String clusterName = ctx.getCloudCluster();
@@ -238,9 +238,10 @@ public class OlapInsertExecutor extends AbstractInsertExecutor {
     protected void onFail(Throwable t) {
         errMsg = t.getMessage() == null ? "unknown reason" : t.getMessage();
         String queryId = DebugUtil.printId(ctx.queryId());
-        // if any throwable being thrown during insert operation, first we should abort this txn
+        // Abort only when the transaction has not been committed yet. Publish-timeout errors are
+        // raised after a successful commit and should keep the committed status for diagnostics.
         LOG.warn("insert [{}] with query id {} failed", labelName, queryId, t);
-        if (txnId != INVALID_TXN_ID) {
+        if (txnId != INVALID_TXN_ID && txnStatus != TransactionStatus.COMMITTED) {
             try {
                 Env.getCurrentGlobalTransactionMgr().abortTransaction(
                         database.getId(), txnId, errMsg);
@@ -250,6 +251,9 @@ public class OlapInsertExecutor extends AbstractInsertExecutor {
                 LOG.warn("insert [{}] with query id {} abort txn {} failed",
                         labelName, queryId, txnId, abortTxnException);
             }
+        }
+        if (txnStatus == TransactionStatus.COMMITTED) {
+            recordInsertResult();
         }
         // retry insert into from select when meet "need re-plan error" in cloud
         if (Config.isCloudMode() && SystemInfoService.needRetryWithReplan(t.getMessage())) {
@@ -313,11 +317,14 @@ public class OlapInsertExecutor extends AbstractInsertExecutor {
         sb.append("}");
 
         ctx.getState().setOk(loadedRows, filteredRows, sb.toString());
-        // set insert result in connection context,
-        // so that user can use `show insert result` to get info of the last insert operation.
+        recordInsertResult();
+    }
+
+    private void recordInsertResult() {
+        // Save the actual insert status in the connection context even when the client-facing
+        // response is turned into an error after the transaction has already been committed.
         ctx.setOrUpdateInsertResult(txnId, labelName, database.getFullName(), table.getName(),
                 txnStatus, loadedRows, filteredRows);
-        // update it, so that user can get loaded rows in fe.audit.log
         ctx.updateReturnRows((int) loadedRows);
     }
 
