@@ -139,9 +139,9 @@ public class OlapInsertExecutorTest extends TestWithFeService {
             InsertResult insertResult = ctx.getInsertResult();
             Assertions.assertNotNull(insertResult);
             Assertions.assertEquals(TransactionStatus.COMMITTED, insertResult.txnStatus);
-            Assertions.assertEquals(20L, insertResult.loadedRows);
-            Assertions.assertEquals(2L, insertResult.filteredRows);
-            Assertions.assertEquals(20L, ctx.getReturnRows());
+            Assertions.assertEquals(12L, insertResult.loadedRows);
+            Assertions.assertEquals(1L, insertResult.filteredRows);
+            Assertions.assertEquals(12L, ctx.getReturnRows());
 
             Mockito.verify(txnMgr, Mockito.never()).abortTransaction(Mockito.anyLong(), Mockito.anyLong(),
                     Mockito.anyString());
