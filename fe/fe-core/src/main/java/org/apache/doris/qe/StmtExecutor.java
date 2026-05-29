@@ -263,9 +263,6 @@ import java.util.stream.Collectors;
 // second: Do handle function for statement.
 public class StmtExecutor {
     private static final Logger LOG = LogManager.getLogger(StmtExecutor.class);
-    static final String INSERT_VISIBLE_TIMEOUT_ERROR_MSG = "transaction commit successfully, "
-            + "BUT data did not become visible within insert_visible_timeout_ms and will be visible later.";
-
     private static final AtomicLong STMT_ID_GENERATOR = new AtomicLong(0);
     public static final int MAX_DATA_TO_SEND_FOR_TXN = 100;
     private static Set<String> blockSqlAstNames = Sets.newHashSet();
@@ -306,16 +303,6 @@ public class StmtExecutor {
     // Only one column to indicate the real return row numbers.
     private static final CommonResultSetMetaData DRY_RUN_QUERY_METADATA = new CommonResultSetMetaData(
             Lists.newArrayList(new Column("ReturnedRows", PrimitiveType.STRING)));
-
-    public static void handleInsertVisibleTimeout(SessionVariable sessionVariable) throws AnalysisException {
-        if (sessionVariable != null && sessionVariable.isInsertVisibleTimeoutReturnError()) {
-            throwInsertVisibleTimeoutException();
-        }
-    }
-
-    public static void throwInsertVisibleTimeoutException() throws AnalysisException {
-        throw new AnalysisException(INSERT_VISIBLE_TIMEOUT_ERROR_MSG);
-    }
 
     // this constructor is mainly for proxy
     public StmtExecutor(ConnectContext context, OriginStatement originStmt, boolean isProxy) {

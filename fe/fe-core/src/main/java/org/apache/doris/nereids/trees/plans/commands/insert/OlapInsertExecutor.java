@@ -75,7 +75,12 @@ import java.util.stream.Collectors;
  */
 public class OlapInsertExecutor extends AbstractInsertExecutor {
     private static final Logger LOG = LogManager.getLogger(OlapInsertExecutor.class);
+    // Keep the timeout message aligned with the client-facing error returned by the legacy insert path.
+    private static final String INSERT_VISIBLE_TIMEOUT_ERROR_MSG = "transaction commit successfully, "
+            + "BUT data did not become visible within insert_visible_timeout_ms and will be visible later.";
     protected TransactionStatus txnStatus = TransactionStatus.ABORTED;
+    // Track publish timeout separately from real failures so finished load jobs keep committed metadata.
+    protected boolean publishTimedOutAfterCommit = false;
 
     /**
      * constructor
@@ -212,10 +217,10 @@ public class OlapInsertExecutor extends AbstractInsertExecutor {
                 ctx.getSessionVariable().getInsertVisibleTimeoutMs())) {
             txnStatus = TransactionStatus.VISIBLE;
         } else {
+            // Preserve the committed status and continue with the normal completion path so accounting,
+            // persistence, and cloud sync stay aligned with committed mode.
             txnStatus = TransactionStatus.COMMITTED;
-            // Keep the committed internal status before raising the client-side timeout error so that
-            // the timeout path stays aligned with explicit transaction commit semantics.
-            StmtExecutor.handleInsertVisibleTimeout(ctx.getSessionVariable());
+            publishTimedOutAfterCommit = true;
         }
         if (Config.isCloudMode()) {
             String clusterName = ctx.getCloudCluster();
@@ -238,8 +243,8 @@ public class OlapInsertExecutor extends AbstractInsertExecutor {
     protected void onFail(Throwable t) {
         errMsg = t.getMessage() == null ? "unknown reason" : t.getMessage();
         String queryId = DebugUtil.printId(ctx.queryId());
-        // Abort only when the transaction has not been committed yet. Publish-timeout errors are
-        // raised after a successful commit and should keep the committed status for diagnostics.
+        // Abort only when the transaction has not been committed yet. Failures raised after a
+        // successful commit should keep the committed status for diagnostics.
         LOG.warn("insert [{}] with query id {} failed", labelName, queryId, t);
         if (txnId != INVALID_TXN_ID && txnStatus != TransactionStatus.COMMITTED) {
             try {
@@ -318,6 +323,10 @@ public class OlapInsertExecutor extends AbstractInsertExecutor {
 
         ctx.getState().setOk(loadedRows, filteredRows, sb.toString());
         recordInsertResult();
+        if (publishTimedOutAfterCommit && ctx.getSessionVariable().isInsertVisibleTimeoutReturnError()) {
+            // Convert the final client response to ERR after all committed-side bookkeeping has finished.
+            ctx.getState().setError(ErrorCode.ERR_UNKNOWN_ERROR, INSERT_VISIBLE_TIMEOUT_ERROR_MSG);
+        }
     }
 
     private void recordInsertResult() {

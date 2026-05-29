@@ -21,7 +21,11 @@ import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.EnvFactory;
 import org.apache.doris.catalog.Table;
+import org.apache.doris.common.Status;
 import org.apache.doris.common.profile.ExecutionProfile;
+import org.apache.doris.common.profile.Profile;
+import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.load.loadv2.LoadManager;
 import org.apache.doris.nereids.NereidsPlanner;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.Coordinator;
@@ -29,6 +33,8 @@ import org.apache.doris.qe.InsertResult;
 import org.apache.doris.qe.QueryState.MysqlStateType;
 import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.qe.StmtExecutor;
+import org.apache.doris.task.LoadEtlTask;
+import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TUniqueId;
 import org.apache.doris.transaction.GlobalTransactionMgrIface;
 import org.apache.doris.transaction.TransactionStatus;
@@ -38,6 +44,7 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
@@ -53,29 +60,30 @@ public class OlapInsertExecutorTest extends TestWithFeService {
     }
 
     @Test
-    public void testPublishTimeoutReturnErrorKeepsCommittedStatus() throws Exception {
+    public void testExecuteSingleInsertPublishTimeoutReturnErrorKeepsCommittedAccounting() throws Exception {
         ConnectContext ctx = createExecutorContext();
         ctx.getSessionVariable().setInsertVisibleTimeoutReturnMode(
                 SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR);
 
         Coordinator coordinator = createCoordinator();
         GlobalTransactionMgrIface txnMgr = Mockito.mock(GlobalTransactionMgrIface.class);
+        LoadManager loadManager = Mockito.mock(LoadManager.class);
+        StmtExecutor stmtExecutor = createStmtExecutor();
+        boolean originEnableNereidsLoad = org.apache.doris.common.Config.enable_nereids_load;
 
-        // Mock the transaction publish result so the executor enters the timeout branch.
+        // Keep loadv2 recording enabled so the test validates the full committed accounting path.
+        org.apache.doris.common.Config.enable_nereids_load = false;
         try (MockedStatic<EnvFactory> envFactoryMock = Mockito.mockStatic(EnvFactory.class);
                 MockedStatic<Env> envMock = Mockito.mockStatic(Env.class)) {
             prepareFactoryMocks(envFactoryMock, envMock, coordinator, txnMgr);
+            prepareContextEnv(ctx, loadManager);
             Mockito.when(txnMgr.commitAndPublishTransaction(
                     Mockito.any(), Mockito.anyList(), Mockito.anyLong(), Mockito.anyList(), Mockito.anyLong()))
                     .thenReturn(false);
 
             OlapInsertExecutor executor = createExecutor(ctx);
             executor.txnId = 10001L;
-            executor.loadedRows = 12L;
-            executor.filteredRows = 1;
-
-            Exception exception = Assertions.assertThrows(Exception.class, executor::onComplete);
-            executor.onFail(exception);
+            executor.executeSingleInsert(stmtExecutor, 0L);
 
             Assertions.assertEquals(TransactionStatus.COMMITTED, executor.txnStatus);
             Assertions.assertEquals(MysqlStateType.ERR, ctx.getState().getStateType());
@@ -90,8 +98,16 @@ public class OlapInsertExecutorTest extends TestWithFeService {
             Assertions.assertEquals(1L, insertResult.filteredRows);
             Assertions.assertEquals(12L, ctx.getReturnRows());
 
+            // The finished load job must still be recorded even when the client response becomes ERR.
+            ArgumentCaptor<String> failMsgCaptor = ArgumentCaptor.forClass(String.class);
+            Mockito.verify(loadManager).recordFinishedLoadJob(Mockito.eq("label_test"), Mockito.eq(10001L),
+                    Mockito.eq("test_db"), Mockito.eq(2L), Mockito.any(), Mockito.anyLong(), failMsgCaptor.capture(),
+                    Mockito.isNull(), Mockito.isNull(), Mockito.eq(0L));
+            Assertions.assertEquals("", failMsgCaptor.getValue());
             Mockito.verify(txnMgr, Mockito.never()).abortTransaction(Mockito.anyLong(), Mockito.anyLong(),
                     Mockito.anyString());
+        } finally {
+            org.apache.doris.common.Config.enable_nereids_load = originEnableNereidsLoad;
         }
     }
 
@@ -100,9 +116,10 @@ public class OlapInsertExecutorTest extends TestWithFeService {
         ConnectContext ctx = createExecutorContext();
         Coordinator coordinator = createCoordinator();
         GlobalTransactionMgrIface txnMgr = Mockito.mock(GlobalTransactionMgrIface.class);
+        StmtExecutor stmtExecutor = createStmtExecutor();
         boolean originEnableNereidsLoad = org.apache.doris.common.Config.enable_nereids_load;
 
-        // Keep afterExec focused on client-visible return info so the test only covers timeout handling.
+        // Skip loadv2 recording in this case so the test stays focused on the committed-mode response path.
         org.apache.doris.common.Config.enable_nereids_load = true;
         try (MockedStatic<EnvFactory> envFactoryMock = Mockito.mockStatic(EnvFactory.class);
                 MockedStatic<Env> envMock = Mockito.mockStatic(Env.class)) {
@@ -113,11 +130,7 @@ public class OlapInsertExecutorTest extends TestWithFeService {
 
             OlapInsertExecutor executor = createExecutor(ctx);
             executor.txnId = 10002L;
-            executor.loadedRows = 20L;
-            executor.filteredRows = 2;
-
-            executor.onComplete();
-            executor.afterExec(Mockito.mock(StmtExecutor.class));
+            executor.executeSingleInsert(stmtExecutor, 0L);
 
             Assertions.assertEquals(TransactionStatus.COMMITTED, executor.txnStatus);
             Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
@@ -149,11 +162,24 @@ public class OlapInsertExecutorTest extends TestWithFeService {
     // Prepare the mocked coordinator so the executor can run its completion logic without real execution.
     private Coordinator createCoordinator() {
         Coordinator coordinator = Mockito.mock(Coordinator.class);
+        Mockito.when(coordinator.join(Mockito.anyInt())).thenReturn(true);
+        Mockito.when(coordinator.isDone()).thenReturn(true);
+        Mockito.when(coordinator.getExecStatus()).thenReturn(new Status(TStatusCode.OK, ""));
         Mockito.when(coordinator.getCommitInfos()).thenReturn(Lists.newArrayList());
         Mockito.when(coordinator.getTrackingUrl()).thenReturn(null);
         Mockito.when(coordinator.getExecutionProfile()).thenReturn(Mockito.mock(ExecutionProfile.class));
-        Mockito.when(coordinator.getLoadCounters()).thenReturn(ImmutableMap.of());
+        Mockito.when(coordinator.getLoadCounters()).thenReturn(ImmutableMap.of(
+                LoadEtlTask.DPP_NORMAL_ALL, "12",
+                LoadEtlTask.DPP_ABNORMAL_ALL, "1"));
         return coordinator;
+    }
+
+    // Use a mocked executor so executeSingleInsert can run the real control flow without a full query setup.
+    private StmtExecutor createStmtExecutor() {
+        StmtExecutor stmtExecutor = Mockito.mock(StmtExecutor.class);
+        Mockito.when(stmtExecutor.getProfile()).thenReturn(Mockito.mock(Profile.class));
+        Mockito.when(stmtExecutor.getOriginStmtInString()).thenReturn("insert into test_tbl select 1");
+        return stmtExecutor;
     }
 
     // Create an executor with mocked table metadata because this test only validates timeout result handling.
@@ -169,6 +195,16 @@ public class OlapInsertExecutorTest extends TestWithFeService {
 
         return new OlapInsertExecutor(ctx, table, "label_test", Mockito.mock(NereidsPlanner.class),
                 Optional.empty(), false);
+    }
+
+    // Attach a mocked env so afterExec can record the finished load job without depending on a real FE env.
+    private void prepareContextEnv(ConnectContext ctx, LoadManager loadManager) {
+        Env env = Mockito.mock(Env.class);
+        InternalCatalog internalCatalog = Mockito.mock(InternalCatalog.class);
+        Mockito.when(env.getInternalCatalog()).thenReturn(internalCatalog);
+        Mockito.when(internalCatalog.getName()).thenReturn("internal");
+        Mockito.when(env.getLoadManager()).thenReturn(loadManager);
+        ctx.setEnv(env);
     }
 
     // Redirect coordinator creation and transaction access to mocks so the test stays deterministic.

@@ -804,7 +804,11 @@ public class SessionVariable implements Serializable, Writable {
 
     // This mode only changes how normal internal-table inserts report publish timeout to clients.
     @VariableMgr.VarAttr(name = INSERT_VISIBLE_TIMEOUT_RETURN_MODE, needForward = true,
-            checker = "checkInsertVisibleTimeoutReturnMode", setter = "setInsertVisibleTimeoutReturnMode")
+            checker = "checkInsertVisibleTimeoutReturnMode", setter = "setInsertVisibleTimeoutReturnMode",
+            description = {"控制普通内表 INSERT 在 publish timeout 时返回给客户端的状态。",
+                    "Controls the status returned to the client when a normal internal-table INSERT times out "
+                            + "while waiting for publish visibility."},
+            options = {INSERT_VISIBLE_TIMEOUT_RETURN_MODE_COMMITTED, INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR})
     public String insertVisibleTimeoutReturnMode = INSERT_VISIBLE_TIMEOUT_RETURN_MODE_COMMITTED;
 
     // max memory used on every backend.
@@ -4911,7 +4915,7 @@ public class SessionVariable implements Serializable, Writable {
     }
 
     public String normalizeInsertVisibleTimeoutReturnMode(String mode) {
-        return mode == null ? null : mode.toLowerCase();
+        return mode == null ? null : mode.toLowerCase(Locale.ROOT);
     }
 
     public void checkExternalTableDmlReturnStatus(String externalTableDmlReturnStatus) {

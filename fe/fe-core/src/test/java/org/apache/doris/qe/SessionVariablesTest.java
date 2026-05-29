@@ -34,6 +34,7 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 public class SessionVariablesTest extends TestWithFeService {
@@ -213,6 +214,28 @@ public class SessionVariablesTest extends TestWithFeService {
         restored.readFromJson("{\"insert_visible_timeout_return_mode\":\"ERROR\"}");
         Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR,
                 restored.getInsertVisibleTimeoutReturnMode());
+
+        // Keep normalization locale-independent so variable persistence and display are stable.
+        Locale defaultLocale = Locale.getDefault();
+        try {
+            Locale.setDefault(Locale.forLanguageTag("tr-TR"));
+            Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_COMMITTED,
+                    restored.normalizeInsertVisibleTimeoutReturnMode("COMMITTED"));
+        } finally {
+            Locale.setDefault(defaultLocale);
+        }
+
+        Field field = SessionVariable.class.getDeclaredField("insertVisibleTimeoutReturnMode");
+        VariableMgr.VarAttr varAttr = field.getAnnotation(VariableMgr.VarAttr.class);
+        Assertions.assertArrayEquals(new String[] {
+                "控制普通内表 INSERT 在 publish timeout 时返回给客户端的状态。",
+                "Controls the status returned to the client when a normal internal-table INSERT times out "
+                        + "while waiting for publish visibility."
+        }, varAttr.description());
+        Assertions.assertArrayEquals(new String[] {
+                SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_COMMITTED,
+                SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR
+        }, varAttr.options());
 
         sql = "set insert_visible_timeout_return_mode='unexpected'";
         setStmt = (SetStmt) parseAndAnalyzeStmt(sql, connectContext);
