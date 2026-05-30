@@ -25,6 +25,7 @@ import org.apache.doris.common.Status;
 import org.apache.doris.common.profile.ExecutionProfile;
 import org.apache.doris.common.profile.Profile;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.datasource.hive.HiveTransactionMgr;
 import org.apache.doris.load.loadv2.LoadManager;
 import org.apache.doris.nereids.NereidsPlanner;
 import org.apache.doris.qe.ConnectContext;
@@ -35,6 +36,7 @@ import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.qe.StmtExecutor;
 import org.apache.doris.task.LoadEtlTask;
 import org.apache.doris.thrift.TStatusCode;
+import org.apache.doris.thrift.TQueryOptions;
 import org.apache.doris.thrift.TUniqueId;
 import org.apache.doris.transaction.GlobalTransactionMgrIface;
 import org.apache.doris.transaction.TransactionStatus;
@@ -154,6 +156,8 @@ public class OlapInsertExecutorTest extends TestWithFeService {
     private ConnectContext createExecutorContext() {
         ConnectContext ctx = new ConnectContext();
         ctx.setQueryId(new TUniqueId(1, 2));
+        // Disable strict insert mode because this test intentionally keeps one filtered row in the mocked counters.
+        ctx.getSessionVariable().setEnableInsertStrict(false);
         ctx.getState().reset();
         ctx.resetReturnRows();
         return ctx;
@@ -165,6 +169,8 @@ public class OlapInsertExecutorTest extends TestWithFeService {
         Mockito.when(coordinator.join(Mockito.anyInt())).thenReturn(true);
         Mockito.when(coordinator.isDone()).thenReturn(true);
         Mockito.when(coordinator.getExecStatus()).thenReturn(new Status(TStatusCode.OK, ""));
+        // Provide default query options so the real insert execution path can access profile flags safely.
+        Mockito.when(coordinator.getQueryOptions()).thenReturn(new TQueryOptions());
         Mockito.when(coordinator.getCommitInfos()).thenReturn(Lists.newArrayList());
         Mockito.when(coordinator.getTrackingUrl()).thenReturn(null);
         Mockito.when(coordinator.getExecutionProfile()).thenReturn(Mockito.mock(ExecutionProfile.class));
@@ -211,9 +217,12 @@ public class OlapInsertExecutorTest extends TestWithFeService {
     private void prepareFactoryMocks(MockedStatic<EnvFactory> envFactoryMock, MockedStatic<Env> envMock,
             Coordinator coordinator, GlobalTransactionMgrIface txnMgr) {
         EnvFactory envFactory = Mockito.mock(EnvFactory.class);
+        HiveTransactionMgr hiveTransactionMgr = Mockito.mock(HiveTransactionMgr.class);
         envFactoryMock.when(EnvFactory::getInstance).thenReturn(envFactory);
         Mockito.when(envFactory.createCoordinator(Mockito.any(), Mockito.isNull(), Mockito.any(), Mockito.any()))
                 .thenReturn(coordinator);
         envMock.when(Env::getCurrentGlobalTransactionMgr).thenReturn(txnMgr);
+        // Provide a no-op hive transaction manager so unregisterQuery() can finish its cleanup path safely.
+        envMock.when(Env::getCurrentHiveTransactionMgr).thenReturn(hiveTransactionMgr);
     }
 }
