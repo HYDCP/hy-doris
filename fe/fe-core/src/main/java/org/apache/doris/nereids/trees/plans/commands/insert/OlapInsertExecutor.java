@@ -319,7 +319,12 @@ public class OlapInsertExecutor extends AbstractInsertExecutor {
         sb.append("}");
 
         ctx.getState().setOk(loadedRows, filteredRows, sb.toString());
-        recordInsertResult();
+        // set insert result in connection context,
+        // so that user can use `show insert result` to get info of the last insert operation.
+        ctx.setOrUpdateInsertResult(txnId, labelName, database.getFullName(), table.getName(),
+                txnStatus, loadedRows, filteredRows);
+        // update it, so that user can get loaded rows in fe.audit.log
+        ctx.updateReturnRows((int) loadedRows);
         if (publishTimedOutAfterCommit && ctx.getSessionVariable().isInsertVisibleTimeoutReturnError()) {
             // Log the committed timeout branch explicitly so operators can distinguish it from real failures.
             LOG.warn("insert [{}] with txn id {} committed but return error because {}={}",
@@ -328,14 +333,6 @@ public class OlapInsertExecutor extends AbstractInsertExecutor {
             // Convert the final client response to ERR after all committed-side bookkeeping has finished.
             ctx.getState().setError(ErrorCode.ERR_UNKNOWN_ERROR, INSERT_VISIBLE_TIMEOUT_ERROR_MSG);
         }
-    }
-
-    private void recordInsertResult() {
-        // Save the actual insert status in the connection context even when the client-facing
-        // response is turned into an error after the transaction has already been committed.
-        ctx.setOrUpdateInsertResult(txnId, labelName, database.getFullName(), table.getName(),
-                txnStatus, loadedRows, filteredRows);
-        ctx.updateReturnRows((int) loadedRows);
     }
 
     public long getTimeout() {
