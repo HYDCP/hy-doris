@@ -226,6 +226,27 @@ public class SessionVariable implements Serializable, Writable {
     public static final String INSERT_VISIBLE_TIMEOUT_RETURN_MODE_COMMITTED = "committed";
     public static final String INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR = "error";
 
+    // Keep the mode enum for business logic while storing the session value as a string.
+    public enum InsertVisibleTimeoutReturnMode {
+        COMMITTED(INSERT_VISIBLE_TIMEOUT_RETURN_MODE_COMMITTED),
+        ERROR(INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR);
+
+        private final String option;
+
+        InsertVisibleTimeoutReturnMode(String option) {
+            this.option = option;
+        }
+
+        public String getOption() {
+            return option;
+        }
+
+        @Override
+        public String toString() {
+            return option;
+        }
+    }
+
     public static final String DELETE_WITHOUT_PARTITION = "delete_without_partition";
 
     public static final String ENABLE_VARIANT_ACCESS_IN_ORIGINAL_PLANNER = "enable_variant_access_in_original_planner";
@@ -3774,15 +3795,20 @@ public class SessionVariable implements Serializable, Writable {
     }
 
     public String getInsertVisibleTimeoutReturnMode() {
-        return insertVisibleTimeoutReturnMode;
+        return getInsertVisibleTimeoutReturnModeEnum().getOption();
+    }
+
+    public InsertVisibleTimeoutReturnMode getInsertVisibleTimeoutReturnModeEnum() {
+        return parseInsertVisibleTimeoutReturnMode(insertVisibleTimeoutReturnMode);
     }
 
     public boolean isInsertVisibleTimeoutReturnError() {
-        return INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR.equals(insertVisibleTimeoutReturnMode);
+        return getInsertVisibleTimeoutReturnModeEnum() == InsertVisibleTimeoutReturnMode.ERROR;
     }
 
     public void setInsertVisibleTimeoutReturnMode(String insertVisibleTimeoutReturnMode) {
-        this.insertVisibleTimeoutReturnMode = normalizeInsertVisibleTimeoutReturnMode(insertVisibleTimeoutReturnMode);
+        this.insertVisibleTimeoutReturnMode = parseInsertVisibleTimeoutReturnMode(insertVisibleTimeoutReturnMode)
+                .getOption();
     }
 
     public boolean getIsSingleSetVar() {
@@ -4529,11 +4555,11 @@ public class SessionVariable implements Serializable, Writable {
             }
             // Normalize serialized string enums so forwarded and restored sessions keep the same semantics.
             externalTableDmlReturnStatus = normalizeExternalTableDmlReturnStatus(externalTableDmlReturnStatus);
+            insertVisibleTimeoutReturnMode = parseInsertVisibleTimeoutReturnMode(insertVisibleTimeoutReturnMode)
+                    .getOption();
         } catch (Exception e) {
             throw new IOException("failed to read session variable: " + e.getMessage());
         }
-        // Normalize serialized string enums so restored sessions keep the same semantics.
-        insertVisibleTimeoutReturnMode = normalizeInsertVisibleTimeoutReturnMode(insertVisibleTimeoutReturnMode);
     }
 
     /**
@@ -4607,7 +4633,8 @@ public class SessionVariable implements Serializable, Writable {
             LOG.error("failed to set forward variables", e);
         }
         // Normalize forwarded string enums because forwarded assignments bypass dedicated setters.
-        insertVisibleTimeoutReturnMode = normalizeInsertVisibleTimeoutReturnMode(insertVisibleTimeoutReturnMode);
+        insertVisibleTimeoutReturnMode = parseInsertVisibleTimeoutReturnMode(insertVisibleTimeoutReturnMode)
+                .getOption();
     }
 
     /**
@@ -4902,20 +4929,24 @@ public class SessionVariable implements Serializable, Writable {
     }
 
     public void checkInsertVisibleTimeoutReturnMode(String mode) {
+        // Reuse the parser so validation stays consistent with assignment and enum access.
+        parseInsertVisibleTimeoutReturnMode(mode);
+    }
+
+    // Parse the stored string case-insensitively and expose the enum only to business logic.
+    private InsertVisibleTimeoutReturnMode parseInsertVisibleTimeoutReturnMode(String mode) {
         if (StringUtils.isEmpty(mode)) {
             LOG.warn("insertVisibleTimeoutReturnMode value is empty");
             throw new UnsupportedOperationException("insertVisibleTimeoutReturnMode value is empty");
         }
-        if (!INSERT_VISIBLE_TIMEOUT_RETURN_MODE_COMMITTED.equalsIgnoreCase(mode)
-                && !INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR.equalsIgnoreCase(mode)) {
-            LOG.warn("insertVisibleTimeoutReturnMode value is invalid, the invalid value is {}", mode);
-            throw new UnsupportedOperationException(
-                    "insertVisibleTimeoutReturnMode value is invalid, the invalid value is " + mode);
+        for (InsertVisibleTimeoutReturnMode value : InsertVisibleTimeoutReturnMode.values()) {
+            if (value.getOption().equalsIgnoreCase(mode)) {
+                return value;
+            }
         }
-    }
-
-    public String normalizeInsertVisibleTimeoutReturnMode(String mode) {
-        return mode == null ? null : mode.toLowerCase(Locale.ROOT);
+        LOG.warn("insertVisibleTimeoutReturnMode value is invalid, the invalid value is {}", mode);
+        throw new UnsupportedOperationException(
+                "insertVisibleTimeoutReturnMode value is invalid, the invalid value is " + mode);
     }
 
     public void checkExternalTableDmlReturnStatus(String externalTableDmlReturnStatus) {

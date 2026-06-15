@@ -152,6 +152,31 @@ public class OlapInsertExecutorTest extends TestWithFeService {
         }
     }
 
+    @Test
+    public void testOnFailAbortsUncommittedTransaction() throws Exception {
+        ConnectContext ctx = createExecutorContext();
+        Coordinator coordinator = createCoordinator();
+        GlobalTransactionMgrIface txnMgr = Mockito.mock(GlobalTransactionMgrIface.class);
+
+        try (MockedStatic<EnvFactory> envFactoryMock = Mockito.mockStatic(EnvFactory.class);
+                MockedStatic<Env> envMock = Mockito.mockStatic(Env.class)) {
+            prepareFactoryMocks(envFactoryMock, envMock, coordinator, txnMgr);
+
+            // Simulate a pre-commit failure so the executor must abort the transaction.
+            OlapInsertExecutor executor = createExecutor(ctx);
+            executor.txnId = 10003L;
+            executor.txnStatus = TransactionStatus.ABORTED;
+
+            executor.onFail(new RuntimeException("pre-commit failure"));
+
+            Assertions.assertEquals(MysqlStateType.ERR, ctx.getState().getStateType());
+            Assertions.assertTrue(ctx.getState().getErrorMessage().contains("pre-commit failure"));
+            Assertions.assertNull(ctx.getInsertResult());
+            Mockito.verify(txnMgr).abortTransaction(Mockito.eq(1L), Mockito.eq(10003L),
+                    Mockito.eq("pre-commit failure"));
+        }
+    }
+
     // Build a fresh context per case so insertResult and QueryState do not leak between tests.
     private ConnectContext createExecutorContext() {
         ConnectContext ctx = new ConnectContext();

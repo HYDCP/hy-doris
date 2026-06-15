@@ -244,10 +244,9 @@ public class OlapInsertExecutor extends AbstractInsertExecutor {
     protected void onFail(Throwable t) {
         errMsg = t.getMessage() == null ? "unknown reason" : t.getMessage();
         String queryId = DebugUtil.printId(ctx.queryId());
-        // Abort only when the transaction has not been committed yet. Failures raised after a
-        // successful commit should keep the committed status for diagnostics.
+        // if any throwable being thrown during insert operation, first we should abort this txn
         LOG.warn("insert [{}] with query id {} failed", labelName, queryId, t);
-        if (txnId != INVALID_TXN_ID && txnStatus != TransactionStatus.COMMITTED) {
+        if (txnId != INVALID_TXN_ID) {
             try {
                 Env.getCurrentGlobalTransactionMgr().abortTransaction(
                         database.getId(), txnId, errMsg);
@@ -257,9 +256,6 @@ public class OlapInsertExecutor extends AbstractInsertExecutor {
                 LOG.warn("insert [{}] with query id {} abort txn {} failed",
                         labelName, queryId, txnId, abortTxnException);
             }
-        }
-        if (txnStatus == TransactionStatus.COMMITTED) {
-            recordInsertResult();
         }
         // retry insert into from select when meet "need re-plan error" in cloud
         if (Config.isCloudMode() && SystemInfoService.needRetryWithReplan(t.getMessage())) {

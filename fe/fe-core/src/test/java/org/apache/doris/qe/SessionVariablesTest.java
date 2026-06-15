@@ -34,7 +34,6 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 
 public class SessionVariablesTest extends TestWithFeService {
@@ -142,6 +141,8 @@ public class SessionVariablesTest extends TestWithFeService {
         Assertions.assertTrue(sessionVariable.enableProfile);
         Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR,
                 sessionVariable.getInsertVisibleTimeoutReturnMode());
+        Assertions.assertEquals(SessionVariable.InsertVisibleTimeoutReturnMode.ERROR,
+                sessionVariable.getInsertVisibleTimeoutReturnModeEnum());
         // Forwarded string enums should be normalized because the forward path bypasses session setters.
         vars.put(SessionVariable.EXTERNAL_TABLE_DML_RETURN_STATUS, "COMMITTED");
         sessionVariable.setForwardedSessionVariables(vars);
@@ -209,21 +210,17 @@ public class SessionVariablesTest extends TestWithFeService {
         setExecutor.execute();
         Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR,
                 sessionVar.getInsertVisibleTimeoutReturnMode());
+        Assertions.assertEquals(SessionVariable.InsertVisibleTimeoutReturnMode.ERROR,
+                sessionVar.getInsertVisibleTimeoutReturnModeEnum());
+        Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR,
+                sessionVar.getForwardVariables().get(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE));
 
         SessionVariable restored = new SessionVariable();
         restored.readFromJson("{\"insert_visible_timeout_return_mode\":\"ERROR\"}");
         Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR,
                 restored.getInsertVisibleTimeoutReturnMode());
-
-        // Keep normalization locale-independent so variable persistence and display are stable.
-        Locale defaultLocale = Locale.getDefault();
-        try {
-            Locale.setDefault(Locale.forLanguageTag("tr-TR"));
-            Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_COMMITTED,
-                    restored.normalizeInsertVisibleTimeoutReturnMode("COMMITTED"));
-        } finally {
-            Locale.setDefault(defaultLocale);
-        }
+        Assertions.assertEquals(SessionVariable.InsertVisibleTimeoutReturnMode.ERROR,
+                restored.getInsertVisibleTimeoutReturnModeEnum());
 
         Field field = SessionVariable.class.getDeclaredField("insertVisibleTimeoutReturnMode");
         VariableMgr.VarAttr varAttr = field.getAnnotation(VariableMgr.VarAttr.class);
@@ -242,5 +239,28 @@ public class SessionVariablesTest extends TestWithFeService {
         SetExecutor invalidSetExecutor = new SetExecutor(connectContext, setStmt);
         ExceptionChecker.expectThrowsWithMsg(DdlException.class,
                 "insertVisibleTimeoutReturnMode value is invalid", invalidSetExecutor::execute);
+    }
+
+    @Test
+    public void testInsertVisibleTimeoutReturnModeDefaultsAndCheckerBranches() {
+        // Cover the default branch and the helper methods used by setter/checker paths.
+        SessionVariable sessionVar = new SessionVariable();
+        Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_COMMITTED,
+                sessionVar.getInsertVisibleTimeoutReturnMode());
+        Assertions.assertEquals(SessionVariable.InsertVisibleTimeoutReturnMode.COMMITTED,
+                sessionVar.getInsertVisibleTimeoutReturnModeEnum());
+        Assertions.assertFalse(sessionVar.isInsertVisibleTimeoutReturnError());
+
+        // Verify setter parsing is case-insensitive and stores the canonical lowercase value.
+        sessionVar.setInsertVisibleTimeoutReturnMode("ErRoR");
+        Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR,
+                sessionVar.getInsertVisibleTimeoutReturnMode());
+        Assertions.assertEquals(SessionVariable.InsertVisibleTimeoutReturnMode.ERROR,
+                sessionVar.getInsertVisibleTimeoutReturnModeEnum());
+        Assertions.assertTrue(sessionVar.isInsertVisibleTimeoutReturnError());
+
+        ExceptionChecker.expectThrowsWithMsg(UnsupportedOperationException.class,
+                "insertVisibleTimeoutReturnMode value is empty",
+                () -> sessionVar.checkInsertVisibleTimeoutReturnMode(""));
     }
 }
