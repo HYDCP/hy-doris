@@ -1969,7 +1969,7 @@ public class SessionVariable implements Serializable, Writable {
                     + "within the same session, that is, changes to data within the same session are visible in "
                     + "real time. If you want strong consistent reads between sessions, set this variable to true. "
     })
-    public boolean enableStrongConsistencyRead = true;
+    public boolean enableStrongConsistencyRead = false;
 
     // This session variable only controls how successful external table DML reports status to the client.
     @VariableMgr.VarAttr(name = EXTERNAL_TABLE_DML_RETURN_STATUS, needForward = true,
