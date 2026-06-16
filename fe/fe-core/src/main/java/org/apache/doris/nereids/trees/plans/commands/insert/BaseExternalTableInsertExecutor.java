@@ -32,7 +32,6 @@ import org.apache.doris.planner.DataSink;
 import org.apache.doris.planner.PlanFragment;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.QueryState;
-import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.qe.StmtExecutor;
 import org.apache.doris.transaction.TransactionManager;
 import org.apache.doris.transaction.TransactionStatus;
@@ -110,15 +109,12 @@ public abstract class BaseExternalTableInsertExecutor extends AbstractInsertExec
                 transactionManager.commit(txnId);
             }
             summaryProfile.ifPresent(SummaryProfile::setTransactionEndTime);
+            txnStatus = TransactionStatus.COMMITTED;
             Env.getCurrentEnv().getRefreshManager().handleRefreshTable(
                     catalogName,
                     table.getDatabase().getFullName(),
                     table.getName(),
                     true);
-            // Reporting VISIBLE here only changes the success status returned to the client.
-            // If the DML and the follow-up query may hit different non-master FEs, enableStrongConsistencyRead
-            // is still required to strengthen read-after-write consistency.
-            txnStatus = getExternalTableDmlReturnStatus(ctx.getSessionVariable());
         }
     }
 
@@ -178,11 +174,5 @@ public abstract class BaseExternalTableInsertExecutor extends AbstractInsertExec
                 txnStatus, loadedRows, 0);
         // update it, so that user can get loaded rows in fe.audit.log
         ctx.updateReturnRows((int) loadedRows);
-    }
-
-    static TransactionStatus getExternalTableDmlReturnStatus(SessionVariable sessionVariable) {
-        return sessionVariable.isExternalTableDmlReturnVisible()
-                ? TransactionStatus.VISIBLE
-                : TransactionStatus.COMMITTED;
     }
 }
