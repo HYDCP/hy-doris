@@ -32,6 +32,7 @@ suite("test_preload_external_metadata_profile", "p0,external,doris,external_dock
     String s3Endpoint = getS3Endpoint()
     String bucket = getS3BucketName()
     String driverUrl = "https://${bucket}.${s3Endpoint}/regression/jdbc_driver/mysql-connector-j-8.4.0.jar"
+    Map<String, Map<String, Integer>> profileMetrics = [:]
 
     def extractCounterMs = { String profileString, String counterName ->
         String flexibleCounterName = counterName.split(" ").collect { Pattern.quote(it) }.join("\\s+")
@@ -84,8 +85,14 @@ suite("test_preload_external_metadata_profile", "p0,external,doris,external_dock
                 assertTrue(profileString.contains("PhysicalJdbcScan"))
                 int preloadMs = extractCounterMs(profileString, "Nereids Preload External Metadata Time")
                 int lockMs = extractCounterMs(profileString, "Nereids Lock Table Time")
-                log.info("preload external metadata profile: tag={}, preloadMs={}, lockMs={}",
-                        tag, preloadMs, lockMs)
+                int analysisMs = extractCounterMs(profileString, "Nereids Analysis Time")
+                profileMetrics[tag] = [
+                        preloadMs: preloadMs,
+                        lockMs: lockMs,
+                        analysisMs: analysisMs
+                ]
+                log.info("preload external metadata profile: tag={}, preloadMs={}, lockMs={}, analysisMs={}",
+                        tag, preloadMs, lockMs, analysisMs)
                 if (expectPreload) {
                     assertTrue("preload metadata time should be recorded in preload counter", preloadMs > 0)
                 } else {
@@ -135,6 +142,17 @@ suite("test_preload_external_metadata_profile", "p0,external,doris,external_dock
 
         checkPreloadProfile("preload_external_metadata_profile_off", catalogOff, false, false)
         checkPreloadProfile("preload_external_metadata_profile_on", catalogOn, true, true)
+        Map<String, Integer> offMetrics = profileMetrics["preload_external_metadata_profile_off"]
+        Map<String, Integer> onMetrics = profileMetrics["preload_external_metadata_profile_on"]
+        assertTrue(offMetrics != null)
+        assertTrue(onMetrics != null)
+        int analysisDropMs = offMetrics.analysisMs - onMetrics.analysisMs
+        int allowedDiffMs = Math.max(100, onMetrics.preloadMs)
+        log.info("preload external metadata profile comparison: analysisDropMs={}, preloadMs={}, allowedDiffMs={}",
+                analysisDropMs, onMetrics.preloadMs, allowedDiffMs)
+        assertTrue("analysis time should decrease when metadata is preloaded", analysisDropMs > 0)
+        assertTrue("analysis time decrease should be close to preload metadata time",
+                Math.abs(analysisDropMs - onMetrics.preloadMs) <= allowedDiffMs)
     } finally {
         sql """ SET enable_preload_external_metadata = false """
         sql """ DROP CATALOG IF EXISTS ${catalogOff} """
