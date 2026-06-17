@@ -158,7 +158,7 @@ public class CollectRelation implements AnalysisRuleFactory {
             case 3:
                 // catalog.db.table
                 // Use catalog and database name from name parts.
-                collectFromUnboundRelation(ctx.cascadesContext, nameParts, TableFrom.QUERY);
+                collectFromUnboundRelation(ctx.cascadesContext, ctx.root, TableFrom.QUERY);
                 return null;
             default:
                 throw new IllegalStateException("Table name [" + ctx.root.getTableName() + "] is invalid.");
@@ -166,7 +166,18 @@ public class CollectRelation implements AnalysisRuleFactory {
     }
 
     private void collectFromUnboundRelation(CascadesContext cascadesContext,
+            UnboundRelation unboundRelation, TableFrom tableFrom) {
+        collectFromUnboundRelation(cascadesContext, unboundRelation.getNameParts(), tableFrom,
+                Optional.of(unboundRelation));
+    }
+
+    private void collectFromUnboundRelation(CascadesContext cascadesContext,
             List<String> nameParts, TableFrom tableFrom) {
+        collectFromUnboundRelation(cascadesContext, nameParts, tableFrom, Optional.empty());
+    }
+
+    private void collectFromUnboundRelation(CascadesContext cascadesContext,
+            List<String> nameParts, TableFrom tableFrom, Optional<UnboundRelation> unboundRelation) {
         if (nameParts.size() == 1) {
             String tableName = nameParts.get(0);
             // check if it is a CTE's name
@@ -182,6 +193,11 @@ public class CollectRelation implements AnalysisRuleFactory {
         TableIf table = cascadesContext.getConnectContext().getStatementContext()
                 .getAndCacheTable(tableQualifier, tableFrom);
         LOG.info("collect table {} from {}", nameParts, tableFrom);
+        if (tableFrom == TableFrom.QUERY && unboundRelation.isPresent()) {
+            cascadesContext.getStatementContext().registerExternalTableForPreload(
+                    table, unboundRelation.get().getTableSnapshot(),
+                    Optional.ofNullable(unboundRelation.get().getScanParams()));
+        }
         if (tableFrom == TableFrom.QUERY) {
             collectMTMVCandidates(table, cascadesContext);
         }

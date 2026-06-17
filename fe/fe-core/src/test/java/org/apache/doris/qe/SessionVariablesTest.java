@@ -136,10 +136,12 @@ public class SessionVariablesTest extends TestWithFeService {
         Assertions.assertEquals(numOfForwardVars, vars.size());
 
         vars.put(SessionVariable.ENABLE_PROFILE, "true");
+        vars.put(SessionVariable.ENABLE_PRELOAD_EXTERNAL_METADATA, "true");
         // Forwarded string enums should be normalized because the forward path bypasses session setters.
         vars.put(SessionVariable.EXTERNAL_TABLE_DML_RETURN_STATUS, "COMMITTED");
         sessionVariable.setForwardedSessionVariables(vars);
         Assertions.assertTrue(sessionVariable.enableProfile);
+        Assertions.assertTrue(sessionVariable.isEnablePreloadExternalMetadata());
         Assertions.assertEquals(SessionVariable.EXTERNAL_TABLE_DML_RETURN_STATUS_COMMITTED,
                 sessionVariable.getExternalTableDmlReturnStatus());
     }

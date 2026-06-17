@@ -422,6 +422,20 @@ public interface TableIf {
     }
 
     /**
+     * Returns whether the table can preload planning metadata before internal table locks are acquired.
+     */
+    default boolean supportsExternalMetadataPreload() {
+        return false;
+    }
+
+    /**
+     * Returns whether the table has a meaningful latest snapshot that can be preloaded ahead of analysis.
+     */
+    default boolean supportsLatestSnapshotPreload() {
+        return false;
+    }
+
+    /**
      * Doris table type.
      */
     enum TableType {
@@ -616,4 +630,3 @@ public interface TableIf {
         return false;
     }
 }
-

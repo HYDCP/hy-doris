@@ -269,6 +269,16 @@ public class PaimonExternalTable extends ExternalTable implements MTMVRelatedTab
     }
 
     @Override
+    public boolean supportsExternalMetadataPreload() {
+        return true;
+    }
+
+    @Override
+    public boolean supportsLatestSnapshotPreload() {
+        return true;
+    }
+
+    @Override
     public boolean supportInternalPartitionPruned() {
         return true;
     }

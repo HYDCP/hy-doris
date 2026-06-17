@@ -50,6 +50,7 @@ import org.apache.doris.nereids.minidump.NereidsTracer;
 import org.apache.doris.nereids.processor.post.PlanPostProcessors;
 import org.apache.doris.nereids.processor.pre.PlanPreprocessors;
 import org.apache.doris.nereids.properties.PhysicalProperties;
+import org.apache.doris.nereids.rules.analysis.PreloadExternalMetadata;
 import org.apache.doris.nereids.rules.exploration.mv.MaterializationContext;
 import org.apache.doris.nereids.stats.StatsCalculator;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
@@ -360,6 +361,29 @@ public class NereidsPlanner extends Planner {
             LOG.debug("Start collect and lock table");
         }
         keepOrShowPlanProcess(showPlanProcess, () -> cascadesContext.newTableCollector().collect());
+        ExternalMetadataPreloadResult preloadResult = new PreloadExternalMetadata().executePreload(statementContext);
+        statementContext.setExternalMetadataPreloadResult(preloadResult);
+        if (statementContext.getConnectContext().getExecutor() != null && preloadResult.isExecuted()) {
+            statementContext.getConnectContext().getExecutor().getSummaryProfile()
+                    .addNereidsPreloadExternalMetadataTime(preloadResult.getElapsedTimeMs());
+        }
+        if (LOG.isDebugEnabled()) {
+            if (preloadResult.isExecuted()) {
+                LOG.debug("{} preloaded external metadata for {} of {} candidate tables in {} ms",
+                        statementContext.getConnectContext().getQueryIdentifier(),
+                        preloadResult.getPreloadedTableCount(),
+                        preloadResult.getCandidateTableCount(),
+                        preloadResult.getElapsedTimeMs());
+            } else {
+                LOG.debug("{} skip external metadata preload before lock: {} [candidateTableCount={}]",
+                        statementContext.getConnectContext().getQueryIdentifier(), preloadResult.getSkipReason(),
+                        preloadResult.getCandidateTableCount());
+            }
+        }
+        if (statementContext.getConnectContext().getExecutor() != null) {
+            statementContext.getConnectContext().getExecutor().getSummaryProfile()
+                    .setNereidsLockTableStartTime(TimeUtils.getStartTimeMs());
+        }
         statementContext.lock();
         cascadesContext.setCteContext(new CTEContext());
         NereidsTracer.logImportantTime("EndCollectAndLockTables");

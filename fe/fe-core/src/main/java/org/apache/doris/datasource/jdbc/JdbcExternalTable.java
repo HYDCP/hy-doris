@@ -110,6 +110,11 @@ public class JdbcExternalTable extends ExternalTable {
     }
 
     @Override
+    public boolean supportsExternalMetadataPreload() {
+        return true;
+    }
+
+    @Override
     public Optional<SchemaCacheValue> initSchema() {
         String remoteDbName = ((ExternalDatabase<?>) this.getDatabase()).getRemoteName();
 

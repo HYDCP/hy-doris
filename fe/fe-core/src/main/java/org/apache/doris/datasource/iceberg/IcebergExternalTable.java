@@ -255,6 +255,16 @@ public class IcebergExternalTable extends ExternalTable implements MTMVRelatedTa
     }
 
     @Override
+    public boolean supportsExternalMetadataPreload() {
+        return true;
+    }
+
+    @Override
+    public boolean supportsLatestSnapshotPreload() {
+        return true;
+    }
+
+    @Override
     public boolean supportInternalPartitionPruned() {
         return true;
     }
