@@ -731,7 +731,8 @@ public class StatementContext implements Closeable {
     /**
      * Load snapshot information of one mvcc table.
      */
-    public void loadSnapshot(TableIf tableIf, Optional<TableSnapshot> tableSnapshot, Optional<TableScanParams> scanParams) {
+    public void loadSnapshot(TableIf tableIf, Optional<TableSnapshot> tableSnapshot,
+            Optional<TableScanParams> scanParams) {
         if (!(tableIf instanceof MvccTable)) {
             return;
         }
