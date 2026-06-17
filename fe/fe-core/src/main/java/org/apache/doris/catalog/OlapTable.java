@@ -25,6 +25,7 @@ import org.apache.doris.analysis.CreateMaterializedViewStmt;
 import org.apache.doris.analysis.DataSortInfo;
 import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.IndexDef;
+import org.apache.doris.analysis.RestoreStmt;
 import org.apache.doris.analysis.SlotDescriptor;
 import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.backup.Status;
@@ -286,6 +287,13 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
                 String.valueOf(isBeingSynced));
     }
 
+    public void setMediumAllocationMode(DataProperty.MediumAllocationMode mediumAllocationMode) {
+        TableProperty tableProperty = getOrCreatTableProperty();
+        tableProperty.modifyTableProperties(PropertyAnalyzer.PROPERTIES_MEDIUM_ALLOCATION_MODE,
+                mediumAllocationMode.getValue());
+        tableProperty.setMediumAllocationMode(mediumAllocationMode);
+    }
+
     public String getStorageVaultName() {
         if (Strings.isNullOrEmpty(getStorageVaultId())) {
             return "";
@@ -306,6 +314,10 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
 
     public boolean isBeingSynced() {
         return getOrCreatTableProperty().isBeingSynced();
+    }
+
+    public DataProperty.MediumAllocationMode getMediumAllocationMode() {
+        return getOrCreatTableProperty().getMediumAllocationMode();
     }
 
     public boolean isTemporaryPartition(long partitionId) {
@@ -703,6 +715,12 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
 
     public Status resetIdsForRestore(Env env, Database db, ReplicaAllocation restoreReplicaAlloc,
             boolean reserveReplica, String srcDbName) {
+        return resetIdsForRestore(env, db, restoreReplicaAlloc, reserveReplica,
+                srcDbName, RestoreStmt.STORAGE_MEDIUM_SAME_WITH_UPSTREAM);
+    }
+
+    public Status resetIdsForRestore(Env env, Database db, ReplicaAllocation restoreReplicaAlloc,
+            boolean reserveReplica, String srcDbName, String storageMediumParam) {
         // ATTN: The meta of the restore may come from different clusters, so the
         // original ID in the meta may conflict with the ID of the new cluster. For
         // example, if a newly allocated ID happens to be the same as an original ID,
@@ -753,6 +771,7 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
         partitionInfo.resetPartitionIdForRestore(partitionMap,
                 reserveReplica ? null : restoreReplicaAlloc, isSinglePartition);
 
+
         // for each partition, reset rollup index map
         Map<Tag, Integer> nextIndexes = Maps.newHashMap();
         for (Map.Entry<Long, Partition> entry : idToPartition.entrySet()) {
@@ -798,10 +817,37 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
                         continue;
                     }
                     try {
+                        // Medium should already be decided and set in partition DataProperty by RestoreJob
+                        // using MediumDecisionMaker before calling resetIdsForRestore()
+                        DataProperty partitionDataProperty = partitionInfo.getDataProperty(entry.getKey());
+                        TStorageMedium partitionMedium = (partitionDataProperty != null)
+                                ? partitionDataProperty.getStorageMedium()
+                                : TStorageMedium.HDD;
+
+                        DataProperty.MediumAllocationMode allocationMode = (partitionDataProperty != null
+                                && partitionDataProperty.getMediumAllocationMode() != null)
+                                ? partitionDataProperty.getMediumAllocationMode()
+                                : (getMediumAllocationMode() != null ? getMediumAllocationMode()
+                                        : DataProperty.MediumAllocationMode.STRICT);
+
                         Pair<Map<Tag, List<Long>>, TStorageMedium> tag2beIdsAndMedium =
                                 Env.getCurrentSystemInfo().selectBackendIdsForReplicaCreation(
-                                        replicaAlloc, nextIndexes, null, false, false);
+                                        replicaAlloc, nextIndexes, partitionMedium,
+                                        allocationMode, false);
                         Map<Tag, List<Long>> tag2beIds = tag2beIdsAndMedium.first;
+                        TStorageMedium actualMedium = tag2beIdsAndMedium.second;
+
+                        if (allocationMode.isAdaptive() && actualMedium != null
+                                && actualMedium != partitionMedium && partitionDataProperty != null) {
+                            partitionDataProperty.setStorageMedium(actualMedium);
+                            LOG.info("Partition {} changed medium from {} to {} (preferred unavailable)",
+                                    entry.getKey(), partitionMedium, actualMedium);
+                        } else {
+                            LOG.info("Partition {} using medium {} from DataProperty (allocation mode: {})",
+                                    entry.getKey(), actualMedium != null ? actualMedium : partitionMedium,
+                                    allocationMode);
+                        }
+
                         for (Map.Entry<Tag, List<Long>> entry3 : tag2beIds.entrySet()) {
                             for (Long beId : entry3.getValue()) {
                                 long newReplicaId = env.getNextId();
@@ -1972,10 +2018,12 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
             }
             partition.setState(PartitionState.NORMAL);
             if (isForBackup) {
-                // set storage medium to HDD for backup job, because we want that the backuped table
-                // can be able to restored to another Doris cluster without SSD disk.
-                // But for other operation such as truncate table, keep the origin storage medium.
-                copied.getPartitionInfo().setDataProperty(partition.getId(), new DataProperty(TStorageMedium.HDD));
+                // For backup jobs, preserve the original storage medium information.
+                // The restore operation will utilize the medium sync policy to determine
+                // the appropriate storage medium during restoration.
+                LOG.debug("Preserving original storage medium for partition {} during backup: {}",
+                         partition.getId(),
+                         copied.getPartitionInfo().getDataProperty(partition.getId()).getStorageMedium());
             }
             for (MaterializedIndex idx : partition.getMaterializedIndices(extState)) {
                 idx.setState(IndexState.NORMAL);

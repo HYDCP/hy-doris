@@ -1186,7 +1186,8 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         } else {
             throw new TException("unknown ConnectType: " + context.getConnectType());
         }
-        Runnable clearCallback = () -> {};
+        Runnable clearCallback = () -> {
+        };
         if (params.isSetQueryId()) {
             proxyQueryIdToConnCtx.put(params.getQueryId(), context);
             clearCallback = () -> proxyQueryIdToConnCtx.remove(params.getQueryId());
@@ -2181,14 +2182,14 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         multiTableFragmentInstanceIdIndexMap.putIfAbsent(request.getTxnId(), new AtomicInteger(1));
         AtomicInteger index = multiTableFragmentInstanceIdIndexMap.get(request.getTxnId());
         StreamLoadHandler streamLoadHandler = new StreamLoadHandler(request, index, null,
-                                                                    getClientAddrAsString());
+                getClientAddrAsString());
         try {
             streamLoadHandler.generatePlan();
             planFragmentParamsList.addAll(streamLoadHandler.getFragmentParams());
             if (LOG.isDebugEnabled()) {
                 LOG.debug("receive stream load multi table put request result: {}", result);
             }
-        }  catch (UserException exception) {
+        } catch (UserException exception) {
             LOG.warn("failed to get stream load plan: {}", exception.getMessage());
             status = new TStatus(TStatusCode.ANALYSIS_ERROR);
             status.addToErrorMsgs(exception.getMessage());
@@ -2197,7 +2198,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                 RoutineLoadJob routineLoadJob = Env.getCurrentEnv().getRoutineLoadManager()
                         .getRoutineLoadJobByMultiLoadTaskTxnId(request.getTxnId());
                 routineLoadJob.updateState(JobState.PAUSED, new ErrorReason(InternalErrorCode.INTERNAL_ERR,
-                            "failed to get stream load plan, " + exception.getMessage()), false);
+                        "failed to get stream load plan, " + exception.getMessage()), false);
             } catch (Throwable e) {
                 LOG.warn("catch update routine load job error.", e);
             }
@@ -3241,6 +3242,18 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         if (request.isForceReplace()) {
             properties.put(RestoreStmt.PROP_FORCE_REPLACE, "true");
         }
+        if (request.isSetStorageMedium()) {
+            properties.put(RestoreStmt.PROP_STORAGE_MEDIUM, request.getStorageMedium());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("RPC: setting storage_medium to properties: {}", request.getStorageMedium());
+            }
+        }
+        if (request.isSetMediumAllocationMode()) {
+            properties.put(RestoreStmt.PROP_MEDIUM_ALLOCATION_MODE, request.getMediumAllocationMode());
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("RPC: setting medium_allocation_mode to properties: {}", request.getMediumAllocationMode());
+            }
+        }
 
         AbstractBackupTableRefClause restoreTableRefClause = null;
         if (request.isSetTableRefs()) {
@@ -3289,7 +3302,12 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         RestoreStmt restoreStmt = new RestoreStmt(
                 label, repoName, restoreTableRefClause, properties, backupMeta, backupJobInfo);
         restoreStmt.setIsBeingSynced();
-        LOG.debug("restore snapshot info, restoreStmt: {}", restoreStmt);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("restore snapshot info, restoreStmt: {}", restoreStmt);
+            LOG.debug("RPC: created RestoreStmt with storage_medium={}, medium_allocation_mode={}, isBeingSynced={}",
+                    restoreStmt.getStorageMedium(), restoreStmt.getMediumAllocationMode(),
+                    restoreStmt.isBeingSynced());
+        }
         try {
             ConnectContext ctx = new ConnectContext();
             ctx.setQualifiedUser(request.getUser());
@@ -3998,7 +4016,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             if (needReplace) {
                 // names for [1 2]
                 List<String> pendingPartitionNames = olapTable.getEqualPartitionNames(reqPartitionIds,
-                                resultPartitionIds);
+                        resultPartitionIds);
                 for (String name : pendingPartitionNames) {
                     pendingPartitionIds.add(olapTable.getPartition(name).getId()); // put [1 2]
                 }

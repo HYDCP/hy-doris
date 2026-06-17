@@ -50,6 +50,7 @@ public class TablePropertyTest {
         properties.put(DynamicPartitionProperty.PREFIX, "p");
         properties.put(DynamicPartitionProperty.BUCKETS, "30");
         properties.put("otherProperty", "unknownProperty");
+        properties.put("medium_allocation_mode", "adaptive");
         TableProperty tableProperty = new TableProperty(properties);
         tableProperty.setReplicaAlloc(ReplicaAllocation.DEFAULT_ALLOCATION);
         tableProperty.write(out);

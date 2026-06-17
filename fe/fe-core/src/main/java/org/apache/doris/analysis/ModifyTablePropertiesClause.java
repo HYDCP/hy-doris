@@ -18,6 +18,7 @@
 package org.apache.doris.analysis;
 
 import org.apache.doris.alter.AlterOpType;
+import org.apache.doris.catalog.DataProperty.MediumAllocationMode;
 import org.apache.doris.catalog.DynamicPartitionProperty;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.MTMV;
@@ -40,6 +41,14 @@ public class ModifyTablePropertiesClause extends AlterTableClause {
 
     private Map<String, String> properties;
 
+    private String storagePolicy;
+
+    private boolean isBeingSynced = false;
+
+    private MediumAllocationMode mediumAllocationMode = MediumAllocationMode.ADAPTIVE;
+
+    private short minLoadReplicaNum = -1;
+
     public String getStoragePolicy() {
         return this.storagePolicy;
     }
@@ -48,18 +57,20 @@ public class ModifyTablePropertiesClause extends AlterTableClause {
         this.storagePolicy = storagePolicy;
     }
 
-    private String storagePolicy;
-
-    private boolean isBeingSynced = false;
-
-    private short minLoadReplicaNum = -1;
-
     public void setIsBeingSynced(boolean isBeingSynced) {
         this.isBeingSynced = isBeingSynced;
     }
 
     public boolean isBeingSynced() {
         return isBeingSynced;
+    }
+
+    public void setMediumAllocationMode(MediumAllocationMode mediumAllocationMode) {
+        this.mediumAllocationMode = mediumAllocationMode;
+    }
+
+    public MediumAllocationMode getMediumAllocationMode() {
+        return mediumAllocationMode;
     }
 
     public ModifyTablePropertiesClause(Map<String, String> properties) {
@@ -149,6 +160,17 @@ public class ModifyTablePropertiesClause extends AlterTableClause {
             this.needTableStable = false;
             setIsBeingSynced(Boolean.parseBoolean(properties.getOrDefault(
                     PropertyAnalyzer.PROPERTIES_IS_BEING_SYNCED, "false")));
+        } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_MEDIUM_ALLOCATION_MODE)) {
+            String mediumAllocationModeValue = properties.get(PropertyAnalyzer.PROPERTIES_MEDIUM_ALLOCATION_MODE);
+            try {
+                MediumAllocationMode mediumAllocationMode = MediumAllocationMode.fromString(
+                        mediumAllocationModeValue);
+                this.needTableStable = false;
+                this.opType = AlterOpType.MODIFY_TABLE_PROPERTY_SYNC;
+                setMediumAllocationMode(mediumAllocationMode);
+            } catch (IllegalArgumentException e) {
+                throw new AnalysisException(e.getMessage());
+            }
         } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_ENABLE)
                 || properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_TTL_SECONDS)
                 || properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_MAX_BYTES)
