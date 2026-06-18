@@ -88,8 +88,8 @@ public class AnalysisTaskWrapper extends FutureTask<Void> {
             LOG.warn("{} cancelled, cost time:{}", task.toString(), System.currentTimeMillis() - startTime);
             task.cancel();
         } catch (Exception e) {
-            LOG.warn(String.format("Cancel job failed job info : %s",
-                    appendStatisticsAnalyzeOOMHint(Util.getRootCauseMessage(e))));
+            LOG.warn("Cancel job failed job info: {}, cause: {}",
+                    msg, appendStatisticsAnalyzeOOMHint(Util.getRootCauseMessage(e)), e);
         }
         // Interrupt thread when it's writing metadata would cause FE crush.
         return super.cancel(false);
