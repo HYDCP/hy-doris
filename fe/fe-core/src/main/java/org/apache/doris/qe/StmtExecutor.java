@@ -263,6 +263,9 @@ import java.util.stream.Collectors;
 // second: Do handle function for statement.
 public class StmtExecutor {
     private static final Logger LOG = LogManager.getLogger(StmtExecutor.class);
+    // Follow the Nereids timeout message so both planner paths expose the same client-facing error.
+    private static final String INSERT_VISIBLE_TIMEOUT_ERROR_MSG = "transaction commit successfully, "
+            + "BUT data did not become visible within insert_visible_timeout_ms and will be visible later.";
     private static final AtomicLong STMT_ID_GENERATOR = new AtomicLong(0);
     public static final int MAX_DATA_TO_SEND_FOR_TXN = 100;
     private static Set<String> blockSqlAstNames = Sets.newHashSet();
@@ -2352,6 +2355,7 @@ public class StmtExecutor {
         TableType tblType = insertStmt.getTargetTable().getType();
         boolean isGroupCommit = false;
         boolean reuseGroupCommitPlan = false;
+        boolean publishTimedOutAfterCommit = false;
         if (context.isTxnModel()) {
             if (insertStmt.getQueryStmt() instanceof SelectStmt) {
                 if (((SelectStmt) insertStmt.getQueryStmt()).getTableRefs().size() > 0) {
@@ -2505,6 +2509,7 @@ public class StmtExecutor {
                     txnStatus = TransactionStatus.VISIBLE;
                 } else {
                     txnStatus = TransactionStatus.COMMITTED;
+                    publishTimedOutAfterCommit = true;
                 }
                 // TODO(meiyi)
                 // insertStmt.afterFinishTxn(true);
@@ -2603,6 +2608,13 @@ public class StmtExecutor {
                 txnStatus, loadedRows, filteredRows);
         // update it, so that user can get loaded rows in fe.audit.log
         context.updateReturnRows((int) loadedRows);
+        if (publishTimedOutAfterCommit && context.getSessionVariable().isInsertVisibleTimeoutReturnError()) {
+            // Convert only the client response to ERR after committed-side bookkeeping has completed.
+            LOG.warn("insert [{}] with txn id {} committed but return error because {}={}",
+                    label, txnId, SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE,
+                    SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR);
+            context.getState().setError(ErrorCode.ERR_UNKNOWN_ERROR, INSERT_VISIBLE_TIMEOUT_ERROR_MSG);
+        }
     }
 
     public static void syncLoadForTablets(List<List<Backend>> backendsList, List<Long> allTabletIds) {
