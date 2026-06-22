@@ -364,13 +364,15 @@ public class HMSExternalTable extends ExternalTable implements MTMVRelatedTableI
 
     @Override
     public boolean supportsExternalMetadataPreload() {
-        return getDlaType() == DLAType.HIVE || getDlaType() == DLAType.HUDI;
+        return getDlaType() == DLAType.HIVE
+                || getDlaType() == DLAType.HUDI
+                || getDlaType() == DLAType.ICEBERG;
     }
 
     @Override
     public boolean supportsLatestSnapshotPreload() {
         // Only snapshot-aware table types should preload latest snapshot metadata.
-        return getDlaType() == DLAType.HUDI;
+        return getDlaType() == DLAType.HUDI || getDlaType() == DLAType.ICEBERG;
     }
 
     @Override

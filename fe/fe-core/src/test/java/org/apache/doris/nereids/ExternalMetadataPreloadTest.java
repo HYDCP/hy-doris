@@ -22,6 +22,8 @@ import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.datasource.CatalogIf;
 import org.apache.doris.datasource.ExternalTable;
+import org.apache.doris.datasource.hive.HMSExternalTable;
+import org.apache.doris.datasource.hive.HMSExternalTable.DLAType;
 import org.apache.doris.datasource.mvcc.MvccSnapshot;
 import org.apache.doris.datasource.mvcc.MvccTable;
 import org.apache.doris.nereids.rules.analysis.PreloadExternalMetadata;
@@ -104,10 +106,28 @@ public class ExternalMetadataPreloadTest {
     }
 
     @Test
+    public void testPreloadLatestSnapshotForHmsIcebergLatestRelation() {
+        StatementContext statementContext = createStatementContext(true);
+        addInternalTable(statementContext, true);
+        HMSExternalTable externalTable = mockHmsIcebergExternalTable(4L);
+
+        Assertions.assertTrue(externalTable.supportsExternalMetadataPreload());
+        Assertions.assertTrue(externalTable.supportsLatestSnapshotPreload());
+
+        statementContext.registerExternalTableForPreload(externalTable, Optional.empty(), Optional.empty());
+        ExternalMetadataPreloadResult result = new PreloadExternalMetadata().executePreload(statementContext);
+
+        Assertions.assertTrue(result.isExecuted());
+        Assertions.assertEquals(1, result.getPreloadedTableCount());
+        Mockito.verify(externalTable).loadSnapshot(Optional.empty(), Optional.empty());
+        Mockito.verify(externalTable).getBaseSchema();
+    }
+
+    @Test
     public void testSkipPreloadWhenNoTableNeedsPlanReadLock() {
         StatementContext statementContext = createStatementContext(true);
         addInternalTable(statementContext, false);
-        ExternalTable externalTable = mockExternalTable(4L, false);
+        ExternalTable externalTable = mockExternalTable(5L, false);
 
         statementContext.registerExternalTableForPreload(externalTable, Optional.empty(), Optional.empty());
         ExternalMetadataPreloadResult result = new PreloadExternalMetadata().executePreload(statementContext);
@@ -144,6 +164,20 @@ public class ExternalMetadataPreloadTest {
         Mockito.when(externalTable.supportsLatestSnapshotPreload()).thenReturn(supportLatestSnapshotPreload);
         mockDatabase(externalTable);
         Mockito.when(((MvccTable) externalTable).loadSnapshot(Optional.empty(), Optional.empty()))
+                .thenReturn(Mockito.mock(MvccSnapshot.class));
+        return externalTable;
+    }
+
+    private HMSExternalTable mockHmsIcebergExternalTable(long id) {
+        HMSExternalTable externalTable = Mockito.mock(HMSExternalTable.class);
+        Mockito.when(externalTable.getDlaType()).thenReturn(DLAType.ICEBERG);
+        Mockito.when(externalTable.supportsExternalMetadataPreload()).thenCallRealMethod();
+        Mockito.when(externalTable.supportsLatestSnapshotPreload()).thenCallRealMethod();
+        Mockito.when(externalTable.getId()).thenReturn(id);
+        Mockito.when(externalTable.supportInternalPartitionPruned()).thenReturn(false);
+        Mockito.when(externalTable.getBaseSchema()).thenReturn(Collections.emptyList());
+        mockDatabase(externalTable);
+        Mockito.when(externalTable.loadSnapshot(Optional.empty(), Optional.empty()))
                 .thenReturn(Mockito.mock(MvccSnapshot.class));
         return externalTable;
     }
