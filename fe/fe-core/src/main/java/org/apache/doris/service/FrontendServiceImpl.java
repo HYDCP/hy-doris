@@ -321,6 +321,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 // Frontend service used to serve all request for this frontend through
@@ -345,6 +346,27 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         String masterHost = env.getMasterHost();
         int masterRpcPort = env.getMasterRpcPort();
         return new TNetworkAddress(masterHost, masterRpcPort);
+    }
+
+    private static TNetworkAddress getValidMasterAddress() {
+        Env env = Env.getCurrentEnv();
+        String masterHost = env.getMasterHost();
+        int masterRpcPort = env.getMasterRpcPort();
+        if (!Strings.isNullOrEmpty(masterHost) && masterRpcPort > 0) {
+            return new TNetworkAddress(masterHost, masterRpcPort);
+        }
+        LOG.warn("skip setting invalid master address for not master response. feType: {}, isMaster: {}, "
+                        + "isReady: {}, selfNode: {}, masterHost: {}, masterRpcPort: {}",
+                env.getFeType(), env.isMaster(), env.isReady(), env.getSelfNode(), masterHost, masterRpcPort);
+        return null;
+    }
+
+    private static void setMasterAddressIfValid(Consumer<TNetworkAddress> masterAddressSetter) {
+        TNetworkAddress masterAddress = getValidMasterAddress();
+        if (masterAddress == null) {
+            return;
+        }
+        masterAddressSetter.accept(masterAddress);
     }
 
     public FrontendServiceImpl(ExecuteEnv exeEnv) {
@@ -1371,6 +1393,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         result.setStatus(status);
 
         if (status.getStatusCode() != TStatusCode.OK) {
+            setMasterAddressIfValid(result::setMasterAddress);
             return result;
         }
 
@@ -1810,6 +1833,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         result.setStatus(status);
 
         if (status.getStatusCode() != TStatusCode.OK) {
+            setMasterAddressIfValid(result::setMasterAddress);
             return result;
         }
 
@@ -2030,6 +2054,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         TStatus status = checkMaster();
         result.setStatus(status);
         if (status.getStatusCode() != TStatusCode.OK) {
+            setMasterAddressIfValid(result::setMasterAddress);
             return result;
         }
 
@@ -2937,7 +2962,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             if (!request.isAllowFollowerRead()) {
                 status.setStatusCode(TStatusCode.NOT_MASTER);
                 status.addToErrorMsgs(NOT_MASTER_ERR_MSG);
-                result.setMasterAddress(getMasterAddress());
+                setMasterAddressIfValid(result::setMasterAddress);
                 LOG.error("failed to get binlog: {}", NOT_MASTER_ERR_MSG);
                 return result;
             }
@@ -3415,6 +3440,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         TStatus status = checkMaster();
         result.setStatus(status);
         if (status.getStatusCode() != TStatusCode.OK) {
+            setMasterAddressIfValid(result::setMasterAddress);
             return result;
         }
 
@@ -3446,6 +3472,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         result.setStatus(status);
 
         if (status.getStatusCode() != TStatusCode.OK) {
+            setMasterAddressIfValid(result::setMasterAddress);
             return result;
         }
 
@@ -3548,6 +3575,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         result.setStatus(status);
 
         if (status.getStatusCode() != TStatusCode.OK) {
+            setMasterAddressIfValid(result::setMasterAddress);
             return result;
         }
 

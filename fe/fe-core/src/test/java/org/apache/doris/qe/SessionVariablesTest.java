@@ -137,6 +137,13 @@ public class SessionVariablesTest extends TestWithFeService {
 
         vars.put(SessionVariable.ENABLE_PROFILE, "true");
         vars.put(SessionVariable.ENABLE_PRELOAD_EXTERNAL_METADATA, "true");
+        vars.put(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE, "ERROR");
+        sessionVariable.setForwardedSessionVariables(vars);
+        Assertions.assertTrue(sessionVariable.enableProfile);
+        Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR,
+                sessionVariable.getInsertVisibleTimeoutReturnMode());
+        Assertions.assertEquals(SessionVariable.InsertVisibleTimeoutReturnMode.ERROR,
+                sessionVariable.getInsertVisibleTimeoutReturnModeEnum());
         // Forwarded string enums should be normalized because the forward path bypasses session setters.
         vars.put(SessionVariable.EXTERNAL_TABLE_DML_RETURN_STATUS, "COMMITTED");
         sessionVariable.setForwardedSessionVariables(vars);
@@ -192,5 +199,70 @@ public class SessionVariablesTest extends TestWithFeService {
 
         Assertions.assertEquals("test",
                 sessionVariableClone.getSessionOriginValue().get(txIsolationSessionVariableField));
+    }
+
+    @Test
+    public void testInsertVisibleTimeoutReturnMode() throws Exception {
+        connectContext.setThreadLocalInfo();
+        SessionVariable sessionVar = connectContext.getSessionVariable();
+
+        String sql = "set insert_visible_timeout_return_mode='ERROR'";
+        SetStmt setStmt = (SetStmt) parseAndAnalyzeStmt(sql, connectContext);
+        SetExecutor setExecutor = new SetExecutor(connectContext, setStmt);
+        setExecutor.execute();
+        Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR,
+                sessionVar.getInsertVisibleTimeoutReturnMode());
+        Assertions.assertEquals(SessionVariable.InsertVisibleTimeoutReturnMode.ERROR,
+                sessionVar.getInsertVisibleTimeoutReturnModeEnum());
+        Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR,
+                sessionVar.getForwardVariables().get(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE));
+
+        SessionVariable restored = new SessionVariable();
+        restored.readFromJson("{\"insert_visible_timeout_return_mode\":\"ERROR\"}");
+        Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR,
+                restored.getInsertVisibleTimeoutReturnMode());
+        Assertions.assertEquals(SessionVariable.InsertVisibleTimeoutReturnMode.ERROR,
+                restored.getInsertVisibleTimeoutReturnModeEnum());
+
+        Field field = SessionVariable.class.getDeclaredField("insertVisibleTimeoutReturnMode");
+        VariableMgr.VarAttr varAttr = field.getAnnotation(VariableMgr.VarAttr.class);
+        Assertions.assertArrayEquals(new String[] {
+                "控制普通内表 INSERT 在 publish timeout 时返回给客户端的状态。",
+                "Controls the status returned to the client when a normal internal-table INSERT times out "
+                        + "while waiting for publish visibility."
+        }, varAttr.description());
+        Assertions.assertArrayEquals(new String[] {
+                SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_COMMITTED,
+                SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR
+        }, varAttr.options());
+
+        sql = "set insert_visible_timeout_return_mode='unexpected'";
+        setStmt = (SetStmt) parseAndAnalyzeStmt(sql, connectContext);
+        SetExecutor invalidSetExecutor = new SetExecutor(connectContext, setStmt);
+        ExceptionChecker.expectThrowsWithMsg(DdlException.class,
+                "insertVisibleTimeoutReturnMode value is invalid", invalidSetExecutor::execute);
+    }
+
+    @Test
+    public void testInsertVisibleTimeoutReturnModeDefaultsAndCheckerBranches() {
+        // Cover the default branch and the helper methods used by setter/checker paths.
+        SessionVariable sessionVar = new SessionVariable();
+        Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_COMMITTED,
+                sessionVar.getInsertVisibleTimeoutReturnMode());
+        Assertions.assertEquals(SessionVariable.InsertVisibleTimeoutReturnMode.COMMITTED,
+                sessionVar.getInsertVisibleTimeoutReturnModeEnum());
+        Assertions.assertFalse(sessionVar.isInsertVisibleTimeoutReturnError());
+
+        // Verify setter parsing is case-insensitive and stores the canonical lowercase value.
+        sessionVar.setInsertVisibleTimeoutReturnMode("ErRoR");
+        Assertions.assertEquals(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE_ERROR,
+                sessionVar.getInsertVisibleTimeoutReturnMode());
+        Assertions.assertEquals(SessionVariable.InsertVisibleTimeoutReturnMode.ERROR,
+                sessionVar.getInsertVisibleTimeoutReturnModeEnum());
+        Assertions.assertTrue(sessionVar.isInsertVisibleTimeoutReturnError());
+
+        ExceptionChecker.expectThrowsWithMsg(UnsupportedOperationException.class,
+                "insertVisibleTimeoutReturnMode value is empty",
+                () -> sessionVar.checkInsertVisibleTimeoutReturnMode(""));
     }
 }

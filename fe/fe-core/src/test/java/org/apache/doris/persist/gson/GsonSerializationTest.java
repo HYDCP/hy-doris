@@ -24,12 +24,16 @@ import org.apache.doris.persist.gson.GsonSerializationTest.Key.MyEnum;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.HashBasedTable;
 import com.google.common.collect.HashMultimap;
+import com.google.common.collect.LinkedHashMultimap;
+import com.google.common.collect.LinkedListMultimap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
 import com.google.common.collect.Table;
+import com.google.gson.annotations.JsonAdapter;
 import com.google.gson.annotations.SerializedName;
+import com.google.gson.reflect.TypeToken;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Test;
@@ -42,6 +46,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.lang.reflect.Type;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -428,5 +433,210 @@ public class GsonSerializationTest {
         MultiMapClassA readClassA = MultiMapClassA.read(in);
         Assert.assertEquals(Sets.newHashSet(new Key(MyEnum.TYPE_A, "key1"), new Key(MyEnum.TYPE_B, "key2")),
                 readClassA.map.keySet());
+    }
+
+    /*
+     * Pin the json format of the tree mode GuavaTableAdapter (registered globally).
+     * The streaming GuavaTableTypeAdapterFactory must produce byte-identical json,
+     * so that old journals can be replayed and rolling upgrade is safe.
+     */
+    @Test
+    public void testGuavaTableJsonFormat() {
+        Type tableType = new TypeToken<Table<Long, String, Long>>() {
+        }.getType();
+
+        Table<Long, String, Long> table = HashBasedTable.create();
+        table.put(1L, "col1", 10L);
+        String json = GsonUtils.GSON.toJson(table, tableType);
+        Assert.assertEquals(
+                "{\"clazz\":\"HashBasedTable\",\"rowKeys\":[1],\"columnKeys\":[\"col1\"],\"cells\":[0,0,10]}",
+                json);
+
+        String legacyJson = "{\"clazz\":\"HashBasedTable\",\"rowKeys\":[1,2],\"columnKeys\":[\"col1\",\"col2\"],"
+                + "\"cells\":[0,0,10,1,1,20]}";
+        Table<Long, String, Long> readTable = GsonUtils.GSON.fromJson(legacyJson, tableType);
+        Assert.assertEquals("HashBasedTable", readTable.getClass().getSimpleName());
+        Assert.assertEquals(2, readTable.size());
+        Assert.assertEquals(Long.valueOf(10L), readTable.get(1L, "col1"));
+        Assert.assertEquals(Long.valueOf(20L), readTable.get(2L, "col2"));
+    }
+
+    /*
+     * Same as SchemaChangeJobV2.partitionIndexTabletMap, the value of Table is a Map.
+     */
+    @Test
+    public void testGuavaTableWithComplexValue() {
+        Type tableType = new TypeToken<Table<Long, Long, Map<Long, Long>>>() {
+        }.getType();
+
+        Table<Long, Long, Map<Long, Long>> table = HashBasedTable.create();
+        Map<Long, Long> value = Maps.newHashMap();
+        value.put(100L, 200L);
+        table.put(1L, 2L, value);
+
+        String json = GsonUtils.GSON.toJson(table, tableType);
+        Table<Long, Long, Map<Long, Long>> readTable = GsonUtils.GSON.fromJson(json, tableType);
+        Assert.assertEquals(1, readTable.size());
+        Assert.assertEquals(value, readTable.get(1L, 2L));
+    }
+
+    /*
+     * Pin the json format of the tree mode GuavaMultimapAdapter (registered globally).
+     */
+    @Test
+    public void testGuavaMultimapJsonFormat() {
+        Type multimapType = new TypeToken<Multimap<Long, String>>() {
+        }.getType();
+
+        Multimap<Long, String> multimap = ArrayListMultimap.create();
+        multimap.put(1L, "value1");
+        multimap.put(1L, "value2");
+        String json = GsonUtils.GSON.toJson(multimap, multimapType);
+        Assert.assertEquals("{\"clazz\":\"ArrayListMultimap\",\"map\":{\"1\":[\"value1\",\"value2\"]}}", json);
+
+        Multimap<Long, String> readMultimap = GsonUtils.GSON.fromJson(json, multimapType);
+        Assert.assertEquals("ArrayListMultimap", readMultimap.getClass().getSimpleName());
+        Assert.assertEquals(Lists.newArrayList("value1", "value2"), readMultimap.get(1L));
+    }
+
+    @Test
+    public void testGuavaTableMultiRowColJsonFormat() {
+        Type tableType = new TypeToken<Table<Long, String, Long>>() {
+        }.getType();
+
+        // HashBasedTable is backed by LinkedHashMap, iteration follows insertion order
+        Table<Long, String, Long> table = HashBasedTable.create();
+        table.put(1L, "col1", 10L);
+        table.put(1L, "col2", 20L);
+        table.put(2L, "col1", 30L);
+        String json = GsonUtils.GSON.toJson(table, tableType);
+        Assert.assertEquals("{\"clazz\":\"HashBasedTable\",\"rowKeys\":[1,2],\"columnKeys\":[\"col1\",\"col2\"],"
+                + "\"cells\":[0,0,10,0,1,20,1,0,30]}", json);
+
+        Table<Long, String, Long> readTable = GsonUtils.GSON.fromJson(json, tableType);
+        Assert.assertEquals(table, readTable);
+    }
+
+    @Test
+    public void testGuavaHashMultimapJsonFormat() {
+        Type multimapType = new TypeToken<Multimap<Long, String>>() {
+        }.getType();
+
+        Multimap<Long, String> multimap = HashMultimap.create();
+        multimap.put(1L, "value1");
+        String json = GsonUtils.GSON.toJson(multimap, multimapType);
+        Assert.assertEquals("{\"clazz\":\"HashMultimap\",\"map\":{\"1\":[\"value1\"]}}", json);
+
+        Multimap<Long, String> readMultimap = GsonUtils.GSON.fromJson(json, multimapType);
+        Assert.assertEquals("HashMultimap", readMultimap.getClass().getSimpleName());
+        Assert.assertEquals(multimap, readMultimap);
+    }
+
+    @Test
+    public void testGuavaLinkedMultimapJsonFormat() {
+        Type multimapType = new TypeToken<Multimap<Long, String>>() {
+        }.getType();
+
+        // LinkedHashMultimap preserves insertion order, so multi-entry exact assertion is stable
+        Multimap<Long, String> linkedHashMultimap = LinkedHashMultimap.create();
+        linkedHashMultimap.put(2L, "value2");
+        linkedHashMultimap.put(1L, "value1");
+        linkedHashMultimap.put(2L, "value3");
+        String json = GsonUtils.GSON.toJson(linkedHashMultimap, multimapType);
+        Assert.assertEquals("{\"clazz\":\"LinkedHashMultimap\",\"map\":{\"2\":[\"value2\",\"value3\"],"
+                + "\"1\":[\"value1\"]}}", json);
+        Multimap<Long, String> readMultimap = GsonUtils.GSON.fromJson(json, multimapType);
+        Assert.assertEquals("LinkedHashMultimap", readMultimap.getClass().getSimpleName());
+        Assert.assertEquals(linkedHashMultimap, readMultimap);
+
+        Multimap<Long, String> linkedListMultimap = LinkedListMultimap.create();
+        linkedListMultimap.put(1L, "value1");
+        linkedListMultimap.put(1L, "value1");
+        json = GsonUtils.GSON.toJson(linkedListMultimap, multimapType);
+        Assert.assertEquals("{\"clazz\":\"LinkedListMultimap\",\"map\":{\"1\":[\"value1\",\"value1\"]}}", json);
+        readMultimap = GsonUtils.GSON.fromJson(json, multimapType);
+        Assert.assertEquals("LinkedListMultimap", readMultimap.getClass().getSimpleName());
+        Assert.assertEquals(linkedListMultimap, readMultimap);
+    }
+
+    /*
+     * Multimap with a complex (non-primitive) key goes through the array-of-pairs format of
+     * enableComplexMapKeySerialization, same as ColocateTableIndex.group2Tables (GroupId key).
+     */
+    @Test
+    public void testGuavaMultimapComplexKeyJsonFormat() {
+        Type multimapType = new TypeToken<Multimap<Key, Long>>() {
+        }.getType();
+
+        Multimap<Key, Long> multimap = HashMultimap.create();
+        multimap.put(new Key(MyEnum.TYPE_A, "key1"), 1L);
+        String json = GsonUtils.GSON.toJson(multimap, multimapType);
+        Assert.assertEquals("{\"clazz\":\"HashMultimap\",\"map\":[[{\"type\":\"TYPE_A\",\"value\":\"key1\"},[1]]]}",
+                json);
+
+        Multimap<Key, Long> readMultimap = GsonUtils.GSON.fromJson(json, multimapType);
+        Assert.assertEquals(multimap, readMultimap);
+    }
+
+    public static class StreamingTableHolder {
+        @SerializedName("tbl")
+        @JsonAdapter(GsonUtils.GuavaTableTypeAdapterFactory.class)
+        public Table<Long, String, Long> tbl = HashBasedTable.create();
+    }
+
+    public static class StreamingComplexTableHolder {
+        @SerializedName("tbl")
+        @JsonAdapter(GsonUtils.GuavaTableTypeAdapterFactory.class)
+        public Table<Long, Long, Map<Long, Long>> tbl = HashBasedTable.create();
+    }
+
+    /*
+     * Same as RestoreJob.snapshotInfos/restoredVersionInfo, the streaming adapter is applied
+     * per-field via @JsonAdapter. Its output must be byte-identical to the global tree mode
+     * GuavaTableAdapter, so that journals written by old code can be replayed by new code
+     * and vice versa.
+     */
+    @Test
+    public void testStreamingTableAdapterMatchesLegacy() {
+        StreamingTableHolder holder = new StreamingTableHolder();
+        holder.tbl.put(1L, "col1", 10L);
+        holder.tbl.put(1L, "col2", 20L);
+        holder.tbl.put(2L, "col1", 30L);
+
+        Type tableType = new TypeToken<Table<Long, String, Long>>() {
+        }.getType();
+        String streamingJson = GsonUtils.GSON.toJson(holder);
+        // serializing the bare Table goes through the global tree mode GuavaTableAdapter
+        String legacyTableJson = GsonUtils.GSON.toJson(holder.tbl, tableType);
+        Assert.assertEquals("{\"tbl\":" + legacyTableJson + "}", streamingJson);
+
+        // new-write-old-read: bytes produced by the streaming writer are parsed by the
+        // global tree mode GuavaTableAdapter, simulating rollback / rolling upgrade
+        String streamingTableJson = streamingJson.substring("{\"tbl\":".length(), streamingJson.length() - 1);
+        Table<Long, String, Long> oldRead = GsonUtils.GSON.fromJson(streamingTableJson, tableType);
+        Assert.assertEquals(holder.tbl, oldRead);
+
+        // old-write-new-read: bytes produced by the tree mode writer are parsed by the
+        // streaming reader of the @JsonAdapter field
+        StreamingTableHolder read = GsonUtils.GSON.fromJson("{\"tbl\":" + legacyTableJson + "}",
+                StreamingTableHolder.class);
+        Assert.assertEquals(holder.tbl, read.tbl);
+    }
+
+    @Test
+    public void testStreamingTableAdapterWithComplexValue() {
+        StreamingComplexTableHolder holder = new StreamingComplexTableHolder();
+        Map<Long, Long> value = Maps.newHashMap();
+        value.put(100L, 200L);
+        holder.tbl.put(1L, 2L, value);
+
+        String streamingJson = GsonUtils.GSON.toJson(holder);
+        String legacyTableJson = GsonUtils.GSON.toJson(holder.tbl,
+                new TypeToken<Table<Long, Long, Map<Long, Long>>>() {
+                }.getType());
+        Assert.assertEquals("{\"tbl\":" + legacyTableJson + "}", streamingJson);
+
+        StreamingComplexTableHolder read = GsonUtils.GSON.fromJson(streamingJson, StreamingComplexTableHolder.class);
+        Assert.assertEquals(holder.tbl, read.tbl);
     }
 }

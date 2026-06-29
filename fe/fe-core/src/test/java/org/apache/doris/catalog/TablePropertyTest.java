@@ -17,10 +17,10 @@
 
 package org.apache.doris.catalog;
 
-
 import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.meta.MetaContext;
 
+import com.google.common.collect.Maps;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -30,6 +30,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.Map;
 
 public class TablePropertyTest {
 
@@ -72,5 +73,86 @@ public class TablePropertyTest {
 
         in.close();
         Files.delete(path);
+    }
+
+    // A non-whitelisted dynamic_partition.* key is ignored (skipped via continue), so it is not
+    // collected at all and the table is neither built as dynamic nor flagged as incomplete.
+    @Test
+    public void testIgnoreInvalidDynamicPartitionPropertyKey() {
+        Map<String, String> properties = Maps.newHashMap();
+        properties.put(DynamicPartitionProperty.DYNAMIC_PARTITION_PROPERTY_PREFIX + "not_a_real_key", "1");
+        TableProperty tableProperty = new TableProperty(properties).buildDynamicProperty();
+        Assert.assertFalse(tableProperty.getDynamicPartitionProperty().isExist());
+        Assert.assertFalse(tableProperty.hasInvalidDynamicPartition());
+    }
+
+    // Only storage_medium (a leftover from a failed ALTER on a non-dynamic table): incomplete,
+    // must be downgraded to a non-dynamic-partition table instead of crashing on parseInt(null).
+    @Test
+    public void testIncompleteStorageMediumIsDowngraded() {
+        Map<String, String> properties = Maps.newHashMap();
+        properties.put(DynamicPartitionProperty.STORAGE_MEDIUM, "hdd");
+        TableProperty tableProperty = new TableProperty(properties).buildDynamicProperty();
+        Assert.assertFalse(tableProperty.getDynamicPartitionProperty().isExist());
+        Assert.assertTrue(tableProperty.hasInvalidDynamicPartition());
+    }
+
+    // Symmetric to storage_medium: a leftover storage_policy alone is also incomplete.
+    @Test
+    public void testIncompleteStoragePolicyIsDowngraded() {
+        Map<String, String> properties = Maps.newHashMap();
+        properties.put(DynamicPartitionProperty.STORAGE_POLICY, "test_policy");
+        TableProperty tableProperty = new TableProperty(properties).buildDynamicProperty();
+        Assert.assertFalse(tableProperty.getDynamicPartitionProperty().isExist());
+        Assert.assertTrue(tableProperty.hasInvalidDynamicPartition());
+    }
+
+    // time_unit present but end missing: still incomplete (covers the END required-key branch).
+    @Test
+    public void testIncompleteMissingEndIsDowngraded() {
+        Map<String, String> properties = Maps.newHashMap();
+        properties.put(DynamicPartitionProperty.TIME_UNIT, "DAY");
+        TableProperty tableProperty = new TableProperty(properties).buildDynamicProperty();
+        Assert.assertFalse(tableProperty.getDynamicPartitionProperty().isExist());
+        Assert.assertTrue(tableProperty.hasInvalidDynamicPartition());
+    }
+
+    // time_unit + end present but prefix missing (covers the PREFIX required-key branch).
+    @Test
+    public void testIncompleteMissingPrefixIsDowngraded() {
+        Map<String, String> properties = Maps.newHashMap();
+        properties.put(DynamicPartitionProperty.TIME_UNIT, "DAY");
+        properties.put(DynamicPartitionProperty.END, "3");
+        TableProperty tableProperty = new TableProperty(properties).buildDynamicProperty();
+        Assert.assertFalse(tableProperty.getDynamicPartitionProperty().isExist());
+        Assert.assertTrue(tableProperty.hasInvalidDynamicPartition());
+    }
+
+    // time_unit + end + prefix present but buckets missing (covers the BUCKETS required-key branch).
+    @Test
+    public void testIncompleteMissingBucketsIsDowngraded() {
+        Map<String, String> properties = Maps.newHashMap();
+        properties.put(DynamicPartitionProperty.TIME_UNIT, "DAY");
+        properties.put(DynamicPartitionProperty.END, "3");
+        properties.put(DynamicPartitionProperty.PREFIX, "p");
+        TableProperty tableProperty = new TableProperty(properties).buildDynamicProperty();
+        Assert.assertFalse(tableProperty.getDynamicPartitionProperty().isExist());
+        Assert.assertTrue(tableProperty.hasInvalidDynamicPartition());
+    }
+
+    // All required keys present: a real DynamicPartitionProperty is built, not downgraded.
+    @Test
+    public void testCompleteDynamicPartitionIsBuilt() {
+        Map<String, String> properties = Maps.newHashMap();
+        properties.put(DynamicPartitionProperty.ENABLE, "true");
+        properties.put(DynamicPartitionProperty.TIME_UNIT, "DAY");
+        properties.put(DynamicPartitionProperty.END, "3");
+        properties.put(DynamicPartitionProperty.PREFIX, "p");
+        properties.put(DynamicPartitionProperty.BUCKETS, "1");
+        TableProperty tableProperty = new TableProperty(properties).buildDynamicProperty();
+        Assert.assertTrue(tableProperty.getDynamicPartitionProperty().isExist());
+        Assert.assertFalse(tableProperty.hasInvalidDynamicPartition());
+        Assert.assertEquals(3, tableProperty.getDynamicPartitionProperty().getEnd());
+        Assert.assertEquals(1, tableProperty.getDynamicPartitionProperty().getBuckets());
     }
 }

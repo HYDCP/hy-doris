@@ -1599,6 +1599,16 @@ public class Config extends ConfigBase {
     public static int max_backup_restore_job_num_per_db = 10;
 
     /**
+     * A internal config, to reduce backup/restore job json serialization memory by streaming.
+     */
+    @ConfField(mutable = true, masterOnly = false, description = {
+            "是否启用 backup/restore job 的流式 JSON 序列化，用于降低 FE 持久化和回放时的内存峰值",
+            "Whether to enable streaming JSON serialization for backup/restore jobs to reduce FE heap peak "
+                    + "during persistence and replay"
+    })
+    public static boolean enable_backup_restore_job_streaming_json = true;
+
+    /**
      * A internal config, to reduce the restore job size during serialization by compress.
      *
      * WARNING: Once this option is enabled and a restore is performed, the FE version cannot be rolled back.
@@ -2551,7 +2561,7 @@ public class Config extends ConfigBase {
     @ConfField
     public static int statistics_sql_parallel_exec_instance_num = 1;
 
-    @ConfField
+    @ConfField(mutable = true)
     public static long statistics_sql_mem_limit_in_bytes = 2L * 1024 * 1024 * 1024;
 
     @ConfField(mutable = true, masterOnly = true, description = {

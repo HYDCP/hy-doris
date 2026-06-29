@@ -99,6 +99,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Table.Cell;
+import com.google.gson.annotations.JsonAdapter;
 import com.google.gson.annotations.SerializedName;
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.logging.log4j.LogManager;
@@ -187,10 +188,14 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
     // save all restored partitions' version info which are already exist in catalog
     // table id -> partition id -> (version, version hash)
+    // use the streaming adapter to avoid materializing the huge JsonElement DOM tree
+    // when persisting a job with a large number of tablets
     @SerializedName("rvi")
+    @JsonAdapter(GsonUtils.GuavaTableTypeAdapterFactory.class)
     private com.google.common.collect.Table<Long, Long, Long> restoredVersionInfo = HashBasedTable.create();
     // tablet id->(be id -> snapshot info)
     @SerializedName("si")
+    @JsonAdapter(GsonUtils.GuavaTableTypeAdapterFactory.class)
     protected com.google.common.collect.Table<Long, Long, SnapshotInfo> snapshotInfos = HashBasedTable.create();
 
     // the meta version is used when reading backup meta from file.
@@ -1197,11 +1202,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     List<Tablet> localTablets = localIndex.getTablets();
                     List<Tablet> remoteTablets = index.getTablets();
                     if (localTablets.size() != remoteTablets.size()) {
-                        return new Status(ErrCode.COMMON_ERROR, String.format(
-                                "the size of local tablet %s is not equals to the remote %s, "
-                                + "is_atomic_restore=true, remote table=%d, remote index=%d, "
-                                + "local table=%d, local index=%d", localTablets.size(), remoteTablets.size(),
-                                remoteOlapTbl.getId(), index.getId(), localOlapTbl.getId(), localIndexId));
+                        LOG.warn("skip bind replicas because the size of local tablet {} is not equals to "
+                                + "the remote {}, is_atomic_restore=true, remote table={}, remote index={}, "
+                                + "local table={}, local index={}", localTablets.size(), remoteTablets.size(),
+                                remoteOlapTbl.getId(), index.getId(), localOlapTbl.getId(), localIndexId);
+                        continue;
                     }
                     for (int i = 0; i < remoteTablets.size(); i++) {
                         Tablet localTablet = localTablets.get(i);
@@ -1209,13 +1214,13 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         List<Replica> localReplicas = localTablet.getReplicas();
                         List<Replica> remoteReplicas = remoteTablet.getReplicas();
                         if (localReplicas.size() != remoteReplicas.size()) {
-                            return new Status(ErrCode.COMMON_ERROR, String.format(
-                                    "the size of local replicas %s is not equals to the remote %s, "
-                                    + "is_atomic_restore=true, remote table=%d, remote index=%d, "
-                                    + "local table=%d, local index=%d, local replicas=%d, remote replicas=%d",
-                                    localTablets.size(), remoteTablets.size(), remoteOlapTbl.getId(),
-                                    index.getId(), localOlapTbl.getId(), localIndexId, localReplicas.size(),
-                                    remoteReplicas.size()));
+                            LOG.warn("skip bind replicas because the size of local replicas {} is not equals to "
+                                    + "the remote {}, is_atomic_restore=true, remote table={}, remote index={}, "
+                                    + "local table={}, local index={}, local tablet={}, remote tablet={}",
+                                    localReplicas.size(), remoteReplicas.size(), remoteOlapTbl.getId(),
+                                    index.getId(), localOlapTbl.getId(), localIndexId, localTablet.getId(),
+                                    remoteTablet.getId());
+                            continue;
                         }
                         for (int j = 0; j < remoteReplicas.size(); j++) {
                             long backendId = localReplicas.get(j).getBackendIdWithoutException();

@@ -27,19 +27,36 @@ import org.apache.doris.catalog.Partition;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.ConfigBase;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.jmockit.Deencapsulation;
+import org.apache.doris.ha.FrontendNodeType;
+import org.apache.doris.ha.MasterInfo;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.ShowResultSet;
 import org.apache.doris.tablefunction.BackendsTableValuedFunction;
 import org.apache.doris.thrift.TBackendsMetadataParams;
+import org.apache.doris.thrift.TBeginTxnRequest;
+import org.apache.doris.thrift.TBeginTxnResult;
+import org.apache.doris.thrift.TCommitTxnRequest;
+import org.apache.doris.thrift.TCommitTxnResult;
 import org.apache.doris.thrift.TCreatePartitionRequest;
 import org.apache.doris.thrift.TCreatePartitionResult;
 import org.apache.doris.thrift.TFetchSchemaTableDataRequest;
 import org.apache.doris.thrift.TFetchSchemaTableDataResult;
+import org.apache.doris.thrift.TGetBinlogLagResult;
+import org.apache.doris.thrift.TGetBinlogRequest;
+import org.apache.doris.thrift.TGetBinlogResult;
 import org.apache.doris.thrift.TGetDbsParams;
 import org.apache.doris.thrift.TGetDbsResult;
+import org.apache.doris.thrift.TGetMasterTokenRequest;
+import org.apache.doris.thrift.TGetMasterTokenResult;
+import org.apache.doris.thrift.TLockBinlogRequest;
+import org.apache.doris.thrift.TLockBinlogResult;
 import org.apache.doris.thrift.TMetadataTableRequestParams;
 import org.apache.doris.thrift.TMetadataType;
+import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TNullableStringLiteral;
+import org.apache.doris.thrift.TRollbackTxnRequest;
+import org.apache.doris.thrift.TRollbackTxnResult;
 import org.apache.doris.thrift.TSchemaTableName;
 import org.apache.doris.thrift.TShowUserRequest;
 import org.apache.doris.thrift.TShowUserResult;
@@ -59,6 +76,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 public class FrontendServiceImplTest {
@@ -92,6 +110,86 @@ public class FrontendServiceImplTest {
     private static void createTable(String sql) throws Exception {
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseAndAnalyzeStmt(sql, connectContext);
         Env.getCurrentEnv().createTable(createTableStmt);
+    }
+
+    private static class NotMasterEnvState implements AutoCloseable {
+        private final Env env;
+        private final FrontendNodeType oldFeType;
+        private final MasterInfo oldMasterInfo;
+        private final AtomicBoolean isReady;
+        private final boolean oldReady;
+
+        NotMasterEnvState(String masterHost, int masterRpcPort) {
+            env = Env.getCurrentEnv();
+            oldFeType = Deencapsulation.getField(env, "feType");
+            oldMasterInfo = Deencapsulation.getField(env, "masterInfo");
+            isReady = Deencapsulation.getField(env, "isReady");
+            oldReady = isReady.get();
+
+            Deencapsulation.setField(env, "feType", FrontendNodeType.FOLLOWER);
+            Deencapsulation.setField(env, "masterInfo", new MasterInfo(masterHost, 0, masterRpcPort));
+            isReady.set(masterRpcPort > 0);
+        }
+
+        @Override
+        public void close() {
+            Deencapsulation.setField(env, "feType", oldFeType);
+            Deencapsulation.setField(env, "masterInfo", oldMasterInfo);
+            isReady.set(oldReady);
+        }
+    }
+
+    private void assertNotMasterWithAddress(TNetworkAddress address) {
+        Assert.assertNotNull(address);
+        Assert.assertEquals("master-fe", address.getHostname());
+        Assert.assertEquals(9020, address.getPort());
+    }
+
+    @Test
+    public void testNotMasterCcrApisReturnValidMasterAddress() throws Exception {
+        try (NotMasterEnvState ignored = new NotMasterEnvState("master-fe", 9020)) {
+            FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+
+            TBeginTxnResult beginTxnResult = impl.beginTxn(new TBeginTxnRequest());
+            Assert.assertEquals(TStatusCode.NOT_MASTER, beginTxnResult.getStatus().getStatusCode());
+            assertNotMasterWithAddress(beginTxnResult.getMasterAddress());
+
+            TCommitTxnResult commitTxnResult = impl.commitTxn(new TCommitTxnRequest());
+            Assert.assertEquals(TStatusCode.NOT_MASTER, commitTxnResult.getStatus().getStatusCode());
+            assertNotMasterWithAddress(commitTxnResult.getMasterAddress());
+
+            TRollbackTxnResult rollbackTxnResult = impl.rollbackTxn(new TRollbackTxnRequest());
+            Assert.assertEquals(TStatusCode.NOT_MASTER, rollbackTxnResult.getStatus().getStatusCode());
+            assertNotMasterWithAddress(rollbackTxnResult.getMasterAddress());
+
+            TGetMasterTokenResult masterTokenResult = impl.getMasterToken(new TGetMasterTokenRequest());
+            Assert.assertEquals(TStatusCode.NOT_MASTER, masterTokenResult.getStatus().getStatusCode());
+            assertNotMasterWithAddress(masterTokenResult.getMasterAddress());
+
+            TGetBinlogRequest binlogRequest = new TGetBinlogRequest();
+            TGetBinlogResult binlogResult = impl.getBinlog(binlogRequest);
+            Assert.assertEquals(TStatusCode.NOT_MASTER, binlogResult.getStatus().getStatusCode());
+            assertNotMasterWithAddress(binlogResult.getMasterAddress());
+
+            TGetBinlogLagResult binlogLagResult = impl.getBinlogLag(binlogRequest);
+            Assert.assertEquals(TStatusCode.NOT_MASTER, binlogLagResult.getStatus().getStatusCode());
+            assertNotMasterWithAddress(binlogLagResult.getMasterAddress());
+
+            TLockBinlogResult lockBinlogResult = impl.lockBinlog(new TLockBinlogRequest());
+            Assert.assertEquals(TStatusCode.NOT_MASTER, lockBinlogResult.getStatus().getStatusCode());
+            assertNotMasterWithAddress(lockBinlogResult.getMasterAddress());
+        }
+    }
+
+    @Test
+    public void testNotMasterCcrApisSkipInvalidMasterAddress() throws Exception {
+        try (NotMasterEnvState ignored = new NotMasterEnvState("", 0)) {
+            FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+
+            TGetBinlogResult binlogResult = impl.getBinlog(new TGetBinlogRequest());
+            Assert.assertEquals(TStatusCode.NOT_MASTER, binlogResult.getStatus().getStatusCode());
+            Assert.assertFalse(binlogResult.isSetMasterAddress());
+        }
     }
 
 

@@ -262,6 +262,8 @@ import java.io.OutputStreamWriter;
 import java.lang.reflect.Method;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
+import java.lang.reflect.TypeVariable;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
 import java.util.HashMap;
@@ -579,9 +581,13 @@ public class GsonUtils {
             .registerSubtype(S3FileSystem.class, S3FileSystem.class.getSimpleName())
             .registerSubtype(AzureFileSystem.class, AzureFileSystem.class.getSimpleName());
 
+    // streaming dispatch avoids materializing the whole job as a JsonElement DOM tree:
+    // a single backup/restore job journal entry can be tens of MB and its DOM costs
+    // dozens of times more transient heap than the serialized bytes
     private static RuntimeTypeAdapterFactory<org.apache.doris.backup.AbstractJob>
             jobBackupTypeAdapterFactory
                     = RuntimeTypeAdapterFactory.of(org.apache.doris.backup.AbstractJob.class, "clazz")
+                    .withStreamingDispatch(() -> Config.enable_backup_restore_job_streaming_json)
                     .registerSubtype(BackupJob.class, BackupJob.class.getSimpleName())
                     .registerSubtype(RestoreJob.class, RestoreJob.class.getSimpleName())
                     .registerSubtype(CloudRestoreJob.class, CloudRestoreJob.class.getSimpleName());
@@ -798,6 +804,213 @@ public class GsonUtils {
         }
     }
 
+    /*
+     * The streaming counterpart of GuavaTableAdapter, producing byte-identical json.
+     *
+     * GuavaTableAdapter works in tree mode, which materializes the whole JsonElement DOM
+     * tree in memory before writing (or after parsing). For large tables (e.g.
+     * RestoreJob.snapshotInfos with tens of thousands of tablets), the transient DOM costs
+     * tens of times more memory than the serialized bytes and easily causes FE heap spikes.
+     * The streaming TypeAdapter writes to JsonWriter and reads from JsonReader directly,
+     * without building the DOM.
+     *
+     * It is applied per-field via the @JsonAdapter annotation (currently only on the large
+     * Table fields of RestoreJob) instead of being registered globally, to keep the blast
+     * radius of the behavior change minimal.
+     *
+     * The field order (clazz, rowKeys, columnKeys, cells) is part of the format contract:
+     * the streaming reader expects this exact order and fails fast on mismatch. This is
+     * safe because all Doris-generated journals/images (both GuavaTableAdapter and this
+     * adapter) always emit fields in this order.
+     */
+    public static class GuavaTableTypeAdapterFactory implements TypeAdapterFactory {
+        @Override
+        public <T> TypeAdapter<T> create(Gson gson, TypeToken<T> typeToken) {
+            if (!Table.class.isAssignableFrom(typeToken.getRawType())) {
+                return null;
+            }
+            Map<TypeVariable<?>, Type> typeArgs = TypeUtils.getTypeArguments(typeToken.getType(), Table.class);
+            TypeVariable<?>[] typeVars = Table.class.getTypeParameters();
+            TypeAdapter<?> rowKeyAdapter = gson.getAdapter(TypeToken.get(resolveTypeArgument(typeArgs, typeVars[0])));
+            TypeAdapter<?> columnKeyAdapter
+                    = gson.getAdapter(TypeToken.get(resolveTypeArgument(typeArgs, typeVars[1])));
+            TypeAdapter<?> valueAdapter = gson.getAdapter(TypeToken.get(resolveTypeArgument(typeArgs, typeVars[2])));
+            @SuppressWarnings("unchecked")
+            TypeAdapter<T> adapter = (TypeAdapter<T>) new TableTypeAdapter<>(gson, rowKeyAdapter,
+                    columnKeyAdapter, valueAdapter).nullSafe();
+            return adapter;
+        }
+
+        private static Type resolveTypeArgument(Map<TypeVariable<?>, Type> typeArgs, TypeVariable<?> typeVar) {
+            Type type = typeArgs == null ? null : typeArgs.get(typeVar);
+            // unresolvable type argument (e.g. raw Table), fall back to runtime type dispatch
+            return (type == null || type instanceof TypeVariable) ? Object.class : type;
+        }
+
+        private static class TableTypeAdapter<R, C, V> extends TypeAdapter<Table<R, C, V>> {
+            private final Gson gson;
+            private final TypeAdapter<R> rowKeyAdapter;
+            private final TypeAdapter<C> columnKeyAdapter;
+            private final TypeAdapter<V> valueAdapter;
+
+            @SuppressWarnings("unchecked")
+            TableTypeAdapter(Gson gson, TypeAdapter<?> rowKeyAdapter, TypeAdapter<?> columnKeyAdapter,
+                    TypeAdapter<?> valueAdapter) {
+                this.gson = gson;
+                this.rowKeyAdapter = (TypeAdapter<R>) rowKeyAdapter;
+                this.columnKeyAdapter = (TypeAdapter<C>) columnKeyAdapter;
+                this.valueAdapter = (TypeAdapter<V>) valueAdapter;
+            }
+
+            @Override
+            public void write(JsonWriter out, Table<R, C, V> src) throws IOException {
+                if (!Config.enable_backup_restore_job_streaming_json) {
+                    Streams.write(toTableJsonTree(src), out);
+                    return;
+                }
+                out.beginObject();
+                out.name("clazz").value(src.getClass().getSimpleName());
+                out.name("rowKeys");
+                out.beginArray();
+                Map<R, Integer> rowKeyToIndex = new HashMap<>();
+                for (R rowKey : src.rowKeySet()) {
+                    rowKeyToIndex.put(rowKey, rowKeyToIndex.size());
+                    writeByRuntimeType(out, rowKey);
+                }
+                out.endArray();
+                out.name("columnKeys");
+                out.beginArray();
+                Map<C, Integer> columnKeyToIndex = new HashMap<>();
+                for (C columnKey : src.columnKeySet()) {
+                    columnKeyToIndex.put(columnKey, columnKeyToIndex.size());
+                    writeByRuntimeType(out, columnKey);
+                }
+                out.endArray();
+                out.name("cells");
+                out.beginArray();
+                for (Table.Cell<R, C, V> cell : src.cellSet()) {
+                    out.value((long) rowKeyToIndex.get(cell.getRowKey()));
+                    out.value((long) columnKeyToIndex.get(cell.getColumnKey()));
+                    writeByRuntimeType(out, cell.getValue());
+                }
+                out.endArray();
+                out.endObject();
+            }
+
+            private JsonObject toTableJsonTree(Table<R, C, V> src) {
+                JsonObject object = new JsonObject();
+                object.addProperty("clazz", src.getClass().getSimpleName());
+                JsonArray rowKeys = new JsonArray();
+                Map<R, Integer> rowKeyToIndex = new HashMap<>();
+                for (R rowKey : src.rowKeySet()) {
+                    rowKeyToIndex.put(rowKey, rowKeyToIndex.size());
+                    rowKeys.add(rowKeyAdapter.toJsonTree(rowKey));
+                }
+                object.add("rowKeys", rowKeys);
+                JsonArray columnKeys = new JsonArray();
+                Map<C, Integer> columnKeyToIndex = new HashMap<>();
+                for (C columnKey : src.columnKeySet()) {
+                    columnKeyToIndex.put(columnKey, columnKeyToIndex.size());
+                    columnKeys.add(columnKeyAdapter.toJsonTree(columnKey));
+                }
+                object.add("columnKeys", columnKeys);
+                JsonArray cells = new JsonArray();
+                for (Table.Cell<R, C, V> cell : src.cellSet()) {
+                    cells.add(rowKeyToIndex.get(cell.getRowKey()));
+                    cells.add(columnKeyToIndex.get(cell.getColumnKey()));
+                    cells.add(valueAdapter.toJsonTree(cell.getValue()));
+                }
+                object.add("cells", cells);
+                return object;
+            }
+
+            // dispatch by runtime class, same as the tree mode JsonSerializationContext.serialize(src)
+            @SuppressWarnings("unchecked")
+            private void writeByRuntimeType(JsonWriter out, Object src) throws IOException {
+                TypeAdapter<Object> adapter = (TypeAdapter<Object>) gson.getAdapter(src.getClass());
+                adapter.write(out, src);
+            }
+
+            @Override
+            public Table<R, C, V> read(JsonReader in) throws IOException {
+                if (!Config.enable_backup_restore_job_streaming_json) {
+                    return fromTableJsonTree(Streams.parse(in).getAsJsonObject());
+                }
+                in.beginObject();
+                expectName(in, "clazz");
+                String tableClazz = in.nextString();
+                Table<R, C, V> table = null;
+                switch (tableClazz) {
+                    case "HashBasedTable":
+                        table = HashBasedTable.create();
+                        break;
+                    default:
+                        Preconditions.checkState(false, "unknown guava table class: " + tableClazz);
+                        break;
+                }
+                expectName(in, "rowKeys");
+                List<R> rowKeys = new ArrayList<>();
+                in.beginArray();
+                while (in.hasNext()) {
+                    rowKeys.add(rowKeyAdapter.read(in));
+                }
+                in.endArray();
+                expectName(in, "columnKeys");
+                List<C> columnKeys = new ArrayList<>();
+                in.beginArray();
+                while (in.hasNext()) {
+                    columnKeys.add(columnKeyAdapter.read(in));
+                }
+                in.endArray();
+                expectName(in, "cells");
+                in.beginArray();
+                // format is [rowIndex, columnIndex, value, rowIndex, columnIndex, value, ...]
+                while (in.hasNext()) {
+                    int rowIndex = in.nextInt();
+                    int columnIndex = in.nextInt();
+                    V value = valueAdapter.read(in);
+                    table.put(rowKeys.get(rowIndex), columnKeys.get(columnIndex), value);
+                }
+                in.endArray();
+                in.endObject();
+                return table;
+            }
+
+            private Table<R, C, V> fromTableJsonTree(JsonObject object) {
+                String tableClazz = object.get("clazz").getAsString();
+                Table<R, C, V> table = newTable(tableClazz);
+                JsonArray rowKeysJsonArray = object.getAsJsonArray("rowKeys");
+                List<R> rowKeys = new ArrayList<>();
+                for (JsonElement jsonElement : rowKeysJsonArray) {
+                    rowKeys.add(rowKeyAdapter.fromJsonTree(jsonElement));
+                }
+                JsonArray columnKeysJsonArray = object.getAsJsonArray("columnKeys");
+                List<C> columnKeys = new ArrayList<>();
+                for (JsonElement jsonElement : columnKeysJsonArray) {
+                    columnKeys.add(columnKeyAdapter.fromJsonTree(jsonElement));
+                }
+                JsonArray cellsJsonArray = object.getAsJsonArray("cells");
+                for (int i = 0; i < cellsJsonArray.size(); i = i + 3) {
+                    int rowIndex = cellsJsonArray.get(i).getAsInt();
+                    int columnIndex = cellsJsonArray.get(i + 1).getAsInt();
+                    V value = valueAdapter.fromJsonTree(cellsJsonArray.get(i + 2));
+                    table.put(rowKeys.get(rowIndex), columnKeys.get(columnIndex), value);
+                }
+                return table;
+            }
+
+            private Table<R, C, V> newTable(String tableClazz) {
+                switch (tableClazz) {
+                    case "HashBasedTable":
+                        return HashBasedTable.create();
+                    default:
+                        Preconditions.checkState(false, "unknown guava table class: " + tableClazz);
+                        return null;
+                }
+            }
+        }
+    }
+
     private static class ExprAdapterFactory implements TypeAdapterFactory {
 
         private static final String EXPR_PROP = "expr";
@@ -906,6 +1119,12 @@ public class GsonUtils {
             }
             return map;
         }
+    }
+
+    private static void expectName(JsonReader in, String expectedName) throws IOException {
+        String name = in.nextName();
+        Preconditions.checkState(expectedName.equals(name),
+                "expect json field '%s' but found '%s'", expectedName, name);
     }
 
     private static class AtomicBooleanAdapter
