@@ -99,6 +99,8 @@ public class OlapInsertExecutorTest extends TestWithFeService {
             Assertions.assertEquals(12L, insertResult.loadedRows);
             Assertions.assertEquals(1L, insertResult.filteredRows);
             Assertions.assertEquals(12L, ctx.getReturnRows());
+            // Verify the insert path propagates the profile-safe decision before coordinator execution.
+            Mockito.verify(coordinator).setIsProfileSafeStmt(false);
 
             // The finished load job must still be recorded even when the client response becomes ERR.
             ArgumentCaptor<String> failMsgCaptor = ArgumentCaptor.forClass(String.class);
@@ -210,6 +212,8 @@ public class OlapInsertExecutorTest extends TestWithFeService {
         StmtExecutor stmtExecutor = Mockito.mock(StmtExecutor.class);
         Mockito.when(stmtExecutor.getProfile()).thenReturn(Mockito.mock(Profile.class));
         Mockito.when(stmtExecutor.getOriginStmtInString()).thenReturn("insert into test_tbl select 1");
+        // Force the executor to mark this mocked insert as profile-unsafe so the propagation can be asserted.
+        Mockito.when(stmtExecutor.isProfileSafeStmt()).thenReturn(false);
         return stmtExecutor;
     }
 

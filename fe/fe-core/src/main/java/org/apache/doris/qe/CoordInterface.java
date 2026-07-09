@@ -35,4 +35,7 @@ public interface CoordInterface {
     public default void close() {}
 
     List<TNetworkAddress> getInvolvedBackends();
+
+    // Propagate whether the current statement should keep profile collection enabled.
+    void setIsProfileSafeStmt(boolean isSafe);
 }

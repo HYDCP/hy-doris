@@ -141,6 +141,8 @@ import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.nereids.NereidsPlanner;
 import org.apache.doris.nereids.PlanProcess;
 import org.apache.doris.nereids.StatementContext;
+import org.apache.doris.nereids.analyzer.UnboundBaseExternalTableSink;
+import org.apache.doris.nereids.analyzer.UnboundTableSink;
 import org.apache.doris.nereids.exceptions.MustFallbackException;
 import org.apache.doris.nereids.exceptions.ParseException;
 import org.apache.doris.nereids.glue.LogicalPlanAdapter;
@@ -150,13 +152,16 @@ import org.apache.doris.nereids.trees.expressions.Placeholder;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.literal.DateTimeV2Literal;
+import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PrepareCommandPlanner;
+import org.apache.doris.nereids.trees.plans.algebra.InlineTable;
 import org.apache.doris.nereids.trees.plans.commands.Command;
 import org.apache.doris.nereids.trees.plans.commands.CreatePolicyCommand;
 import org.apache.doris.nereids.trees.plans.commands.CreateTableCommand;
 import org.apache.doris.nereids.trees.plans.commands.DeleteFromCommand;
 import org.apache.doris.nereids.trees.plans.commands.DeleteFromUsingCommand;
 import org.apache.doris.nereids.trees.plans.commands.Forward;
+import org.apache.doris.nereids.trees.plans.commands.LoadCommand;
 import org.apache.doris.nereids.trees.plans.commands.PrepareCommand;
 import org.apache.doris.nereids.trees.plans.commands.UnsupportedCommand;
 import org.apache.doris.nereids.trees.plans.commands.UpdateCommand;
@@ -1267,6 +1272,46 @@ public class StmtExecutor {
                 && !(((LogicalPlanAdapter) parsedStmt).getLogicalPlan() instanceof Command));
     }
 
+    // Keep execution profiles only for statements that provide useful runtime diagnostics.
+    public boolean isProfileSafeStmt() {
+        // Only generate profiles for statements analyzed by the Nereids planner.
+        if (!(parsedStmt instanceof LogicalPlanAdapter)) {
+            return false;
+        }
+
+        LogicalPlan plan = ((LogicalPlanAdapter) parsedStmt).getLogicalPlan();
+
+        if (plan instanceof InsertIntoTableCommand) {
+            LogicalPlan logicalPlan = ((InsertIntoTableCommand) plan).getLogicalQuery();
+            // Disable profiles for INSERT INTO ... VALUES because they add noise without useful execution insight.
+            if ((logicalPlan instanceof UnboundTableSink)
+                    || (logicalPlan instanceof UnboundBaseExternalTableSink)) {
+                if (logicalPlan.children().isEmpty()) {
+                    return false;
+                }
+
+                for (Plan child : logicalPlan.children()) {
+                    // InlineTable indicates INSERT INTO ... VALUES.
+                    if (child instanceof InlineTable) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        // Keep profiles for CREATE TABLE AS SELECT, LOAD and INSERT OVERWRITE statements.
+        if ((plan instanceof Command) && !(plan instanceof LoadCommand)
+                && !(plan instanceof CreateTableCommand)
+                && !(plan instanceof InsertOverwriteTableCommand)) {
+            // Commands like SHOW QUERY PROFILE should not create profiles for themselves.
+            return false;
+        } else {
+            // Keep profiles for all remaining statements.
+            return true;
+        }
+    }
+
     private void forwardToMaster() throws Exception {
         masterOpExecutor = new MasterOpExecutor(originStmt, context, redirectStatus, isQuery());
         if (LOG.isDebugEnabled()) {
@@ -1302,7 +1347,8 @@ public class StmtExecutor {
     }
 
     public void updateProfile(boolean isFinished) {
-        if (!context.getSessionVariable().enableProfile()) {
+        // Guard FE-side profile updates for statements that should not expose execution profiles.
+        if (!context.getSessionVariable().enableProfile() || !isProfileSafeStmt()) {
             return;
         }
         // If any error happened in update profile, we should ignore this error
@@ -1951,6 +1997,9 @@ public class StmtExecutor {
                     new QueryInfo(context, originStmt.originStmt, coord));
             coordBase = coord;
         }
+
+        // Disable BE profile collection before execution for statements that are not profile-safe.
+        coordBase.setIsProfileSafeStmt(this.isProfileSafeStmt());
 
         try {
             coordBase.exec();

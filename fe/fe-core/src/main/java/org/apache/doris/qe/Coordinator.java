@@ -3433,5 +3433,10 @@ public class Coordinator implements CoordInterface {
             this.targetFragmentInstanceAddr = host;
         }
     }
-}
 
+    // Disable execution profile creation at the coordinator entry when the statement is not profile-safe.
+    @Override
+    public void setIsProfileSafeStmt(boolean isSafe) {
+        this.queryOptions.setEnableProfile(isSafe && queryOptions.isEnableProfile());
+    }
+}
