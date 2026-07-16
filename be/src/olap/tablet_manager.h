@@ -194,7 +194,7 @@ private:
     // RoundResult captures the outcome and cost of one shutdown tablet sweep round.
     struct RoundResult {
         bool need_continue = false;
-        int64_t moved_count = 0;
+        int64_t resolved_count = 0;
         int64_t failed_count = 0;
         int64_t elapsed_ms = 0;
     };
