@@ -231,12 +231,11 @@ public class DeleteFromCommand extends Command implements ForwardWithSync, Expla
 
     // Preserve both the initial predicate-check failure and the fallback execution failure for diagnosis.
     static AnalysisException buildDeleteFallbackException(Exception initialException, Exception fallbackException) {
-        String primaryMessage = fallbackException.getMessage() == null
-                ? fallbackException.toString()
-                : fallbackException.getMessage();
-        String initialMessage = initialException.getMessage() == null
-                ? initialException.toString()
-                : initialException.getMessage();
+        // Fall back to Throwable#toString when the exception message is blank to keep the error debuggable.
+        String primaryMessage = StringUtils.defaultIfBlank(
+                fallbackException.getMessage(), fallbackException.toString());
+        String initialMessage = StringUtils.defaultIfBlank(
+                initialException.getMessage(), initialException.toString());
         AnalysisException mergedException = new AnalysisException(
                 "Delete failed with 2 causes. Primary cause: " + primaryMessage
                         + ". Initial predicate-check failure: " + initialMessage + ".",

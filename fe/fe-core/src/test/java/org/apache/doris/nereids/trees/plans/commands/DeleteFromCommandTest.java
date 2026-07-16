@@ -55,4 +55,18 @@ public class DeleteFromCommandTest {
         Assertions.assertTrue(
                 mergedException.getMessage().contains("Initial predicate-check failure: java.lang.Exception"));
     }
+
+    @Test
+    public void testBuildDeleteFallbackExceptionUsesThrowableToStringWhenMessageIsBlank() {
+        // Verify that blank messages still produce a usable merged error.
+        Exception initialException = new Exception("   ");
+        Exception fallbackException = new Exception("");
+
+        AnalysisException mergedException =
+                DeleteFromCommand.buildDeleteFallbackException(initialException, fallbackException);
+
+        Assertions.assertTrue(mergedException.getMessage().contains("Primary cause: java.lang.Exception"));
+        Assertions.assertTrue(
+                mergedException.getMessage().contains("Initial predicate-check failure: java.lang.Exception"));
+    }
 }
