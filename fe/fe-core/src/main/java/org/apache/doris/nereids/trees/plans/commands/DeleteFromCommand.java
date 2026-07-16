@@ -168,11 +168,12 @@ public class DeleteFromCommand extends Command implements ForwardWithSync, Expla
             }
         } catch (Exception e) {
             try {
+                // Fall back to the write-based delete path when predicate delete validation fails.
                 new DeleteFromUsingCommand(nameParts, tableAlias, isTempPart, partitions,
                         logicalQuery, Optional.empty()).run(ctx, executor);
                 return;
             } catch (Exception e2) {
-                throw e;
+                throw buildDeleteFallbackException(e, e2);
             }
         }
 
@@ -226,6 +227,22 @@ public class DeleteFromCommand extends Command implements ForwardWithSync, Expla
         } catch (Exception e) {
             throw new AnalysisException("set session variable by delete from command failed", e);
         }
+    }
+
+    // Preserve both the initial predicate-check failure and the fallback execution failure for diagnosis.
+    static AnalysisException buildDeleteFallbackException(Exception initialException, Exception fallbackException) {
+        String primaryMessage = fallbackException.getMessage() == null
+                ? fallbackException.toString()
+                : fallbackException.getMessage();
+        String initialMessage = initialException.getMessage() == null
+                ? initialException.toString()
+                : initialException.getMessage();
+        AnalysisException mergedException = new AnalysisException(
+                "Delete failed with 2 causes. Primary cause: " + primaryMessage
+                        + ". Initial predicate-check failure: " + initialMessage + ".",
+                fallbackException);
+        mergedException.addSuppressed(initialException);
+        return mergedException;
     }
 
     private void checkColumn(Set<String> tableColumns, SlotReference slotReference, OlapTable table) {
