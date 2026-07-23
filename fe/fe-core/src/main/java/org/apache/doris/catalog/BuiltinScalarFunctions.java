@@ -556,6 +556,8 @@ public class BuiltinScalarFunctions implements FunctionHelper {
             scalar(ArrayZip.class, "array_zip"),
             scalar(ArraysOverlap.class, "arrays_overlap"),
             scalar(Ascii.class, "ascii"),
+            // Restore public SQL binding for assert_true in branch-3.1.
+            scalar(org.apache.doris.nereids.trees.expressions.functions.scalar.AssertTrue.class, "assert_true"),
             scalar(Asin.class, "asin"),
             scalar(Atan.class, "atan"),
             scalar(Atan2.class, "atan2"),
