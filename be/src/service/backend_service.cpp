@@ -16,6 +16,7 @@
 // under the License.
 
 #include "service/backend_service.h"
+#include "service/backend_service_ingest_helper.h"
 
 #include <absl/strings/str_split.h>
 #include <arrow/record_batch.h>
@@ -50,6 +51,7 @@
 #include "cloud/config.h"
 #include "common/config.h"
 #include "common/logging.h"
+#include "common/metrics/doris_metrics.h"
 #include "common/status.h"
 #include "exprs/function/dictionary_factory.h"
 #include "format/arrow/arrow_row_batch.h"
@@ -78,6 +80,7 @@
 #include "storage/txn/txn_manager.h"
 #include "udf/python/python_env.h"
 #include "util/client_cache.h"
+#include "util/debug_points.h"
 #include "util/defer_op.h"
 #include "util/threadpool.h"
 #include "util/thrift_rpc_helper.h"
@@ -97,6 +100,126 @@ class TTransportException;
 } // namespace apache
 
 namespace doris {
+
+IngestCommitResult::IngestCommitResult(Code c) : code(c) {}
+IngestCommitResult::IngestCommitResult(Code c, Status s) : code(c), status(std::move(s)) {}
+bool IngestCommitResult::operator==(Code c) const { return code == c; }
+
+IngestCommitResult commit_ingested_rowset(
+        StorageEngine& engine, const TabletSharedPtr& local_tablet, int64_t txn_id,
+        int64_t partition_id, const RowsetMetaSharedPtr& rowset_meta,
+        PendingRowsetGuard pending_rs_guard, MonotonicStopWatch& watch,
+        std::unordered_map<std::string_view, uint64_t>& elapsed_time_map) {
+    // Step 7.1: create rowset
+    RowsetSharedPtr rowset;
+    auto status = RowsetFactory::create_rowset(local_tablet->tablet_schema(),
+                                               local_tablet->tablet_path(), rowset_meta, &rowset);
+    if (!status) {
+        LOG(WARNING) << "failed to create rowset from rowset meta for remote tablet"
+                     << ". rowset_id: " << rowset_meta->rowset_id()
+                     << ", rowset_type: " << rowset_meta->rowset_type()
+                     << ", tablet_id=" << rowset_meta->tablet_id() << ", txn_id=" << txn_id
+                     << ", status=" << status.to_string();
+        return {IngestCommitResult::kError, std::move(status)};
+    }
+
+    // Step 7.2 calculate delete bitmap before commit
+    auto calc_delete_bitmap_token = engine.calc_delete_bitmap_executor()->create_token();
+    DeleteBitmapPtr delete_bitmap = std::make_shared<DeleteBitmap>(rowset_meta->tablet_id());
+    RowsetIdUnorderedSet pre_rowset_ids;
+    if (local_tablet->enable_unique_key_merge_on_write()) {
+        auto beta_rowset = reinterpret_cast<BetaRowset*>(rowset.get());
+        std::vector<segment_v2::SegmentSharedPtr> segments;
+        status = beta_rowset->load_segments(&segments);
+        if (!status) {
+            LOG(WARNING) << "failed to load segments from rowset"
+                         << ". rowset_id: " << beta_rowset->rowset_id() << ", txn_id=" << txn_id
+                         << ", status=" << status.to_string();
+            return {IngestCommitResult::kError, std::move(status)};
+        }
+        elapsed_time_map.emplace("load_segments", watch.elapsed_time_microseconds());
+        if (segments.size() > 1) {
+            // calculate delete bitmap between segments
+            status = local_tablet->calc_delete_bitmap_between_segments(
+                    rowset->tablet_schema(), rowset->rowset_id(), segments, delete_bitmap);
+            if (!status) {
+                LOG(WARNING) << "failed to calculate delete bitmap"
+                             << ". tablet_id: " << local_tablet->tablet_id()
+                             << ". rowset_id: " << rowset->rowset_id() << ", txn_id=" << txn_id
+                             << ", status=" << status.to_string();
+                return {IngestCommitResult::kError, std::move(status)};
+            }
+            elapsed_time_map.emplace("calc_delete_bitmap", watch.elapsed_time_microseconds());
+        }
+
+        static_cast<void>(BaseTablet::commit_phase_update_delete_bitmap(
+                local_tablet, rowset, pre_rowset_ids, delete_bitmap, segments, txn_id,
+                calc_delete_bitmap_token.get(), nullptr));
+        elapsed_time_map.emplace("commit_phase_update_delete_bitmap",
+                                 watch.elapsed_time_microseconds());
+        static_cast<void>(calc_delete_bitmap_token->wait());
+        elapsed_time_map.emplace("wait_delete_bitmap", watch.elapsed_time_microseconds());
+    }
+
+    // Step 7.3: commit txn
+    Status commit_txn_status = engine.txn_manager()->commit_txn(
+            local_tablet->data_dir()->get_meta(), rowset_meta->partition_id(),
+            rowset_meta->txn_id(), rowset_meta->tablet_id(), local_tablet->tablet_uid(),
+            rowset_meta->load_id(), rowset, std::move(pending_rs_guard), false);
+    elapsed_time_map.emplace("commit_txn", watch.elapsed_time_microseconds());
+
+    if (!commit_txn_status) {
+        if (commit_txn_status.is<ErrorCode::PUSH_TRANSACTION_ALREADY_EXIST>()) {
+            LOG(INFO) << "find transaction already exist when commit ingested rowset, skip commit."
+                      << " rowset_id: " << rowset_meta->rowset_id().to_string()
+                      << ", tablet_id=" << rowset_meta->tablet_id()
+                      << ", txn_id=" << rowset_meta->txn_id();
+            return IngestCommitResult::kAlreadyExist;
+        }
+        auto err_msg = fmt::format(
+                "failed to commit txn for remote tablet. rowset_id: {}, tablet_id={}, "
+                "txn_id={}, status={}",
+                rowset_meta->rowset_id().to_string(), rowset_meta->tablet_id(),
+                rowset_meta->txn_id(), commit_txn_status.to_string());
+        LOG(WARNING) << err_msg;
+        return {IngestCommitResult::kError, std::move(commit_txn_status)};
+    }
+
+    if (local_tablet->enable_unique_key_merge_on_write()) {
+        engine.txn_manager()->set_txn_related_delete_bitmap(partition_id, txn_id,
+                                                            rowset_meta->tablet_id(),
+                                                            local_tablet->tablet_uid(), true,
+                                                            delete_bitmap, pre_rowset_ids, nullptr);
+        elapsed_time_map.emplace("set_txn_related_delete_bitmap",
+                                 watch.elapsed_time_microseconds());
+    }
+
+    return IngestCommitResult::kCommitted;
+}
+
+// Delete files downloaded during ingest. Does not change the caller's error status;
+// failures are logged so orphan-file issues remain visible in operations.
+void _delete_downloaded_files(const std::vector<std::string>& files, std::string_view reason,
+                              int64_t txn_id) {
+    if (files.empty()) {
+        return;
+    }
+    std::vector<io::Path> paths;
+    paths.reserve(files.size());
+    for (const auto& file : files) {
+        paths.emplace_back(file);
+    }
+    auto st = io::global_local_filesystem()->batch_delete(paths);
+    if (!st.ok()) {
+        DorisMetrics::instance()->binlog_ingest_redundant_rowset_cleanup_failed_total->increment(1);
+        LOG(WARNING) << "failed to delete " << files.size() << " downloaded files (" << reason
+                     << "), txn_id=" << txn_id << ", status=" << st.to_string();
+    } else {
+        LOG(INFO) << "done delete " << files.size() << " downloaded files (" << reason
+                  << "), txn_id=" << txn_id;
+    }
+}
+
 namespace {
 
 bvar::LatencyRecorder g_ingest_binlog_latency("doris_backend_service", "ingest_binlog");
@@ -294,141 +417,7 @@ Status _download_file_from_peer(const std::string& peer_host, const std::string&
     return HttpClient::execute_with_retry(3, 1, download_cb);
 }
 
-// Result of committing an ingested rowset. When commit fails, |status| preserves the
-// original error so callers can log detailed diagnostics instead of a generic message.
-struct IngestCommitResult {
-    enum Code {
-        kCommitted,    // Rowset committed successfully.
-        kAlreadyExist, // Same load id already committed a different rowset; do not overwrite.
-        kError,        // Commit failed with a real error.
-    };
-
-    Code code;
-    Status status; // Only meaningful when code == kError.
-
-    IngestCommitResult(Code c) : code(c) {}
-    IngestCommitResult(Code c, Status s) : code(c), status(std::move(s)) {}
-
-    bool operator==(Code c) const { return code == c; }
-};
-
-// Delete files downloaded during ingest. Does not change the caller's error status;
-// failures are logged so orphan-file issues remain visible in operations.
-void _delete_downloaded_files(const std::vector<std::string>& files, std::string_view reason,
-                              int64_t txn_id) {
-    if (files.empty()) {
-        return;
-    }
-    std::vector<io::Path> paths;
-    paths.reserve(files.size());
-    for (const auto& file : files) {
-        paths.emplace_back(file);
-    }
-    auto st = io::global_local_filesystem()->batch_delete(paths);
-    if (!st.ok()) {
-        LOG(WARNING) << "failed to delete " << files.size() << " downloaded files (" << reason
-                     << "), txn_id=" << txn_id << ", status=" << st.to_string();
-    } else {
-        LOG(INFO) << "done delete " << files.size() << " downloaded files (" << reason
-                  << "), txn_id=" << txn_id;
-    }
-}
-
-IngestCommitResult commit_ingested_rowset(StorageEngine& engine, const TabletSharedPtr& local_tablet,
-                                          int64_t txn_id, int64_t partition_id,
-                                          const RowsetMetaSharedPtr& rowset_meta,
-                                          PendingRowsetGuard pending_rs_guard,
-                                          MonotonicStopWatch& watch,
-                                          std::unordered_map<std::string_view, uint64_t>&
-                                                  elapsed_time_map) {
-    // Step 7.1: create rowset
-    RowsetSharedPtr rowset;
-    auto status = RowsetFactory::create_rowset(local_tablet->tablet_schema(),
-                                               local_tablet->tablet_path(), rowset_meta, &rowset);
-    if (!status) {
-        LOG(WARNING) << "failed to create rowset from rowset meta for remote tablet"
-                     << ". rowset_id: " << rowset_meta->rowset_id()
-                     << ", rowset_type: " << rowset_meta->rowset_type()
-                     << ", tablet_id=" << rowset_meta->tablet_id() << ", txn_id=" << txn_id
-                     << ", status=" << status.to_string();
-        return {IngestCommitResult::kError, std::move(status)};
-    }
-
-    // Step 7.2 calculate delete bitmap before commit
-    auto calc_delete_bitmap_token = engine.calc_delete_bitmap_executor()->create_token();
-    DeleteBitmapPtr delete_bitmap = std::make_shared<DeleteBitmap>(rowset_meta->tablet_id());
-    RowsetIdUnorderedSet pre_rowset_ids;
-    if (local_tablet->enable_unique_key_merge_on_write()) {
-        auto beta_rowset = reinterpret_cast<BetaRowset*>(rowset.get());
-        std::vector<segment_v2::SegmentSharedPtr> segments;
-        status = beta_rowset->load_segments(&segments);
-        if (!status) {
-            LOG(WARNING) << "failed to load segments from rowset"
-                         << ". rowset_id: " << beta_rowset->rowset_id() << ", txn_id=" << txn_id
-                         << ", status=" << status.to_string();
-            return {IngestCommitResult::kError, std::move(status)};
-        }
-        elapsed_time_map.emplace("load_segments", watch.elapsed_time_microseconds());
-        if (segments.size() > 1) {
-            // calculate delete bitmap between segments
-            status = local_tablet->calc_delete_bitmap_between_segments(
-                    rowset->tablet_schema(), rowset->rowset_id(), segments, delete_bitmap);
-            if (!status) {
-                LOG(WARNING) << "failed to calculate delete bitmap"
-                             << ". tablet_id: " << local_tablet->tablet_id()
-                             << ". rowset_id: " << rowset->rowset_id() << ", txn_id=" << txn_id
-                             << ", status=" << status.to_string();
-                return {IngestCommitResult::kError, std::move(status)};
-            }
-            elapsed_time_map.emplace("calc_delete_bitmap", watch.elapsed_time_microseconds());
-        }
-
-        static_cast<void>(BaseTablet::commit_phase_update_delete_bitmap(
-                local_tablet, rowset, pre_rowset_ids, delete_bitmap, segments, txn_id,
-                calc_delete_bitmap_token.get(), nullptr));
-        elapsed_time_map.emplace("commit_phase_update_delete_bitmap",
-                                 watch.elapsed_time_microseconds());
-        static_cast<void>(calc_delete_bitmap_token->wait());
-        elapsed_time_map.emplace("wait_delete_bitmap", watch.elapsed_time_microseconds());
-    }
-
-    // Step 7.3: commit txn
-    Status commit_txn_status = engine.txn_manager()->commit_txn(
-            local_tablet->data_dir()->get_meta(), rowset_meta->partition_id(),
-            rowset_meta->txn_id(), rowset_meta->tablet_id(), local_tablet->tablet_uid(),
-            rowset_meta->load_id(), rowset, std::move(pending_rs_guard), false);
-    elapsed_time_map.emplace("commit_txn", watch.elapsed_time_microseconds());
-
-    if (!commit_txn_status) {
-        if (commit_txn_status.is<ErrorCode::PUSH_TRANSACTION_ALREADY_EXIST>()) {
-            LOG(INFO) << "find transaction already exist when commit ingested rowset, skip commit."
-                      << " rowset_id: " << rowset_meta->rowset_id().to_string()
-                      << ", tablet_id=" << rowset_meta->tablet_id()
-                      << ", txn_id=" << rowset_meta->txn_id();
-            return IngestCommitResult::kAlreadyExist;
-        }
-        auto err_msg = fmt::format(
-                "failed to commit txn for remote tablet. rowset_id: {}, tablet_id={}, "
-                "txn_id={}, status={}",
-                rowset_meta->rowset_id().to_string(), rowset_meta->tablet_id(),
-                rowset_meta->txn_id(), commit_txn_status.to_string());
-        LOG(WARNING) << err_msg;
-        return {IngestCommitResult::kError, std::move(commit_txn_status)};
-    }
-
-    if (local_tablet->enable_unique_key_merge_on_write()) {
-        engine.txn_manager()->set_txn_related_delete_bitmap(partition_id, txn_id,
-                                                            rowset_meta->tablet_id(),
-                                                            local_tablet->tablet_uid(), true,
-                                                            delete_bitmap, pre_rowset_ids, nullptr);
-        elapsed_time_map.emplace("set_txn_related_delete_bitmap",
-                                 watch.elapsed_time_microseconds());
-    }
-
-    return IngestCommitResult::kCommitted;
-}
-
-void _ingest_binlog_from_peer(StorageEngine& engine, const TIngestBinlogRequest& request,
+void _ingest_binlog_from_peer_impl(StorageEngine& engine, const TIngestBinlogRequest& request,
                               const TabletSharedPtr& local_tablet, int64_t txn_id,
                               int64_t partition_id, TStatus& tstatus) {
     auto set_tstatus = [&tstatus](TStatusCode::type code, std::string error_msg) {
@@ -468,6 +457,7 @@ void _ingest_binlog_from_peer(StorageEngine& engine, const TIngestBinlogRequest&
         if (commit_already_exist && !download_success_files.empty()) {
             LOG(INFO) << "will delete redundant peer files for already-committed txn " << txn_id
                       << ", count=" << download_success_files.size();
+            DorisMetrics::instance()->binlog_ingest_redundant_rowset_cleanup_success_total->increment(1);
             _delete_downloaded_files(download_success_files, "redundant peer cleanup", txn_id);
         }
     }};
@@ -624,8 +614,8 @@ Status _distribute_ingested_rowset_to_followers(
         StorageEngine& engine, const TIngestBinlogRequest& request,
         const RowsetMetaSharedPtr& rowset_meta,
         const std::vector<TIngestedFileInfo>& ingested_files,
-        std::vector<int64_t>& success_backend_ids,
-        std::vector<int64_t>& failed_backend_ids, ThreadPool* distribute_pool) {
+        std::vector<int64_t>& success_backend_ids, std::vector<int64_t>& failed_backend_ids,
+        ThreadPool* distribute_pool, const std::shared_ptr<MemTrackerLimiter>& parent_mem_tracker) {
     if (!request.__isset.follower_replicas || request.follower_replicas.empty()) {
         return Status::OK();
     }
@@ -685,8 +675,9 @@ Status _distribute_ingested_rowset_to_followers(
         futures.push_back(promise_ptr->get_future());
 
         auto worker = [promise_ptr, backend_id, host, be_port, timeout_ms, &request,
-                       &rowset_meta_str, &ingested_files, &peer_host, &peer_http_port,
-                       &peer_token]() {
+                       &rowset_meta_str, &ingested_files, &peer_host, &peer_http_port, &peer_token,
+                       parent_mem_tracker]() {
+            SCOPED_ATTACH_TASK(parent_mem_tracker);
             try {
                 TIngestBinlogResult follower_result;
                 TIngestBinlogRequest follower_request;
@@ -700,6 +691,19 @@ Status _distribute_ingested_rowset_to_followers(
                 follower_request.__set_peer_token(peer_token);
                 follower_request.__set_rowset_meta(rowset_meta_str);
                 follower_request.__set_files(ingested_files);
+
+                DBUG_EXECUTE_IF("ingest_binlog.follower.force_fail", {
+                    auto target_backend_id = DebugPoints::instance()->get_debug_param_or_default<
+                            int64_t>("ingest_binlog.follower.force_fail", "backend_id", -1);
+                    if (target_backend_id == -1 || target_backend_id == backend_id) {
+                        LOG(WARNING) << "debug point force follower ingest_binlog fail, "
+                                     << "backend_id=" << backend_id;
+                        promise_ptr->set_value(std::make_pair(
+                                backend_id,
+                                Status::InternalError("debug point force follower fail")));
+                        return;
+                    }
+                });
 
                 Status status = ThriftRpcHelper::rpc<BackendServiceClient>(
                         host, be_port,
@@ -733,14 +737,19 @@ Status _distribute_ingested_rowset_to_followers(
 
         if (distribute_pool != nullptr) {
             Status st = distribute_pool->submit_func(worker);
-            if (!st.ok()) {
-                LOG(WARNING) << "ingest binlog follower distribute pool is full, backend_id="
-                             << backend_id << ", status=" << st.to_string();
-                promise_ptr->set_value(std::make_pair(backend_id, st));
+            if (st.ok()) {
+                continue;
             }
-        } else {
-            worker();
+            // The pool queue is full. Fall back to inline execution in the thrift
+            // handler thread instead of failing the follower: this transfers
+            // backpressure to the caller (CCR acquires a per-backend concurrency
+            // window for every ingest) and avoids spurious whole-txn retries that
+            // would waste the cross-cluster download this feature saves.
+            LOG(WARNING) << "ingest binlog follower distribute pool is full, run follower "
+                            "distribution inline, backend_id="
+                         << backend_id << ", status=" << st.to_string();
         }
+        worker();
     }
 
     for (auto& future : futures) {
@@ -831,6 +840,7 @@ void _ingest_binlog(StorageEngine& engine, IngestBinlogArg* arg) {
         if (commit_already_exist && distribution_done && !redundant_files_to_delete.empty()) {
             LOG(INFO) << "will delete redundant rowset files downloaded for already-committed txn "
                       << txn_id << ", count=" << redundant_files_to_delete.size();
+            DorisMetrics::instance()->binlog_ingest_redundant_rowset_cleanup_success_total->increment(1);
             _delete_downloaded_files(redundant_files_to_delete, "leader redundant cleanup", txn_id);
         }
 
@@ -1224,9 +1234,8 @@ void _ingest_binlog(StorageEngine& engine, IngestBinlogArg* arg) {
         DCHECK(arg->success_replica_backend_ids != nullptr);
         DCHECK(arg->failed_replica_backend_ids != nullptr);
         status = _distribute_ingested_rowset_to_followers(
-                engine, request, rowset_meta, ingested_files,
-                *arg->success_replica_backend_ids, *arg->failed_replica_backend_ids,
-                arg->follower_distribute_pool);
+                engine, request, rowset_meta, ingested_files, *arg->success_replica_backend_ids,
+                *arg->failed_replica_backend_ids, arg->follower_distribute_pool, mem_tracker);
         if (!status) {
             LOG(WARNING) << "distribute ingested rowset to followers partially failed, success="
                          << arg->success_replica_backend_ids->size()
@@ -1258,27 +1267,41 @@ Status BackendService::start_thrift_dependencies() {
 
     auto thread_num = config::ingest_binlog_work_pool_size;
     if (thread_num < 0) {
-        LOG(INFO) << fmt::format("ingest binlog thread pool size is {}, so we will in sync mode",
+        LOG(INFO) << fmt::format("ingest binlog work pool size is {}, so we will in sync mode",
                                  thread_num);
-        return Status::OK();
+    } else {
+        if (thread_num == 0) {
+            thread_num = std::thread::hardware_concurrency();
+        }
+        RETURN_IF_ERROR(doris::ThreadPoolBuilder("IngestBinlog")
+                                .set_min_threads(thread_num)
+                                .set_max_threads(thread_num * 2)
+                                .build(&_ingest_binlog_workers));
+        LOG(INFO) << fmt::format("ingest binlog work pool size is {}, in async mode", thread_num);
     }
 
-    if (thread_num == 0) {
-        thread_num = std::thread::hardware_concurrency();
+    // Always create the follower distribution pool for single-replica ingest binlog,
+    // regardless of whether the legacy async ingest pool is enabled. This turns follower
+    // fan-out from serial RPC execution into parallel execution bounded by the pool size.
+    // When the pool queue is full, the follower task falls back to inline execution
+    // instead of being rejected, so a busy pool never fails an ingest by itself.
+    auto distribute_thread_num = config::ingest_binlog_distribute_work_pool_size;
+    if (distribute_thread_num < 0) {
+        return Status::InvalidArgument(
+                "ingest_binlog_distribute_work_pool_size must be non-negative, got {}",
+                distribute_thread_num);
     }
-    static_cast<void>(doris::ThreadPoolBuilder("IngestBinlog")
-                              .set_min_threads(thread_num)
-                              .set_max_threads(thread_num * 2)
-                              .build(&_ingest_binlog_workers));
-    // Bounded pool for fan-out of single-replica ingest to followers.
-    // Queue size is 4x the worker count; submissions beyond that are rejected
-    // and the follower is marked failed, which triggers syncer-level retry.
-    static_cast<void>(doris::ThreadPoolBuilder("IngestBinlogDistribute")
-                              .set_min_threads(thread_num)
-                              .set_max_threads(thread_num * 2)
-                              .set_max_queue_size(thread_num * 4)
-                              .build(&_ingest_binlog_distribute_workers));
-    LOG(INFO) << fmt::format("ingest binlog thread pool size is {}, in async mode", thread_num);
+    if (distribute_thread_num == 0) {
+        auto hc = static_cast<int>(std::thread::hardware_concurrency());
+        distribute_thread_num = hc > 0 ? hc : 1;
+    }
+    RETURN_IF_ERROR(doris::ThreadPoolBuilder("IngestBinlogDistribute")
+                            .set_min_threads(distribute_thread_num)
+                            .set_max_threads(distribute_thread_num)
+                            .set_max_queue_size(distribute_thread_num * 4)
+                            .build(&_ingest_binlog_distribute_workers));
+    LOG(INFO) << fmt::format("ingest binlog distribute work pool size is {}",
+                             distribute_thread_num);
     return Status::OK();
 }
 
@@ -1623,7 +1646,7 @@ void BackendService::ingest_binlog(TIngestBinlogResult& result,
     // Dispatch by mode
     if (is_fetch_from_peer) {
         // Follower mode: always synchronous
-        _ingest_binlog_from_peer(_engine, request, local_tablet, txn_id, partition_id, tstatus);
+        _ingest_binlog_from_peer_impl(_engine, request, local_tablet, txn_id, partition_id, tstatus);
         return;
     }
 
@@ -1936,6 +1959,14 @@ void BaseBackendService::get_python_packages(std::vector<TPythonPackageInfo>& re
     std::vector<std::pair<std::string, std::string>> packages;
     THROW_IF_ERROR(list_installed_packages(version, &packages));
     result = manager.package_infos_to_thrift(packages);
+}
+
+// Exposed wrapper for unit tests. The implementation lives in the unnamed namespace
+// and is not directly visible to other translation units.
+void _ingest_binlog_from_peer(StorageEngine& engine, const TIngestBinlogRequest& request,
+                              const TabletSharedPtr& local_tablet, int64_t txn_id,
+                              int64_t partition_id, TStatus& tstatus) {
+    _ingest_binlog_from_peer_impl(engine, request, local_tablet, txn_id, partition_id, tstatus);
 }
 
 } // namespace doris
