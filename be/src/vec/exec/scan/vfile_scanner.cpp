@@ -1621,6 +1621,19 @@ void VFileScanner::update_realtime_counters() {
     _file_cache_statistics->bytes_read_from_remote = 0;
 }
 
+bool VFileScanner::_should_update_load_counters() const {
+    if (_is_load) {
+        return true;
+    }
+    // TVF based loads (e.g. http_stream, group commit relay) plan the load source as a
+    // tvf query scan without src tuple desc, so _is_load is false. But rows filtered by
+    // the load's WHERE clause still need to be reported as unselected rows. FILE_STREAM
+    // is only reachable from such load entries, never from normal queries, so use it to
+    // identify these scanners.
+    return (_params->__isset.file_type && _params->file_type == TFileType::FILE_STREAM) ||
+           (_current_range.__isset.file_type && _current_range.file_type == TFileType::FILE_STREAM);
+}
+
 void VFileScanner::_collect_profile_before_close() {
     VScanner::_collect_profile_before_close();
     if (config::enable_file_cache && _state->query_options().enable_file_cache &&
