@@ -16,19 +16,15 @@
 // under the License.
 
 suite("test_large_http_header", "p0") {
-    def feHost = context.config.feHttpAddress
-    def (host, port) = feHost.split(":")
     def largeHeaderValue = "x" * (100 * 1024)
-    def connection = new URL("http://${host}:${port}/api/health").openConnection()
 
-    try {
-        connection.setRequestMethod("GET")
-        connection.setRequestProperty("X-Large-Header", largeHeaderValue)
-        connection.setConnectTimeout(5000)
-        connection.setReadTimeout(5000)
-
-        assertEquals(200, connection.getResponseCode())
-    } finally {
-        connection.disconnect()
+    httpTest {
+        endpoint context.config.feHttpAddress
+        uri "/api/health"
+        op "get"
+        header "X-Large-Header", largeHeaderValue
+        check { code, body ->
+            assertEquals(200, code)
+        }
     }
 }
