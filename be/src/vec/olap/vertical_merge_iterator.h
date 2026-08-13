@@ -104,7 +104,7 @@ public:
         DCHECK(_buf_idx < _buffer->size());
         return RowSource(_buffer->get_element(_buf_idx));
     }
-    void advance(int32_t step = 1) {
+    void advance(int64_t step = 1) {
         DCHECK(_buf_idx + step <= _buffer->size());
         _buf_idx += step;
     }

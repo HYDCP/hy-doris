@@ -71,8 +71,13 @@ uint16_t RowSource::data() const {
 Status RowSourcesBuffer::append(const std::vector<RowSource>& row_sources) {
     if (_buffer->allocated_bytes() + row_sources.size() * sizeof(UInt16) >
         config::vertical_compaction_max_row_source_memory_mb * 1024 * 1024) {
-        if (_buffer->allocated_bytes() - _buffer->size() * sizeof(UInt16) <
-            row_sources.size() * sizeof(UInt16)) {
+        // Use capacity() - size() to get the truly available element slots.
+        // PODArrayBase::allocated_bytes() includes pad_left and pad_right, which are not usable
+        // for storing elements. Treating them as available space can skip the spill and trigger
+        // an unexpected buffer reallocation below.
+        auto& buffer_data = _buffer->get_data();
+        size_t available_slots = buffer_data.capacity() - buffer_data.size();
+        if (available_slots < row_sources.size()) {
             VLOG_NOTICE << "RowSourceBuffer is too large, serialize and reset buffer: "
                         << _buffer->allocated_bytes() << ", total size: " << _total_size;
             // serialize current buffer
@@ -132,8 +137,8 @@ bool RowSourcesBuffer::get_agg_flag(uint64_t index) {
 
 size_t RowSourcesBuffer::continuous_agg_count(uint64_t index) {
     size_t result = 1;
-    int start = index + 1;
-    int end = _buffer->size();
+    int64_t start = index + 1;
+    int64_t end = _buffer->size();
     while (start < end) {
         RowSource next(_buffer->get_element(start++));
         if (next.agg_flag()) {
@@ -147,8 +152,8 @@ size_t RowSourcesBuffer::continuous_agg_count(uint64_t index) {
 
 size_t RowSourcesBuffer::same_source_count(uint16_t source, size_t limit) {
     int result = 1;
-    int start = _buf_idx + 1;
-    int end = _buffer->size();
+    int64_t start = _buf_idx + 1;
+    int64_t end = _buffer->size();
     while (result < limit && start < end) {
         RowSource next(_buffer->get_element(start++));
         if (source != next.get_source_num()) {
