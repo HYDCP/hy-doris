@@ -19,6 +19,8 @@
 
 #include <gen_cpp/parquet_types.h>
 
+#include <cstring>
+
 #include "common/status.h"
 #include "vec/data_types/data_type.h"
 #include "vec/exec/format/parquet/decoder.h"
@@ -62,6 +64,7 @@ public:
                 break;
             }
             case ColumnSelectVector::NULL_DATA: {
+                memset(raw_data + data_index, 0, run_length * _type_length);
                 data_index += run_length * _type_length;
                 break;
             }

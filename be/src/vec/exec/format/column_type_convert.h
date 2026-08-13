@@ -73,6 +73,18 @@ protected:
     // Error message to show unsupported converter if support() return false;
     std::string _error_msg;
 
+    // Non-consistent converters read a batch-local cached nested column while its null map is
+    // shared with the accumulated destination column. The destination row index must therefore be
+    // used when checking whether a source value is null.
+    static bool _is_null(const IColumn& dst_col, size_t row) {
+        // Direct converter callers may provide an empty nullable destination without a prefilled
+        // null map. In that case there is no source null marker to preserve.
+        if (!dst_col.is_nullable() || row >= dst_col.size()) {
+            return false;
+        }
+        return dst_col.is_null_at(row);
+    }
+
 public:
     /**
      * Get the converter to change column type
@@ -166,6 +178,10 @@ public:
         to_col->resize(start_idx + rows);
         auto& data = static_cast<DstColumnType&>(*to_col.get()).get_data();
         for (int i = 0; i < rows; ++i) {
+            if (_is_null(*dst_col, start_idx + i)) {
+                data[start_idx + i] = {};
+                continue;
+            }
             if constexpr (sizeof(DstCppType) < sizeof(SrcCppType)) {
                 SrcCppType src_value = src_data[i];
                 if ((SrcCppType)std::numeric_limits<DstCppType>::min() > src_value ||
@@ -219,6 +235,10 @@ public:
         to_col->resize(start_idx + rows);
         auto& data = static_cast<DstColumnType&>(*to_col.get()).get_data();
         for (int i = 0; i < rows; ++i) {
+            if (_is_null(*dst_col, start_idx + i)) {
+                data[start_idx + i] = {};
+                continue;
+            }
             SrcCppType src_value = src_data[i];
             if constexpr (is_integer_type<SrcPrimitiveType>()) {
                 if (overflow(src_value)) {
@@ -247,7 +267,12 @@ public:
         size_t rows = from_col->size();
         auto& src_data = static_cast<const SrcColumnType*>(from_col.get())->get_data();
         auto& string_col = static_cast<ColumnString&>(*to_col.get());
+        size_t start_idx = string_col.size();
         for (int i = 0; i < rows; ++i) {
+            if (_is_null(*dst_col, start_idx + i)) {
+                string_col.insert_default();
+                continue;
+            }
             std::string value = src_data[i] != 0 ? "TRUE" : "FALSE";
             string_col.insert_data(value.data(), value.size());
         }
@@ -276,6 +301,10 @@ public:
         auto& src_data = static_cast<const SrcColumnType*>(from_col.get())->get_data();
         auto& string_col = static_cast<ColumnString&>(*to_col.get());
         for (int i = 0; i < rows; ++i) {
+            if (_is_null(*dst_col, start_idx + i)) {
+                string_col.insert_default();
+                continue;
+            }
             if constexpr (SrcPrimitiveType == TYPE_FLOAT || SrcPrimitiveType == TYPE_DOUBLE) {
                 if (fileFormat == FileFormat::ORC && std::isnan(src_data[i])) {
                     if (null_map == nullptr) {
@@ -324,7 +353,12 @@ public:
         size_t rows = from_col->size();
         auto& src_data = static_cast<const SrcColumnType*>(from_col.get())->get_data();
         auto& string_col = static_cast<ColumnString&>(*to_col.get());
+        size_t start_idx = string_col.size();
         for (int i = 0; i < rows; ++i) {
+            if (_is_null(*dst_col, start_idx + i)) {
+                string_col.insert_default();
+                continue;
+            }
             std::string value = src_data[i].to_string(_scale);
             string_col.insert_data(value.data(), value.size());
         }
@@ -345,8 +379,13 @@ public:
         size_t rows = from_col->size();
         auto& src_data = static_cast<const SrcColumnType*>(from_col.get())->get_data();
         auto& string_col = static_cast<ColumnString&>(*to_col.get());
+        size_t start_idx = string_col.size();
         char buf[50];
         for (int i = 0; i < rows; ++i) {
+            if (_is_null(*dst_col, start_idx + i)) {
+                string_col.insert_default();
+                continue;
+            }
             int len = (reinterpret_cast<const SrcCppType&>(src_data[i])).to_buffer(buf);
             string_col.insert_data(buf, len);
         }
@@ -564,6 +603,10 @@ public:
         auto& data = static_cast<DstColumnType*>(to_col.get())->get_data();
         for (int i = 0; i < rows; ++i) {
             DstCppType& value = data[start_idx + i];
+            if (_is_null(*dst_col, start_idx + i)) {
+                value = {};
+                continue;
+            }
             auto string_value = string_col.get_data_at(i);
             bool can_cast = false;
             if constexpr (is_decimal_type<DstPrimitiveType>()) {
@@ -621,6 +664,10 @@ public:
         auto& data = static_cast<DstColumnType&>(*to_col.get()).get_data();
 
         for (int i = 0; i < rows; ++i) {
+            if (_is_null(*dst_col, start_idx + i)) {
+                data[start_idx + i] = {};
+                continue;
+            }
             const SrcCppType& src_value = src_data[i];
             auto& dst_value = reinterpret_cast<DstCppType&>(data[start_idx + i]);
 
@@ -671,6 +718,10 @@ public:
         to_col->resize(start_idx + rows);
         auto& data = static_cast<DstColumnType&>(*to_col.get()).get_data();
         for (int i = 0; i < rows; ++i) {
+            if (_is_null(*dst_col, start_idx + i)) {
+                data[start_idx + i] = {};
+                continue;
+            }
             const auto& src_value = reinterpret_cast<const SrcCppType&>(src_data[i]);
             auto& dst_value = reinterpret_cast<DstCppType&>(data[start_idx + i]);
             dst_value.unchecked_set_time(src_value.year(), src_value.month(), src_value.day(),
@@ -719,6 +770,10 @@ public:
         auto multiplier = DataTypeDecimal<DstDorisType>::get_scale_multiplier(_scale).value;
 
         for (int i = 0; i < rows; ++i) {
+            if (_is_null(*dst_col, start_idx + i)) {
+                data[start_idx + i] = {};
+                continue;
+            }
             const SrcCppType& src_value = src_data[i];
             DstDorisType& res = data[start_idx + i];
 
@@ -814,6 +869,10 @@ public:
         }
 
         for (int i = 0; i < rows; ++i) {
+            if (_is_null(*dst_col, start_idx + i)) {
+                data[start_idx + i] = {};
+                continue;
+            }
             if constexpr (DstPrimitiveType == TYPE_FLOAT || DstPrimitiveType == TYPE_DOUBLE) {
                 data[start_idx + i] = static_cast<DstCppType>(
                         static_cast<double>(src_data[i].value) / (double)scale_factor);
@@ -880,6 +939,10 @@ public:
         auto& data = static_cast<DstColumnType&>(*to_col.get()).get_data();
 
         for (int i = 0; i < rows; ++i) {
+            if (_is_null(*dst_col, start_idx + i)) {
+                data[start_idx + i] = {};
+                continue;
+            }
             SrcNativeType src_value = src_data[i].value;
             DstNativeType& res_value = data[start_idx + i].value;
 

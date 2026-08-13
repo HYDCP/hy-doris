@@ -91,10 +91,12 @@ static void fill_array_offset(FieldSchema* field, ColumnArray::Offsets64& offset
         if (def_levels[i] >= field->definition_level) {
             offsets_data[offset_pos]++;
         }
-        if (def_levels[i] >= field->definition_level - 1) {
-            (*null_map_ptr)[offset_pos] = 0;
-        } else {
-            (*null_map_ptr)[offset_pos] = 1;
+        if (null_map_ptr != nullptr) {
+            if (def_levels[i] >= field->definition_level - 1) {
+                (*null_map_ptr)[offset_pos] = 0;
+            } else {
+                (*null_map_ptr)[offset_pos] = 1;
+            }
         }
     }
     offsets_data.resize(offset_pos + 1);

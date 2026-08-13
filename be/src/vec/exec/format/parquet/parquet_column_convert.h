@@ -171,6 +171,22 @@ protected:
 
     std::unique_ptr<ConvertParams> _convert_params;
 
+    // A cached logical nested column can be cleared between batches while still sharing the
+    // accumulated destination null map. Locate the current batch from the end of that null map.
+    static size_t _null_map_start(const IColumn& dst_col, size_t rows) {
+        DCHECK(!dst_col.is_nullable() || dst_col.size() >= rows)
+                << "rows=" << rows << ", size=" << dst_col.size();
+        return dst_col.is_nullable() ? dst_col.size() - rows : 0;
+    }
+
+    static bool _is_null(const IColumn& dst_col, size_t row) {
+        if (!dst_col.is_nullable()) {
+            return false;
+        }
+        DCHECK_LT(row, dst_col.size()) << "row=" << row << ", size=" << dst_col.size();
+        return dst_col.is_null_at(row);
+    }
+
 public:
     static std::unique_ptr<PhysicalToLogicalConverter> get_converter(
             FieldSchema* field_schema, TypeDescriptor src_logical_type,
@@ -270,7 +286,12 @@ class LittleIntPhysicalConverter : public PhysicalToLogicalConverter {
         size_t start_idx = to_col->size();
         to_col->resize(start_idx + rows);
         auto& data = static_cast<DstColumnType&>(*to_col.get()).get_data();
+        size_t null_map_start = _null_map_start(*src_logical_column, rows);
         for (int i = 0; i < rows; ++i) {
+            if (_is_null(*src_logical_column, null_map_start + i)) {
+                data[start_idx + i] = {};
+                continue;
+            }
             data[start_idx + i] = static_cast<DstCppType>(src_data[i]);
         }
 
@@ -328,8 +349,13 @@ class UnsignedIntegerConverter : public PhysicalToLogicalConverter {
         size_t start_idx = to_col->size();
         to_col->resize(start_idx + rows);
         auto& data = static_cast<DstColumnType&>(*to_col.get()).get_data();
+        size_t null_map_start = _null_map_start(*src_logical_column, rows);
 
         for (int i = 0; i < rows; i++) {
+            if (_is_null(*src_logical_column, null_map_start + i)) {
+                data[start_idx + i] = {};
+                continue;
+            }
             StorageCppType src_value = src_data[i];
             auto unsigned_value = static_cast<UnsignedCppType>(src_value);
             data[start_idx + i] = unsigned_value;
@@ -382,9 +408,10 @@ public:
         ColumnPtr src_col = remove_nullable(src_physical_col);
         MutableColumnPtr dst_col = remove_nullable(src_logical_column)->assume_mutable();
 
-#define M(FixedTypeLength, ValueCopyType) \
-    case FixedTypeLength:                 \
-        return _convert_internal<FixedTypeLength, ValueCopyType>(src_col, dst_col);
+#define M(FixedTypeLength, ValueCopyType)                                          \
+    case FixedTypeLength:                                                          \
+        return _convert_internal<FixedTypeLength, ValueCopyType>(src_col, dst_col, \
+                                                                 src_logical_column);
 
 #define APPLY_FOR_DECIMALS() \
     M(1, int64_t)            \
@@ -432,7 +459,8 @@ public:
     }
 
     template <int fixed_type_length, typename ValueCopyType>
-    Status _convert_internal(ColumnPtr& src_col, MutableColumnPtr& dst_col) {
+    Status _convert_internal(ColumnPtr& src_col, MutableColumnPtr& dst_col,
+                             const ColumnPtr& nullable_dst_col) {
         size_t rows = src_col->size() / fixed_type_length;
         DecimalScaleParams& scale_params = _convert_params->decimal_scale;
         auto* buf = static_cast<const ColumnUInt8*>(src_col.get())->get_data().data();
@@ -440,8 +468,14 @@ public:
         dst_col->resize(start_idx + rows);
 
         auto& data = static_cast<ColumnDecimal<DecimalType>*>(dst_col.get())->get_data();
+        size_t null_map_start = _null_map_start(*nullable_dst_col, rows);
         size_t offset = 0;
         for (int i = 0; i < rows; i++) {
+            if (_is_null(*nullable_dst_col, null_map_start + i)) {
+                data[start_idx + i] = {};
+                offset += fixed_type_length;
+                continue;
+            }
             // When Decimal in parquet is stored in byte arrays, binary and fixed,
             // the unscaled number must be encoded as two's complement using big-endian byte order.
             ValueCopyType value = 0;
@@ -485,7 +519,12 @@ class StringToDecimal : public PhysicalToLogicalConverter {
         dst_col->resize(start_idx + rows);
 
         auto& data = static_cast<ColumnDecimal<DecimalType>*>(dst_col.get())->get_data();
+        size_t null_map_start = _null_map_start(*src_logical_column, rows);
         for (int i = 0; i < rows; i++) {
+            if (_is_null(*src_logical_column, null_map_start + i)) {
+                data[start_idx + i] = {};
+                continue;
+            }
             size_t len = offset[i] - offset[i - 1];
             // When Decimal in parquet is stored in byte arrays, binary and fixed,
             // the unscaled number must be encoded as two's complement using big-endian byte order.
@@ -528,8 +567,13 @@ class NumberToDecimal : public PhysicalToLogicalConverter {
 
         DecimalScaleParams& scale_params = _convert_params->decimal_scale;
         auto* data = static_cast<ColumnDecimal<DecimalType>*>(dst_col.get())->get_data().data();
+        size_t null_map_start = _null_map_start(*src_logical_column, rows);
 
         for (int i = 0; i < rows; i++) {
+            if (_is_null(*src_logical_column, null_map_start + i)) {
+                data[start_idx + i] = {};
+                continue;
+            }
             ValueCopyType value = src_data[i];
             if constexpr (ScaleType == DecimalScaleParams::SCALE_UP) {
                 value *= scale_params.scale_factor;
@@ -554,8 +598,13 @@ class Int32ToDate : public PhysicalToLogicalConverter {
         auto& src_data = static_cast<const ColumnVector<int32>*>(src_col.get())->get_data();
         auto& data = static_cast<ColumnDateV2*>(dst_col.get())->get_data();
         date_day_offset_dict& date_dict = date_day_offset_dict::get();
+        size_t null_map_start = _null_map_start(*src_logical_column, rows);
 
         for (int i = 0; i < rows; i++) {
+            if (_is_null(*src_logical_column, null_map_start + i)) {
+                data.push_back_without_reserve(0);
+                continue;
+            }
             int64_t date_value = (int64_t)src_data[i] + _convert_params->offset_days;
             data.push_back_without_reserve(date_dict[date_value].to_date_int_val());
         }
@@ -575,8 +624,13 @@ struct Int64ToTimestamp : public PhysicalToLogicalConverter {
 
         auto src_data = static_cast<const ColumnVector<int64_t>*>(src_col.get())->get_data().data();
         auto& data = static_cast<ColumnVector<UInt64>*>(dst_col.get())->get_data();
+        size_t null_map_start = _null_map_start(*src_logical_column, rows);
 
         for (int i = 0; i < rows; i++) {
+            if (_is_null(*src_logical_column, null_map_start + i)) {
+                data[start_idx + i] = {};
+                continue;
+            }
             int64_t x = src_data[i];
             auto& num = data[start_idx + i];
             auto& value = reinterpret_cast<DateV2Value<DateTimeV2ValueType>&>(num);
@@ -599,8 +653,13 @@ struct Int96toTimestamp : public PhysicalToLogicalConverter {
         size_t start_idx = dst_col->size();
         dst_col->resize(start_idx + rows);
         auto& data = static_cast<ColumnVector<UInt64>*>(dst_col.get())->get_data();
+        size_t null_map_start = _null_map_start(*src_logical_column, rows);
 
         for (int i = 0; i < rows; i++) {
+            if (_is_null(*src_logical_column, null_map_start + i)) {
+                data[start_idx + i] = {};
+                continue;
+            }
             ParquetInt96 src_cell_data = ParquetInt96_data[i];
             auto& dst_value =
                     reinterpret_cast<DateV2Value<DateTimeV2ValueType>&>(data[start_idx + i]);
