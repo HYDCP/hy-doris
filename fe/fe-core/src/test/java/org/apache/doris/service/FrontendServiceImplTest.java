@@ -30,6 +30,7 @@ import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.ha.FrontendNodeType;
 import org.apache.doris.ha.MasterInfo;
+import org.apache.doris.insertoverwrite.InsertOverwriteManager;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.ShowResultSet;
 import org.apache.doris.tablefunction.BackendsTableValuedFunction;
@@ -57,6 +58,8 @@ import org.apache.doris.thrift.TMetadataTableRequestParams;
 import org.apache.doris.thrift.TMetadataType;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TNullableStringLiteral;
+import org.apache.doris.thrift.TReplacePartitionRequest;
+import org.apache.doris.thrift.TReplacePartitionResult;
 import org.apache.doris.thrift.TRestoreSnapshotRequest;
 import org.apache.doris.thrift.TRestoreSnapshotResult;
 import org.apache.doris.thrift.TRollbackTxnRequest;
@@ -97,7 +100,7 @@ public class FrontendServiceImplTest {
         FeConstants.default_scheduler_interval_millisecond = 100;
         Config.dynamic_partition_enable = true;
         Config.dynamic_partition_check_interval_seconds = 1;
-        UtFrameUtils.createDorisCluster(runningDir);
+        UtFrameUtils.createDorisCluster(runningDir, 2);
         // create connect context
         connectContext = UtFrameUtils.createDefaultCtx();
         // create database
@@ -242,6 +245,68 @@ public class FrontendServiceImplTest {
         Assert.assertEquals(partition.getStatus().getStatusCode(), TStatusCode.OK);
         Partition p20230807 = table.getPartition("p20230807000000");
         Assert.assertNotNull(p20230807);
+    }
+
+    @Test
+    public void testIncrementalPartitionReplicaRequirements() throws Exception {
+        boolean originalAllowReplicaOnSameHost = Config.allow_replica_on_same_host;
+        boolean originalForceMajorityLoad = Config.force_majority_load_for_two_replica;
+        Config.allow_replica_on_same_host = true;
+        Config.force_majority_load_for_two_replica = true;
+        try {
+            createTable("CREATE TABLE test.incremental_partition_replica_requirements(\n"
+                    + "    event_day DATETIME NOT NULL,\n"
+                    + "    site_id INT\n"
+                    + ")\n"
+                    + "DUPLICATE KEY(event_day, site_id)\n"
+                    + "AUTO PARTITION BY range (date_trunc(event_day, 'day')) ()\n"
+                    + "DISTRIBUTED BY HASH(event_day) BUCKETS 1\n"
+                    + "PROPERTIES(\n"
+                    + "    'replication_num' = '2',\n"
+                    + "    'min_load_replica_num' = '1'\n"
+                    + ");");
+
+            Database db = Env.getCurrentInternalCatalog().getDbOrAnalysisException("test");
+            OlapTable table = (OlapTable) db.getTableOrAnalysisException(
+                    "incremental_partition_replica_requirements");
+            List<TNullableStringLiteral> values = new ArrayList<>();
+            values.add(new TNullableStringLiteral().setValue("2023-08-08 00:00:00"));
+
+            TCreatePartitionRequest createRequest = new TCreatePartitionRequest();
+            createRequest.setDbId(db.getId());
+            createRequest.setTableId(table.getId());
+            createRequest.setPartitionValues(Arrays.asList(values));
+            FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+            TCreatePartitionResult createResult = impl.createPartition(createRequest);
+
+            Assert.assertEquals(TStatusCode.OK, createResult.getStatus().getStatusCode());
+            Assert.assertEquals(1, createResult.getPartitionsSize());
+            Assert.assertEquals(2, createResult.getPartitions().get(0).getTotalReplicaNum());
+            Assert.assertEquals(2, createResult.getPartitions().get(0).getLoadRequiredReplicaNum());
+
+            Partition partition = table.getPartition("p20230808000000");
+            Assert.assertNotNull(partition);
+            InsertOverwriteManager overwriteManager = Env.getCurrentEnv().getInsertOverwriteManager();
+            long taskGroupId = overwriteManager.registerTaskGroup(table.getId());
+            try {
+                TReplacePartitionRequest replaceRequest = new TReplacePartitionRequest();
+                replaceRequest.setOverwriteGroupId(taskGroupId);
+                replaceRequest.setDbId(db.getId());
+                replaceRequest.setTableId(table.getId());
+                replaceRequest.setPartitionIds(Arrays.asList(partition.getId()));
+                TReplacePartitionResult replaceResult = impl.replacePartition(replaceRequest);
+
+                Assert.assertEquals(TStatusCode.OK, replaceResult.getStatus().getStatusCode());
+                Assert.assertEquals(1, replaceResult.getPartitionsSize());
+                Assert.assertEquals(2, replaceResult.getPartitions().get(0).getTotalReplicaNum());
+                Assert.assertEquals(2, replaceResult.getPartitions().get(0).getLoadRequiredReplicaNum());
+            } finally {
+                overwriteManager.taskGroupFail(taskGroupId);
+            }
+        } finally {
+            Config.allow_replica_on_same_host = originalAllowReplicaOnSameHost;
+            Config.force_majority_load_for_two_replica = originalForceMajorityLoad;
+        }
     }
 
     @Test
