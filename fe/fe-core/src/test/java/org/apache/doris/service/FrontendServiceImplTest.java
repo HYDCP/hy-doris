@@ -445,7 +445,7 @@ public class FrontendServiceImplTest {
         request.setMetadaTableParams(params);
         result = impl.fetchSchemaTableData(request);
         Assert.assertEquals(result.getStatus().getStatusCode(), TStatusCode.OK);
-        Assert.assertEquals(result.getDataBatchSize(), 1);
+        Assert.assertEquals(Env.getCurrentSystemInfo().getAllBackendIds(false).size(), result.getDataBatchSize());
     }
 
     @Test
