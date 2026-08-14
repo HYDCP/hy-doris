@@ -17,6 +17,7 @@
 
 package org.apache.doris.catalog;
 
+import org.apache.doris.analysis.AlterColocateGroupStmt;
 import org.apache.doris.analysis.AlterTableStmt;
 import org.apache.doris.analysis.CreateDbStmt;
 import org.apache.doris.analysis.CreateTableStmt;
@@ -24,7 +25,10 @@ import org.apache.doris.analysis.DropDbStmt;
 import org.apache.doris.catalog.ColocateTableIndex.GroupId;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.jmockit.Deencapsulation;
+import org.apache.doris.persist.ColocatePersistInfo;
+import org.apache.doris.persist.EditLog;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.DdlExecutor;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.utframe.UtFrameUtils;
 
@@ -38,8 +42,11 @@ import org.junit.BeforeClass;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
+import org.mockito.Mockito;
 
 import java.io.File;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -95,6 +102,38 @@ public class ColocateTableTest {
         Env.getCurrentEnv().alterTable(alterTableStmt);
     }
 
+    private static void alterColocateGroup(String sql) throws Exception {
+        AlterColocateGroupStmt stmt = (AlterColocateGroupStmt) UtFrameUtils.parseAndAnalyzeStmt(sql, connectContext);
+        DdlExecutor.execute(Env.getCurrentEnv(), stmt);
+    }
+
+    private static void createSingleReplicaColocateTable(String tableName) throws Exception {
+        createTable("create table " + dbName + "." + tableName + " (\n"
+                + " `k1` int NULL COMMENT \"\",\n"
+                + " `k2` varchar(10) NULL COMMENT \"\"\n"
+                + ") ENGINE=OLAP\n"
+                + "DUPLICATE KEY(`k1`, `k2`)\n"
+                + "COMMENT \"OLAP\"\n"
+                + "DISTRIBUTED BY HASH(`k1`, `k2`) BUCKETS 1\n"
+                + "PROPERTIES (\n"
+                + " \"replication_num\" = \"1\",\n"
+                + " \"colocate_with\" = \"" + groupName + "\"\n"
+                + ");");
+    }
+
+    private static Map<Tag, List<List<Long>>> copyBackendsPerBucketSeq(
+            Map<Tag, List<List<Long>>> backendsPerBucketSeq) {
+        Map<Tag, List<List<Long>>> copied = new HashMap<>();
+        for (Map.Entry<Tag, List<List<Long>>> entry : backendsPerBucketSeq.entrySet()) {
+            List<List<Long>> copiedBuckets = new ArrayList<>();
+            for (List<Long> backends : entry.getValue()) {
+                copiedBuckets.add(new ArrayList<>(backends));
+            }
+            copied.put(entry.getKey(), copiedBuckets);
+        }
+        return copied;
+    }
+
     @Test
     public void testCreateOneTable() throws Exception {
         createTable("create table " + dbName + "." + tableName1 + " (\n"
@@ -136,6 +175,57 @@ public class ColocateTableTest {
         Assert.assertEquals(dbId, groupSchema.getGroupId().dbId);
         Assert.assertEquals(1, groupSchema.getBucketsNum());
         Assert.assertEquals((short) 1, groupSchema.getReplicaAlloc().getTotalReplicaNum());
+    }
+
+    @Test
+    public void testAlterColocateGroupReplicaAllocationLogsEditLog() throws Exception {
+        createSingleReplicaColocateTable(tableName1);
+
+        Env env = Env.getCurrentEnv();
+        EditLog originalEditLog = env.getEditLog();
+        EditLog mockEditLog = Mockito.mock(EditLog.class);
+        env.setEditLog(mockEditLog);
+        try {
+            alterColocateGroup("ALTER COLOCATE GROUP " + dbName + "." + groupName
+                    + " SET (\"replication_num\" = \"1\")");
+
+            Mockito.verify(mockEditLog, Mockito.times(1))
+                    .logColocateModifyRepliaAlloc(Mockito.any(ColocatePersistInfo.class));
+
+            ColocateTableIndex index = Env.getCurrentColocateIndex();
+            Database db = Env.getCurrentInternalCatalog().getDbOrMetaException(fullDbName);
+            String fullGroupName = GroupId.getFullGroupName(db.getId(), groupName);
+            Assert.assertEquals((short) 1,
+                    index.getGroupSchema(fullGroupName).getReplicaAlloc().getTotalReplicaNum());
+        } finally {
+            env.setEditLog(originalEditLog);
+        }
+    }
+
+    @Test
+    public void testReplayModifyReplicaAllocationDoesNotLogEditLog() throws Exception {
+        createSingleReplicaColocateTable(tableName1);
+
+        ColocateTableIndex index = Env.getCurrentColocateIndex();
+        Database db = Env.getCurrentInternalCatalog().getDbOrMetaException(fullDbName);
+        long tableId = db.getTableOrMetaException(tableName1).getId();
+        GroupId groupId = index.getGroup(tableId);
+        ColocatePersistInfo info = ColocatePersistInfo.createForModifyReplicaAlloc(
+                groupId, new ReplicaAllocation((short) 1),
+                copyBackendsPerBucketSeq(index.getBackendsPerBucketSeq(groupId)));
+
+        Env env = Env.getCurrentEnv();
+        EditLog originalEditLog = env.getEditLog();
+        EditLog mockEditLog = Mockito.mock(EditLog.class);
+        env.setEditLog(mockEditLog);
+        try {
+            index.replayModifyReplicaAlloc(info);
+
+            Mockito.verify(mockEditLog, Mockito.never())
+                    .logColocateModifyRepliaAlloc(Mockito.any(ColocatePersistInfo.class));
+        } finally {
+            env.setEditLog(originalEditLog);
+        }
     }
 
     @Test
