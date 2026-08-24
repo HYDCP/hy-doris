@@ -939,6 +939,56 @@ public class CreateTableTest extends TestWithFeService {
     }
 
     @Test
+    public void testForceMajorityLoadForTwoReplicas() throws Exception {
+        createTable("create table test.tbl_force_majority_two_replica\n"
+                + "(k1 int, k2 int)\n"
+                + "duplicate key(k1)\n"
+                + "distributed by hash(k1) buckets 1\n"
+                + "properties(\n"
+                + " 'replication_num' = '2',\n"
+                + " 'min_load_replica_num' = '1'\n"
+                + ");");
+        createTable("create table test.tbl_force_majority_three_replica\n"
+                + "(k1 int, k2 int)\n"
+                + "duplicate key(k1)\n"
+                + "distributed by hash(k1) buckets 1\n"
+                + "properties(\n"
+                + " 'replication_num' = '3',\n"
+                + " 'min_load_replica_num' = '1'\n"
+                + ");");
+
+        Database db = Env.getCurrentInternalCatalog().getDbOrDdlException("test");
+        OlapTable twoReplicaTable = (OlapTable) db.getTableOrDdlException("tbl_force_majority_two_replica");
+        long twoReplicaPartitionId = twoReplicaTable.getPartitions().iterator().next().getId();
+        OlapTable threeReplicaTable = (OlapTable) db.getTableOrDdlException("tbl_force_majority_three_replica");
+        long threeReplicaPartitionId = threeReplicaTable.getPartitions().iterator().next().getId();
+
+        boolean originalForceMajority = Config.force_majority_load_for_two_replica;
+        short originalMinLoadReplicaNum = Config.min_load_replica_num;
+        short originalTableMinLoadReplicaNum = twoReplicaTable.getMinLoadReplicaNum();
+        try {
+            Assert.assertTrue(Config.force_majority_load_for_two_replica);
+            Assert.assertEquals(2, twoReplicaTable.getLoadRequiredReplicaNum(twoReplicaPartitionId));
+            Assert.assertEquals(1, threeReplicaTable.getLoadRequiredReplicaNum(threeReplicaPartitionId));
+
+            Config.force_majority_load_for_two_replica = false;
+            Assert.assertEquals(1, twoReplicaTable.getLoadRequiredReplicaNum(twoReplicaPartitionId));
+
+            twoReplicaTable.setMinLoadReplicaNum((short) -1);
+            Config.min_load_replica_num = 1;
+            Config.force_majority_load_for_two_replica = true;
+            Assert.assertEquals(2, twoReplicaTable.getLoadRequiredReplicaNum(twoReplicaPartitionId));
+
+            Config.force_majority_load_for_two_replica = false;
+            Assert.assertEquals(1, twoReplicaTable.getLoadRequiredReplicaNum(twoReplicaPartitionId));
+        } finally {
+            Config.force_majority_load_for_two_replica = originalForceMajority;
+            Config.min_load_replica_num = originalMinLoadReplicaNum;
+            twoReplicaTable.setMinLoadReplicaNum(originalTableMinLoadReplicaNum);
+        }
+    }
+
+    @Test
     public void testCreateTableWithNerieds() throws Exception {
         ExceptionChecker.expectThrowsWithMsg(org.apache.doris.common.DdlException.class,
                                 "Failed to check min load replica num",

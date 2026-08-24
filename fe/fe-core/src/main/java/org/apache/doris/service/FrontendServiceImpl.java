@@ -3832,6 +3832,8 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             List<TTabletLocation> partitionSlaveTablets = new ArrayList<>();
             TOlapTablePartition tPartition = new TOlapTablePartition();
             tPartition.setId(partition.getId());
+            tPartition.setTotalReplicaNum(olapTable.getPartitionTotalReplicasNum(partition.getId()));
+            tPartition.setLoadRequiredReplicaNum(olapTable.getLoadRequiredReplicaNum(partition.getId()));
             int partColNum = partitionInfo.getPartitionColumns().size();
             try {
                 OlapTableSink.setPartitionKeys(tPartition, partitionInfo.getItem(partition.getId()), partColNum);
@@ -4101,6 +4103,8 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             Partition partition = olapTable.getPartition(partitionId);
             TOlapTablePartition tPartition = new TOlapTablePartition();
             tPartition.setId(partition.getId());
+            tPartition.setTotalReplicaNum(olapTable.getPartitionTotalReplicasNum(partition.getId()));
+            tPartition.setLoadRequiredReplicaNum(olapTable.getLoadRequiredReplicaNum(partition.getId()));
 
             // set partition keys
             int partColNum = partitionInfo.getPartitionColumns().size();

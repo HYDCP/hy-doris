@@ -2407,16 +2407,24 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
     public int getLoadRequiredReplicaNum(long partitionId) {
         int totalReplicaNum = getPartitionTotalReplicasNum(partitionId);
         int minLoadReplicaNum = getMinLoadReplicaNum();
+        int loadRequiredReplicaNum;
         if (minLoadReplicaNum > 0) {
-            return Math.min(minLoadReplicaNum, totalReplicaNum);
+            loadRequiredReplicaNum = Math.min(minLoadReplicaNum, totalReplicaNum);
+        } else {
+            int quorum = totalReplicaNum / 2 + 1;
+            if (Config.min_load_replica_num > 0) {
+                loadRequiredReplicaNum = Math.min(quorum, Config.min_load_replica_num);
+            } else {
+                loadRequiredReplicaNum = quorum;
+            }
         }
 
-        int quorum = totalReplicaNum / 2 + 1;
-        if (Config.min_load_replica_num > 0) {
-            return Math.min(quorum, Config.min_load_replica_num);
+        // Avoid consecutive loads succeeding on different single replicas and creating crossed version gaps.
+        if (Config.force_majority_load_for_two_replica
+                && totalReplicaNum == 2 && loadRequiredReplicaNum == 1) {
+            return 2;
         }
-
-        return quorum;
+        return loadRequiredReplicaNum;
     }
 
     public void setStorageMedium(TStorageMedium medium) {
