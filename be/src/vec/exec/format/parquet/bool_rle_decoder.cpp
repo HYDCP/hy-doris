@@ -20,6 +20,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cstring>
 #include <ostream>
 #include <string>
 
@@ -91,6 +92,7 @@ Status BoolRLEDecoder::_decode_values(MutableColumnPtr& doris_column, DataTypePt
             break;
         }
         case ColumnSelectVector::NULL_DATA: {
+            memset(column_data.data() + data_index, 0, run_length);
             data_index += run_length;
             break;
         }

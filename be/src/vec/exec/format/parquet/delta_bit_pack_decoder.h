@@ -22,6 +22,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <cstring>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -104,6 +105,7 @@ public:
                 break;
             }
             case ColumnSelectVector::NULL_DATA: {
+                memset(data + data_index, 0, run_length * _type_length);
                 data_index += run_length * _type_length;
                 break;
             }

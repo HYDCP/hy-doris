@@ -18,6 +18,7 @@
 #include "byte_stream_split_decoder.h"
 
 #include <cstdint>
+#include <cstring>
 
 #include "util/byte_stream_split.h"
 
@@ -67,6 +68,7 @@ Status ByteStreamSplitDecoder::_decode_values(MutableColumnPtr& doris_column,
             break;
         }
         case ColumnSelectVector::NULL_DATA: {
+            memset(raw_data + data_index, 0, run_length * _type_length);
             data_index += run_length * _type_length;
             break;
         }
