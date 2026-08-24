@@ -437,6 +437,48 @@ TEST_F(VerticalCompactionTest, TestRowSourcesBuffer) {
     }
 }
 
+// Regression test for RowSourcesBuffer::append spill threshold. PaddedPODArray's
+// allocated_bytes() includes padding that cannot store elements. If that padding is treated as
+// available capacity, append() can miss a spill and allow the in-memory buffer to grow beyond the
+// configured limit.
+TEST_F(VerticalCompactionTest, TestRowSourcesBufferSpillThreshold) {
+    config::vertical_compaction_max_row_source_memory_mb = 1;
+    const size_t mem_limit_bytes =
+            static_cast<size_t>(config::vertical_compaction_max_row_source_memory_mb) * 1024 * 1024;
+
+    RowSourcesBuffer buffer(200, absolute_dir, ReaderType::READER_CUMULATIVE_COMPACTION);
+
+    constexpr size_t kBatchSize = 4096;
+    std::vector<RowSource> batch;
+    batch.reserve(kBatchSize);
+    for (size_t i = 0; i < kBatchSize; ++i) {
+        batch.emplace_back(static_cast<uint16_t>(i % 8), false);
+    }
+
+    const size_t total_appends = (mem_limit_bytes / sizeof(uint16_t)) * 4 / kBatchSize + 8;
+    size_t expected_total = 0;
+    for (size_t i = 0; i < total_appends; ++i) {
+        ASSERT_TRUE(buffer.append(batch).ok());
+        expected_total += kBatchSize;
+
+        const size_t buffered_bytes = buffer.buffered_size() * sizeof(uint16_t);
+        EXPECT_LE(buffered_bytes, mem_limit_bytes + kBatchSize * sizeof(uint16_t))
+                << "RowSourcesBuffer exceeded the configured limit at iteration " << i;
+    }
+
+    EXPECT_EQ(buffer.total_size(), expected_total);
+    ASSERT_TRUE(buffer.flush().ok());
+    ASSERT_TRUE(buffer.seek_to_begin().ok());
+
+    size_t read_back = 0;
+    while (buffer.has_remaining().ok()) {
+        EXPECT_EQ(buffer.current().get_source_num(), read_back % 8);
+        buffer.advance();
+        ++read_back;
+    }
+    EXPECT_EQ(read_back, expected_total);
+}
+
 TEST_F(VerticalCompactionTest, TestDupKeyVerticalMerge) {
     auto num_input_rowset = 2;
     auto num_segments = 2;
