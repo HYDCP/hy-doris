@@ -54,7 +54,6 @@ suite("test_parquet_dict_lazy_read_eof", "p0") {
     // Write directly under /tmp with a file name (no trailing slash) so that
     // no directory has to be pre-created on the backend.
     def outfile_path_prefix = """/tmp/parquet_dict_lazy_read_eof"""
-    def local_tvf_prefix = "tmp/parquet_dict_lazy_read_eof"
     def uuid = UUID.randomUUID().toString()
     def outFilePath = "${outfile_path_prefix}_${uuid}"
 
@@ -95,7 +94,7 @@ suite("test_parquet_dict_lazy_read_eof", "p0") {
         ipList.each { beid, ip ->
             def tvf = """
                 select * from local(
-                "file_path" = "${local_tvf_prefix}_${uuid}*",
+                "file_path" = "${outFilePath}*",
                 "backend_id" = "${beid}",
                 "format" = "parquet")
             """
