@@ -51,10 +51,12 @@ suite("test_parquet_dict_lazy_read_eof", "p0") {
     }
 
     def tableName = "parquet_dict_lazy_read_src"
+    // Write directly under /tmp with a file name (no trailing slash) so that
+    // no directory has to be pre-created on the backend.
     def outfile_path_prefix = """/tmp/parquet_dict_lazy_read_eof"""
     def local_tvf_prefix = "tmp/parquet_dict_lazy_read_eof"
     def uuid = UUID.randomUUID().toString()
-    def outFilePath = "${outfile_path_prefix}/${tableName}_${uuid}"
+    def outFilePath = "${outfile_path_prefix}_${uuid}"
 
     try {
         sql """ DROP TABLE IF EXISTS ${tableName} """
@@ -83,7 +85,7 @@ suite("test_parquet_dict_lazy_read_eof", "p0") {
         assertEquals(1667, srcStr1[0][0])
 
         sql """
-            SELECT * FROM ${tableName} INTO OUTFILE "file://${outFilePath}/"
+            SELECT * FROM ${tableName} INTO OUTFILE "file://${outFilePath}"
             FORMAT AS PARQUET;
         """
 
@@ -93,7 +95,7 @@ suite("test_parquet_dict_lazy_read_eof", "p0") {
         ipList.each { beid, ip ->
             def tvf = """
                 select * from local(
-                "file_path" = "${local_tvf_prefix}/${tableName}_${uuid}/*",
+                "file_path" = "${local_tvf_prefix}_${uuid}*",
                 "backend_id" = "${beid}",
                 "format" = "parquet");
             """
