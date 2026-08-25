@@ -97,7 +97,7 @@ suite("test_parquet_dict_lazy_read_eof", "p0") {
                 select * from local(
                 "file_path" = "${local_tvf_prefix}_${uuid}*",
                 "backend_id" = "${beid}",
-                "format" = "parquet");
+                "format" = "parquet")
             """
 
             // Predicate on the dictionary-encoded column matches nothing:
