@@ -94,4 +94,28 @@ suite("test_scan_filtered_rows_not_pollute_load_counter", "p0") {
         )
     """
     qt_update_noop "select * from test_scan_filter_load_counter_uniq order by k1"
+
+    // A partially filtered insert must report the exact number of loaded rows:
+    // scanner-filtered rows must not be subtracted from the returned affected rows.
+    def affected = sql """
+        INSERT INTO test_scan_filter_load_counter_dst
+        SELECT k1 FROM test_scan_filter_load_counter_src WHERE v1 <= 5
+    """
+    assertTrue(affected.size() == 1 && affected[0].size() == 1)
+    assertTrue(affected[0][0] == 5, "Partially filtered insert should affect exactly 5 rows, got ${affected[0][0]}")
+    def dstCount = sql "select count(*) from test_scan_filter_load_counter_dst"
+    assertTrue(dstCount[0][0] == 5, "Destination should contain exactly 5 rows, got ${dstCount[0][0]}")
+
+    // With profile enabled (the original trigger), a no-op insert must report
+    // zero affected rows instead of a negative, polluted count.
+    sql "set enable_profile=true"
+    def affectedEmpty = sql """
+        INSERT INTO test_scan_filter_load_counter_dst
+        SELECT k1 FROM test_scan_filter_load_counter_src WHERE v1 > 1000
+    """
+    assertTrue(affectedEmpty.size() == 1 && affectedEmpty[0].size() == 1)
+    assertTrue(affectedEmpty[0][0] == 0, "No-op insert should affect 0 rows, got ${affectedEmpty[0][0]}")
+    def dstCountAfter = sql "select count(*) from test_scan_filter_load_counter_dst"
+    assertTrue(dstCountAfter[0][0] == 5, "Destination should still contain 5 rows, got ${dstCountAfter[0][0]}")
+    sql "set enable_profile=false"
 }
