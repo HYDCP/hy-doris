@@ -70,7 +70,7 @@ uint16_t RowSource::data() const {
 // current row_sources must save in memory so agg key can update agg flag
 Status RowSourcesBuffer::append(const std::vector<RowSource>& row_sources) {
     if (_buffer->allocated_bytes() + row_sources.size() * sizeof(UInt16) >
-        config::vertical_compaction_max_row_source_memory_mb * 1024 * 1024) {
+        static_cast<size_t>(config::vertical_compaction_max_row_source_memory_mb) * 1024 * 1024) {
         // Use capacity() - size() to get the truly available element slots.
         // PODArrayBase::allocated_bytes() includes pad_left and pad_right, which are not usable
         // for storing elements. Treating them as available space can skip the spill and trigger
@@ -151,7 +151,7 @@ size_t RowSourcesBuffer::continuous_agg_count(uint64_t index) {
 }
 
 size_t RowSourcesBuffer::same_source_count(uint16_t source, size_t limit) {
-    int result = 1;
+    size_t result = 1;
     int64_t start = _buf_idx + 1;
     int64_t end = _buffer->size();
     while (result < limit && start < end) {
