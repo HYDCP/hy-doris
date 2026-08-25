@@ -27,4 +27,18 @@ suite("test_large_http_header", "p0") {
             assertEquals(200, code)
         }
     }
+
+    // A header larger than jetty_server_max_http_header_size (default 1 MiB)
+    // must be rejected before reaching the servlet, with 431 Request Header
+    // Fields Too Large.
+    def oversizedHeaderValue = "x" * (1024 * 1024 + 64 * 1024)
+    httpTest {
+        endpoint context.config.feHttpAddress
+        uri "/api/health"
+        op "get"
+        header "X-Large-Header", oversizedHeaderValue
+        check { code, body ->
+            assertEquals(431, code)
+        }
+    }
 }
