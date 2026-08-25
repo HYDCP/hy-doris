@@ -595,11 +595,11 @@ TEST_F(DeltaByteArrayDecoderTest, test_invalid_data) {
     ASSERT_FALSE(_decoder->set_data(&data_slice).ok());
 }
 
-
 // NULL rows retained in the result must have their payload zeroed even when
 // the output buffer is reused from a previous batch and still holds poison
 // bytes, and NULL rows must not consume decoded values.
-TEST_F(DeltaByteArrayDecoderTest, test_decode_fixed_len_byte_array_null_data_initializes_reused_payload) {
+TEST_F(DeltaByteArrayDecoderTest,
+       test_decode_fixed_len_byte_array_null_data_initializes_reused_payload) {
     // Configure DECIMAL type parameters
     const int32_t type_length = 16;
     int precision = 10;

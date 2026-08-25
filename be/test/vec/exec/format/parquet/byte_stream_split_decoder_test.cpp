@@ -17,9 +17,9 @@
 
 #include "vec/exec/format/parquet/byte_stream_split_decoder.h"
 
-#include <cstring>
-
 #include <gtest/gtest.h>
+
+#include <cstring>
 
 #include "util/slice.h"
 #include "vec/columns/column_vector.h"
@@ -404,7 +404,6 @@ TEST_F(ByteStreamSplitDecoderTest, test_skip_value_double) {
     EXPECT_DOUBLE_EQ(result_column->get_data()[0], 3.0);
 }
 
-
 // NULL rows retained in the result must have their payload zeroed even when
 // the output buffer is reused from a previous batch and still holds poison
 // bytes. Raw bytes are compared to avoid NaN comparison semantics.
@@ -441,8 +440,8 @@ TEST_F(ByteStreamSplitDecoderTest, test_null_data_initializes_reused_payload) {
     ASSERT_TRUE(filter_map.init(filter_data.data(), filter_data.size(), false).ok());
     ColumnSelectVector select_vector;
     NullMap null_map;
-    ASSERT_TRUE(select_vector.init(run_length_null_map, num_values, &null_map, &filter_map, 0)
-                        .ok());
+    ASSERT_TRUE(
+            select_vector.init(run_length_null_map, num_values, &null_map, &filter_map, 0).ok());
 
     ASSERT_TRUE(_decoder.decode_values(column, data_type, select_vector, false).ok());
 
