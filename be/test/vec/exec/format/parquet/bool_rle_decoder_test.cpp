@@ -17,6 +17,8 @@
 
 #include "vec/exec/format/parquet/bool_rle_decoder.h"
 
+#include <cstring>
+
 #include <gtest/gtest.h>
 
 #include "parquet/encoding.h"
@@ -240,6 +242,56 @@ TEST_F(BoolRLEDecoderTest, test_invalid_data) {
     std::vector<uint8_t> encoded_data = {0x08, 0x01}; // Incomplete data
     Slice data_slice(reinterpret_cast<char*>(encoded_data.data()), encoded_data.size());
     ASSERT_FALSE(_decoder->set_data(&data_slice).ok());
+}
+
+
+// NULL rows retained in the result must have their payload zeroed even when
+// the output buffer is reused from a previous batch and still holds poison
+// bytes, instead of keeping the stale values.
+TEST_F(BoolRLEDecoderTest, test_null_data_initializes_reused_payload) {
+    // Encoded data: [true, false, true, true, false, false, false, true]
+    std::vector<uint8_t> encoded_data = {0x02, 0x00, 0x00, 0x00, 0x03, 0x8d};
+    Slice data_slice(reinterpret_cast<char*>(encoded_data.data()), encoded_data.size());
+    ASSERT_TRUE(_decoder->set_data(&data_slice).ok());
+
+    MutableColumnPtr column = ColumnUInt8::create();
+    // Poison the reusable buffer and clear it, keeping the capacity.
+    auto& poison_data = column->get_data();
+    poison_data.resize(4);
+    memset(poison_data.data(), 1, 4);
+    column->clear();
+    ASSERT_EQ(0, column->size());
+
+    DataTypePtr data_type = std::make_shared<DataTypeUInt8>();
+
+    // Logical pattern: NULL, CONTENT, CONTENT, NULL. Only the two CONTENT
+    // rows consume physical values (true and false).
+    size_t num_values = 4;
+    std::vector<uint16_t> run_length_null_map = {0, 1, 2, 1};
+    std::vector<uint8_t> filter_data(num_values, 1);
+    FilterMap filter_map;
+    ASSERT_TRUE(filter_map.init(filter_data.data(), filter_data.size(), false).ok());
+    ColumnSelectVector select_vector;
+    NullMap null_map;
+    ASSERT_TRUE(
+            select_vector.init(run_length_null_map, num_values, &null_map, &filter_map, 0).ok());
+
+    ASSERT_TRUE(_decoder->decode_values(column, data_type, select_vector, false).ok());
+
+    ASSERT_EQ(num_values, column->size());
+    auto* result_column = assert_cast<ColumnUInt8*>(column.get());
+    // NULL rows must be zeroed, the poison must not survive.
+    EXPECT_EQ(0, result_column->get_data()[0]);
+    EXPECT_EQ(0, result_column->get_data()[3]);
+    // Non-NULL rows decode the physical values true and false.
+    EXPECT_EQ(1, result_column->get_data()[1]);
+    EXPECT_EQ(0, result_column->get_data()[2]);
+
+    ASSERT_EQ(num_values, null_map.size());
+    EXPECT_EQ(1, null_map[0]);
+    EXPECT_EQ(0, null_map[1]);
+    EXPECT_EQ(0, null_map[2]);
+    EXPECT_EQ(1, null_map[3]);
 }
 
 } // namespace doris::vectorized
