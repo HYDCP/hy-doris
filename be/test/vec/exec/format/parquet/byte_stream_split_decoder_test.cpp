@@ -17,6 +17,8 @@
 
 #include "vec/exec/format/parquet/byte_stream_split_decoder.h"
 
+#include <cstring>
+
 #include <gtest/gtest.h>
 
 #include "util/slice.h"
@@ -400,6 +402,71 @@ TEST_F(ByteStreamSplitDecoderTest, test_skip_value_double) {
     ASSERT_EQ(column->size(), num_values);
     auto* result_column = assert_cast<ColumnFloat64*>(column.get());
     EXPECT_DOUBLE_EQ(result_column->get_data()[0], 3.0);
+}
+
+
+// NULL rows retained in the result must have their payload zeroed even when
+// the output buffer is reused from a previous batch and still holds poison
+// bytes. Raw bytes are compared to avoid NaN comparison semantics.
+TEST_F(ByteStreamSplitDecoderTest, test_null_data_initializes_reused_payload) {
+    // Two physical FLOAT values.
+    size_t type_length = sizeof(float);
+    const float values[2] = {1.0f, -2.5f};
+    auto data = std::make_unique<uint8_t[]>(2 * type_length);
+    for (size_t i = 0; i < 2; i++) {
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&values[i]);
+        for (size_t j = 0; j < type_length; j++) {
+            data[j * 2 + i] = bytes[j];
+        }
+    }
+    Slice data_slice(data.get(), 2 * type_length);
+    ASSERT_TRUE(_decoder.set_data(&data_slice).ok());
+    _decoder.set_type_length(type_length);
+
+    MutableColumnPtr column = ColumnFloat32::create();
+    // Poison the reusable buffer and clear it, keeping the capacity.
+    auto& poison_data = assert_cast<ColumnFloat32*>(column.get())->get_data();
+    poison_data.resize(4);
+    memset(poison_data.data(), 0xa5, 4 * type_length);
+    column->clear();
+    ASSERT_EQ(0, column->size());
+
+    DataTypePtr data_type = std::make_shared<DataTypeFloat32>();
+
+    // Logical pattern: NULL, CONTENT, CONTENT, NULL.
+    size_t num_values = 4;
+    std::vector<uint16_t> run_length_null_map = {0, 1, 2, 1};
+    std::vector<uint8_t> filter_data(num_values, 1);
+    FilterMap filter_map;
+    ASSERT_TRUE(filter_map.init(filter_data.data(), filter_data.size(), false).ok());
+    ColumnSelectVector select_vector;
+    NullMap null_map;
+    ASSERT_TRUE(select_vector.init(run_length_null_map, num_values, &null_map, &filter_map, 0)
+                        .ok());
+
+    ASSERT_TRUE(_decoder.decode_values(column, data_type, select_vector, false).ok());
+
+    ASSERT_EQ(num_values, column->size());
+    const auto* result_column = assert_cast<const ColumnFloat32*>(column.get());
+    const auto& result_data = result_column->get_data();
+    const auto* raw = reinterpret_cast<const uint8_t*>(result_data.data());
+
+    // NULL rows must be fully zeroed, the poison must not survive.
+    for (size_t row : {0, 3}) {
+        for (size_t i = 0; i < type_length; ++i) {
+            EXPECT_EQ(0, raw[row * type_length + i])
+                    << "NULL row " << row << " byte " << i << " must be zero";
+        }
+    }
+    // Non-NULL rows decode the physical float values byte-for-byte.
+    EXPECT_EQ(0, memcmp(&values[0], raw + type_length, type_length));
+    EXPECT_EQ(0, memcmp(&values[1], raw + 2 * type_length, type_length));
+
+    ASSERT_EQ(num_values, null_map.size());
+    EXPECT_EQ(1, null_map[0]);
+    EXPECT_EQ(0, null_map[1]);
+    EXPECT_EQ(0, null_map[2]);
+    EXPECT_EQ(1, null_map[3]);
 }
 
 } // namespace doris::vectorized

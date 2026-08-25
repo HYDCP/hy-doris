@@ -595,4 +595,100 @@ TEST_F(DeltaByteArrayDecoderTest, test_invalid_data) {
     ASSERT_FALSE(_decoder->set_data(&data_slice).ok());
 }
 
+
+// NULL rows retained in the result must have their payload zeroed even when
+// the output buffer is reused from a previous batch and still holds poison
+// bytes, and NULL rows must not consume decoded values.
+TEST_F(DeltaByteArrayDecoderTest, test_decode_fixed_len_byte_array_null_data_initializes_reused_payload) {
+    // Configure DECIMAL type parameters
+    const int32_t type_length = 16;
+    int precision = 10;
+    int scale = 2;
+    _decoder->set_type_length(type_length);
+
+    // Create ColumnDescriptor
+    auto node = parquet::schema::PrimitiveNode::Make(
+            "test_column", parquet::Repetition::REQUIRED, parquet::Type::FIXED_LEN_BYTE_ARRAY,
+            parquet::ConvertedType::DECIMAL, type_length, precision, scale);
+    auto descr = std::make_shared<parquet::ColumnDescriptor>(node, 0, 0);
+
+    // Prepare test data
+    std::vector<std::vector<uint8_t>> test_fixed_len_buffers = {
+            {0x1a, 0x05, 0x06, 0x1b, 0x00, 0x00, 0x00, 0x13, 0x1c, 0x00, 0x00, 0x00, 0x00, 0xbc,
+             0x61, 0x40}, // Data 1
+            {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+             0x00, 0x00}, // Data 2 (all zeros)
+            {0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC,
+             0xDE, 0xF0} // Data 3 (random)
+    };
+
+    std::vector<parquet::ByteArray> byte_array_values;
+    for (const auto& buffer : test_fixed_len_buffers) {
+        byte_array_values.emplace_back(
+                parquet::ByteArray {static_cast<uint32_t>(buffer.size()), buffer.data()});
+    }
+
+    // Encode data
+    auto encoder = MakeTypedEncoder<parquet::ByteArrayType>(parquet::Encoding::DELTA_BYTE_ARRAY,
+                                                            /*use_dictionary=*/false, descr.get());
+    ASSERT_NO_THROW(
+            encoder->Put(byte_array_values.data(), static_cast<int>(byte_array_values.size())));
+    auto encoded_buffer = encoder->FlushValues();
+
+    // Set decoder data
+    Slice data_slice(encoded_buffer->data(), encoded_buffer->size());
+    ASSERT_TRUE(_decoder->set_data(&data_slice).ok());
+
+    // Create column and data type
+    MutableColumnPtr column = ColumnInt8::create();
+    // Poison the reusable buffer and clear it, keeping the capacity.
+    auto& poison_data = assert_cast<ColumnInt8*>(column.get())->get_data();
+    poison_data.resize(4 * type_length);
+    memset(poison_data.data(), 0x7f, 4 * type_length);
+    column->clear();
+    ASSERT_EQ(0, column->size());
+
+    DataTypePtr data_type = std::make_shared<DataTypeInt8>();
+
+    // Logical pattern: NULL, CONTENT, CONTENT, NULL. The two CONTENT rows
+    // consume Data 1 and Data 2, while the NULL rows must not consume any
+    // decoded value.
+    size_t num_values = 4;
+    std::vector<uint16_t> run_length_null_map = {0, 1, 2, 1};
+    std::vector<uint8_t> filter_data(num_values, 1);
+    FilterMap filter_map;
+    ASSERT_TRUE(filter_map.init(filter_data.data(), filter_data.size(), false).ok());
+    ColumnSelectVector select_vector;
+    NullMap null_map;
+    ASSERT_TRUE(
+            select_vector.init(run_length_null_map, num_values, &null_map, &filter_map, 0).ok());
+
+    // Perform decoding
+    ASSERT_TRUE(_decoder->decode_values(column, data_type, select_vector, false).ok());
+
+    // Verify results
+    ASSERT_EQ(num_values * type_length, column->size());
+    auto* result_column = assert_cast<ColumnInt8*>(column.get());
+    const auto& data = result_column->get_data();
+
+    // NULL rows must be fully zeroed, the poison must not survive.
+    for (size_t row : {0, 3}) {
+        for (size_t i = 0; i < type_length; ++i) {
+            EXPECT_EQ(0, data[row * type_length + i])
+                    << "NULL row " << row << " byte " << i << " must be zero";
+        }
+    }
+    // Non-NULL rows decode Data 1 and Data 2.
+    for (size_t i = 0; i < type_length; ++i) {
+        EXPECT_EQ(static_cast<int8_t>(test_fixed_len_buffers[0][i]), data[type_length + i]);
+        EXPECT_EQ(static_cast<int8_t>(test_fixed_len_buffers[1][i]), data[2 * type_length + i]);
+    }
+
+    ASSERT_EQ(num_values, null_map.size());
+    EXPECT_EQ(1, null_map[0]);
+    EXPECT_EQ(0, null_map[1]);
+    EXPECT_EQ(0, null_map[2]);
+    EXPECT_EQ(1, null_map[3]);
+}
+
 } // namespace doris::vectorized
