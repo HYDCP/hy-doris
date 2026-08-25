@@ -22,8 +22,6 @@
 // columns before the block is reused, otherwise stale dictionary codes leak
 // into later batches and downstream operators.
 import org.codehaus.groovy.runtime.IOGroovyMethods
-import java.io.BufferedReader
-import java.io.InputStreamReader
 
 suite("test_parquet_dict_lazy_read_eof", "p0") {
     // check whether the FE config 'enable_outfile_to_local' is true
@@ -51,11 +49,19 @@ suite("test_parquet_dict_lazy_read_eof", "p0") {
     }
 
     def tableName = "parquet_dict_lazy_read_src"
-    // Write directly under /tmp with a file name (no trailing slash) so that
-    // no directory has to be pre-created on the backend.
-    def outfile_path_prefix = """/tmp/parquet_dict_lazy_read_eof"""
+    // The local() tvf resolves file paths against the backend's DORIS_HOME,
+    // so write the parquet file under <repo>/output/be/tmp which is the
+    // backend home in the regression environment.
+    def dataPath = context.config.dataPath
+    def repoRoot = new File(dataPath).getParentFile().getParentFile().getAbsolutePath()
+    def beHome = "${repoRoot}/output/be"
+    def beTmpDir = new File("${beHome}/tmp")
+    if (!beTmpDir.exists()) {
+        beTmpDir.mkdirs()
+    }
     def uuid = UUID.randomUUID().toString()
-    def outFilePath = "${outfile_path_prefix}_${uuid}"
+    def outfilePrefix = "parquet_dict_lazy_read_eof_${uuid}"
+    def outFilePath = "${beHome}/tmp/${outfilePrefix}"
 
     try {
         sql """ DROP TABLE IF EXISTS ${tableName} """
@@ -94,7 +100,7 @@ suite("test_parquet_dict_lazy_read_eof", "p0") {
         ipList.each { beid, ip ->
             def tvf = """
                 select * from local(
-                "file_path" = "${outFilePath}*",
+                "file_path" = "tmp/${outfilePrefix}*",
                 "backend_id" = "${beid}",
                 "format" = "parquet")
             """
@@ -121,7 +127,7 @@ suite("test_parquet_dict_lazy_read_eof", "p0") {
             assertEquals("str_2", sample[2][0])
         }
     } finally {
-        deleteRemotePathOnAllBE("root", "${outFilePath}")
+        beTmpDir.listFiles().findAll { it.name.startsWith(outfilePrefix) }.each { it.delete() }
         sql """ DROP TABLE IF EXISTS ${tableName} """
     }
 }
