@@ -125,8 +125,9 @@ TEST_F(ParquetNullPayloadConversionTest, FixedLengthPlainDecoderInitializesReuse
 
     // Poison the reusable output buffer and clear it, keeping the capacity,
     // which is exactly the state of a cached column between batches.
-    auto column = ColumnUInt8::create();
-    column->get_data().resize_fill(kTypeLength * kBatchRows, 0x7f);
+    MutableColumnPtr column = ColumnUInt8::create();
+    assert_cast<ColumnUInt8*>(column.get())->get_data().resize_fill(kTypeLength * kBatchRows,
+                                                                    0x7f);
     ASSERT_LE(kTypeLength * kBatchRows, column->get_data().capacity());
     column->clear();
     ASSERT_EQ(0, column->size());
@@ -150,7 +151,7 @@ TEST_F(ParquetNullPayloadConversionTest, FixedLengthPlainDecoderInitializesReuse
 
     // Four logical rows are retained, each with a 16-byte payload.
     ASSERT_EQ(kTypeLength * kBatchRows, column->size());
-    const auto& data = column->get_data();
+    const auto& data = assert_cast<const ColumnUInt8*>(column.get())->get_data();
 
     // NULL rows must be fully zeroed instead of keeping the poison.
     for (size_t row : {0, 2}) {

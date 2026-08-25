@@ -425,7 +425,7 @@ TEST_F(ByteStreamSplitDecoderTest, test_null_data_initializes_reused_payload) {
 
     MutableColumnPtr column = ColumnFloat32::create();
     // Poison the reusable buffer and clear it, keeping the capacity.
-    auto& poison_data = column->get_data();
+    auto& poison_data = assert_cast<ColumnFloat32*>(column.get())->get_data();
     poison_data.resize(4);
     memset(poison_data.data(), 0xa5, 4 * type_length);
     column->clear();

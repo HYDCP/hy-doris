@@ -642,7 +642,7 @@ TEST_F(DeltaByteArrayDecoderTest, test_decode_fixed_len_byte_array_null_data_ini
     // Create column and data type
     MutableColumnPtr column = ColumnInt8::create();
     // Poison the reusable buffer and clear it, keeping the capacity.
-    auto& poison_data = column->get_data();
+    auto& poison_data = assert_cast<ColumnInt8*>(column.get())->get_data();
     poison_data.resize(4 * type_length);
     memset(poison_data.data(), 0x7f, 4 * type_length);
     column->clear();

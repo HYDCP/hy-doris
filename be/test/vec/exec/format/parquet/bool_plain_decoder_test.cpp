@@ -256,7 +256,7 @@ TEST_F(BoolPlainDecoderTest, test_null_data_initializes_reused_payload) {
 
     MutableColumnPtr column = ColumnUInt8::create();
     // Poison the reusable buffer and clear it, keeping the capacity.
-    auto& poison_data = column->get_data();
+    auto& poison_data = assert_cast<ColumnUInt8*>(column.get())->get_data();
     poison_data.resize(4);
     memset(poison_data.data(), 1, 4);
     column->clear();

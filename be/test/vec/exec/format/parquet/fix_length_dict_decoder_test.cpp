@@ -555,7 +555,7 @@ TEST_F(FixLengthDictDecoderTest, test_skip_value) {
 TEST_F(FixLengthDictDecoderTest, test_null_data_initializes_reused_payload) {
     MutableColumnPtr column = ColumnUInt8::create();
     // Poison the reusable buffer and clear it, keeping the capacity.
-    auto& poison_data = column->get_data();
+    auto& poison_data = assert_cast<ColumnUInt8*>(column.get())->get_data();
     poison_data.resize(4 * _type_length);
     memset(poison_data.data(), 0x7f, 4 * _type_length);
     column->clear();
