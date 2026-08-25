@@ -174,9 +174,13 @@ protected:
     // A cached logical nested column can be cleared between batches while still sharing the
     // accumulated destination null map. Locate the current batch from the end of that null map.
     static size_t _null_map_start(const IColumn& dst_col, size_t rows) {
-        DCHECK(!dst_col.is_nullable() || dst_col.size() >= rows)
-                << "rows=" << rows << ", size=" << dst_col.size();
-        return dst_col.is_nullable() ? dst_col.size() - rows : 0;
+        if (dst_col.is_nullable()) {
+            // Release-enabled check: a violated precondition would underflow the size_t
+            // subtraction below and read out of bounds.
+            CHECK_GE(dst_col.size(), rows);
+            return dst_col.size() - rows;
+        }
+        return 0;
     }
 
     static bool _is_null(const IColumn& dst_col, size_t row) {
