@@ -37,7 +37,7 @@
 
 namespace doris::vectorized {
 
-using Decimal128Column = ColumnDecimal<Decimal128V2>;
+using Decimal128Column = ColumnDecimal<Decimal128V3>;
 
 // Regression tests for NULL payload handling in the parquet reading chain:
 //   1. fixed-width decoders must initialize nested payload of retained NULL
@@ -105,7 +105,7 @@ protected:
 
     static void assert_decimal_value(const Decimal128Column& column, size_t pos, Int128 expected,
                                       const char* what) {
-        EXPECT_EQ(Decimal128V2(expected), column.get_data()[pos]) << what << " at row " << pos;
+        EXPECT_EQ(Decimal128V3(expected), column.get_data()[pos]) << what << " at row " << pos;
     }
 };
 
@@ -274,7 +274,7 @@ TEST_F(ParquetNullPayloadConversionTest, DecimalLogicalConverterUsesAccumulatedD
     auto& null_map = nullable_dst.get_null_map_data();
     // 4 prefix rows, all non-NULL.
     for (int i = 0; i < kPrefixRows; ++i) {
-        nested_dst.get_data().push_back(Decimal128V2((i + 1) * 100000));
+        nested_dst.get_data().push_back(Decimal128V3((i + 1) * 100000));
         null_map.push_back(0);
     }
     // Current batch flags: [1, 0, 1, 0].
@@ -285,10 +285,10 @@ TEST_F(ParquetNullPayloadConversionTest, DecimalLogicalConverterUsesAccumulatedD
     // Batch-local source values with poison at the NULL positions.
     auto src_mutable = create_decimal(kSrcPrecision, kSrcScale, false)->create_column();
     auto& src_data = assert_cast<Decimal128Column&>(*src_mutable).get_data();
-    src_data.push_back(Decimal128V2(poison_value()));
-    src_data.push_back(Decimal128V2(valid_value_1()));
-    src_data.push_back(Decimal128V2(poison_value()));
-    src_data.push_back(Decimal128V2(valid_value_2()));
+    src_data.push_back(Decimal128V3(poison_value()));
+    src_data.push_back(Decimal128V3(valid_value_1()));
+    src_data.push_back(Decimal128V3(poison_value()));
+    src_data.push_back(Decimal128V3(valid_value_2()));
 
     ColumnPtr src_col = std::move(src_mutable);
     Status st = converter->convert(src_col, mutable_dst);
@@ -333,7 +333,7 @@ TEST_F(ParquetNullPayloadConversionTest, NonNullDecimalOverflowStillFails) {
     auto& null_map = nullable_dst.get_null_map_data();
     // All prefix and batch rows are non-NULL.
     for (int i = 0; i < kPrefixRows; ++i) {
-        nested_dst.get_data().push_back(Decimal128V2((i + 1) * 100000));
+        nested_dst.get_data().push_back(Decimal128V3((i + 1) * 100000));
         null_map.push_back(0);
     }
     for (int i = 0; i < kBatchRows; ++i) {
@@ -343,10 +343,10 @@ TEST_F(ParquetNullPayloadConversionTest, NonNullDecimalOverflowStillFails) {
     // The first row of the batch carries the poison at a non-NULL position.
     auto src_mutable = create_decimal(kSrcPrecision, kSrcScale, false)->create_column();
     auto& src_data = assert_cast<Decimal128Column&>(*src_mutable).get_data();
-    src_data.push_back(Decimal128V2(poison_value()));
-    src_data.push_back(Decimal128V2(valid_value_1()));
-    src_data.push_back(Decimal128V2(valid_value_2()));
-    src_data.push_back(Decimal128V2(valid_value_1()));
+    src_data.push_back(Decimal128V3(poison_value()));
+    src_data.push_back(Decimal128V3(valid_value_1()));
+    src_data.push_back(Decimal128V3(valid_value_2()));
+    src_data.push_back(Decimal128V3(valid_value_1()));
 
     ColumnPtr src_col = std::move(src_mutable);
     Status st = converter->convert(src_col, mutable_dst);

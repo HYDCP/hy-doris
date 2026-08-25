@@ -249,8 +249,8 @@ TEST_F(BoolPlainDecoderTest, test_data_generated_by_arrow) {
 // the output buffer is reused from a previous batch and still holds poison
 // bytes, instead of keeping the stale values.
 TEST_F(BoolPlainDecoderTest, test_null_data_initializes_reused_payload) {
-    // Two physical non-NULL values: true, false.
-    std::vector<uint8_t> encoded_data = {0b10};
+    // Two physical non-NULL values: true, false. Bits are read LSB-first.
+    std::vector<uint8_t> encoded_data = {0b01};
     Slice data_slice(reinterpret_cast<char*>(encoded_data.data()), encoded_data.size());
     ASSERT_TRUE(_decoder->set_data(&data_slice).ok());
 
