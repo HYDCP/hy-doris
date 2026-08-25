@@ -17,9 +17,9 @@
 
 #include "vec/exec/format/parquet/bool_plain_decoder.h"
 
-#include <cstring>
-
 #include <gtest/gtest.h>
+
+#include <cstring>
 
 #include "parquet/encoding.h"
 #include "parquet/schema.h"
@@ -243,7 +243,6 @@ TEST_F(BoolPlainDecoderTest, test_data_generated_by_arrow) {
 //    Slice data_slice(reinterpret_cast<char*>(encoded_data.data()), encoded_data.size());
 //    ASSERT_FALSE(_decoder->set_data(&data_slice).ok());
 //}
-
 
 // NULL rows retained in the result must have their payload zeroed even when
 // the output buffer is reused from a previous batch and still holds poison

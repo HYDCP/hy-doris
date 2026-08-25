@@ -548,7 +548,6 @@ TEST_F(FixLengthDictDecoderTest, test_skip_value) {
     }
 }
 
-
 // NULL rows retained in the result must have their payload zeroed even when
 // the output buffer is reused from a previous batch and still holds poison
 // bytes, and NULL rows must not consume dictionary indices.

@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "vec/exec/format/parquet/parquet_column_convert.h"
-
 #include <gtest/gtest.h>
 
 #include <cstring>
@@ -33,6 +31,7 @@
 #include "vec/data_types/data_type_number.h"
 #include "vec/exec/format/column_type_convert.h"
 #include "vec/exec/format/parquet/fix_length_plain_decoder.h"
+#include "vec/exec/format/parquet/parquet_column_convert.h"
 #include "vec/exec/format/parquet/schema_desc.h"
 
 namespace doris::vectorized {
@@ -61,8 +60,8 @@ protected:
     static constexpr int kPrefixRows = 4;
     static constexpr int kBatchRows = 4;
 
-    static Int128 valid_value_1() { return 123456; }  // 12.3456 with scale 4
-    static Int128 valid_value_2() { return -78901; }  // -7.8901 with scale 4
+    static Int128 valid_value_1() { return 123456; } // 12.3456 with scale 4
+    static Int128 valid_value_2() { return -78901; } // -7.8901 with scale 4
 
     // Fits into DECIMAL(38,4) but exceeds DECIMAL(26,4), so any non-NULL
     // conversion of it must fail the narrowing check.
@@ -104,7 +103,7 @@ protected:
     }
 
     static void assert_decimal_value(const Decimal128Column& column, size_t pos, Int128 expected,
-                                      const char* what) {
+                                     const char* what) {
         EXPECT_EQ(Decimal128V3(expected), column.get_data()[pos]) << what << " at row " << pos;
     }
 };
@@ -126,8 +125,7 @@ TEST_F(ParquetNullPayloadConversionTest, FixedLengthPlainDecoderInitializesReuse
     // Poison the reusable output buffer and clear it, keeping the capacity,
     // which is exactly the state of a cached column between batches.
     MutableColumnPtr column = ColumnUInt8::create();
-    assert_cast<ColumnUInt8*>(column.get())->get_data().resize_fill(kTypeLength * kBatchRows,
-                                                                    0x7f);
+    assert_cast<ColumnUInt8*>(column.get())->get_data().resize_fill(kTypeLength * kBatchRows, 0x7f);
     ASSERT_LE(kTypeLength * kBatchRows,
               assert_cast<const ColumnUInt8*>(column.get())->get_data().capacity());
     column->clear();
@@ -191,8 +189,8 @@ TEST_F(ParquetNullPayloadConversionTest, FixedLengthPlainDecoderInitializesReuse
 // batch interval (offset by the prefix rows), not the batch-local index.
 TEST_F(ParquetNullPayloadConversionTest, FixedSizeDecimalPhysicalConverterUsesCurrentBatchNullMap) {
     FieldSchema field_schema = create_decimal_field_schema();
-    auto dst_logical_type = std::make_shared<DataTypeNullable>(
-            create_decimal(kDstPrecision, kSrcScale, false));
+    auto dst_logical_type =
+            std::make_shared<DataTypeNullable>(create_decimal(kDstPrecision, kSrcScale, false));
     auto converter = parquet::PhysicalToLogicalConverter::get_converter(
             &field_schema, field_schema.type, dst_logical_type, nullptr, false);
     ASSERT_TRUE(converter->support());
@@ -208,8 +206,7 @@ TEST_F(ParquetNullPayloadConversionTest, FixedSizeDecimalPhysicalConverterUsesCu
         null_map_data.push_back(flag);
     }
     auto nested = create_decimal(kSrcPrecision, kSrcScale, false)->create_column();
-    auto src_logical_column =
-            ColumnNullable::create(nested->get_ptr(), null_map_column->get_ptr());
+    auto src_logical_column = ColumnNullable::create(nested->get_ptr(), null_map_column->get_ptr());
     ASSERT_EQ(kPrefixRows + kBatchRows, src_logical_column->size());
 
     // Physical column: local rows 0 and 2 carry poison payloads for the NULL
@@ -231,8 +228,8 @@ TEST_F(ParquetNullPayloadConversionTest, FixedSizeDecimalPhysicalConverterUsesCu
     ColumnPtr src_logical_col = std::move(src_logical_column);
     ASSERT_TRUE(converter->physical_convert(src_physical_col, src_logical_col).ok());
 
-    const auto* converted = assert_cast<const Decimal128Column*>(
-            remove_nullable(src_logical_col).get());
+    const auto* converted =
+            assert_cast<const Decimal128Column*>(remove_nullable(src_logical_col).get());
     ASSERT_EQ(kBatchRows, converted->size());
     // NULL rows get the default payload instead of the poison.
     assert_decimal_value(*converted, 0, 0, "physical NULL row must be default");
@@ -263,8 +260,8 @@ TEST_F(ParquetNullPayloadConversionTest, DecimalLogicalConverterUsesAccumulatedD
     src_type.scale = kSrcScale;
     auto dst_logical_type =
             std::make_shared<DataTypeNullable>(create_decimal(kDstPrecision, kSrcScale, false));
-    auto converter = converter::ColumnTypeConverter::get_converter(
-            src_type, dst_logical_type, converter::FileFormat::PARQUET);
+    auto converter = converter::ColumnTypeConverter::get_converter(src_type, dst_logical_type,
+                                                                   converter::FileFormat::PARQUET);
     ASSERT_TRUE(converter->support());
     ASSERT_FALSE(converter->is_consistent());
 
@@ -323,8 +320,8 @@ TEST_F(ParquetNullPayloadConversionTest, NonNullDecimalOverflowStillFails) {
     src_type.scale = kSrcScale;
     auto dst_logical_type =
             std::make_shared<DataTypeNullable>(create_decimal(kDstPrecision, kSrcScale, false));
-    auto converter = converter::ColumnTypeConverter::get_converter(
-            src_type, dst_logical_type, converter::FileFormat::PARQUET);
+    auto converter = converter::ColumnTypeConverter::get_converter(src_type, dst_logical_type,
+                                                                   converter::FileFormat::PARQUET);
     ASSERT_TRUE(converter->support());
 
     auto mutable_dst = dst_logical_type->create_column();
@@ -351,8 +348,7 @@ TEST_F(ParquetNullPayloadConversionTest, NonNullDecimalOverflowStillFails) {
     ColumnPtr src_col = std::move(src_mutable);
     Status st = converter->convert(src_col, mutable_dst);
     ASSERT_FALSE(st.ok());
-    EXPECT_NE(std::string::npos, st.to_string().find("Failed to cast value"))
-            << st.to_string();
+    EXPECT_NE(std::string::npos, st.to_string().find("Failed to cast value")) << st.to_string();
 }
 
 } // namespace doris::vectorized
