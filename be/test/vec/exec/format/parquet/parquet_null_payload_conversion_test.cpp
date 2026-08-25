@@ -128,7 +128,8 @@ TEST_F(ParquetNullPayloadConversionTest, FixedLengthPlainDecoderInitializesReuse
     MutableColumnPtr column = ColumnUInt8::create();
     assert_cast<ColumnUInt8*>(column.get())->get_data().resize_fill(kTypeLength * kBatchRows,
                                                                     0x7f);
-    ASSERT_LE(kTypeLength * kBatchRows, column->get_data().capacity());
+    ASSERT_LE(kTypeLength * kBatchRows,
+              assert_cast<const ColumnUInt8*>(column.get())->get_data().capacity());
     column->clear();
     ASSERT_EQ(0, column->size());
 
