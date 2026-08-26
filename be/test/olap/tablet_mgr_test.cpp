@@ -105,6 +105,7 @@ public:
         DebugPoints::instance()->remove("DataDir.gc_tablet_path.delete_directly_failed");
         DebugPoints::instance()->remove(
                 "TabletManager._resolve_shutdown_tablet.remove_meta_failed");
+        DebugPoints::instance()->remove("TabletManager._resolve_shutdown_tablet.save_meta_failed");
         config::enable_debug_points = _original_enable_debug_points;
     }
 
@@ -642,6 +643,72 @@ TEST_F(TabletMgrTest, ShutdownTabletIntentionalSkipDoesNotCountDirectDeleteSucce
     bool exists = false;
     ASSERT_TRUE(io::global_local_filesystem()->exists(tablet_path, &exists).ok());
     EXPECT_TRUE(exists);
+}
+
+TEST_F(TabletMgrTest, ShutdownTabletMoveToTrashSaveMetaFailureIsRequeued) {
+    constexpr int64_t tablet_id = 210;
+    auto tablet = create_test_tablet(tablet_id);
+    ASSERT_NE(tablet, nullptr);
+    const std::string tablet_path = tablet->tablet_path();
+
+    Status status = _tablet_mgr->drop_tablet(tablet_id, 0, false);
+    ASSERT_TRUE(status.ok()) << status;
+    tablet.reset();
+
+    // A header-save failure must NOT delete the tablet: MOVE_TO_TRASH must remain
+    // failure-safe and keep the tablet queued for retry instead of losing data.
+    config::enable_debug_points = true;
+    DebugPoints::instance()->add("TabletManager._resolve_shutdown_tablet.save_meta_failed");
+
+    status = _tablet_mgr->start_trash_sweep(
+            sweep_policies(TabletPathGcMode::MOVE_TO_TRASH, TabletPathGcReason::NORMAL_RETENTION));
+    ASSERT_TRUE(status.ok()) << status;
+
+    tablet = _tablet_mgr->get_tablet(tablet_id, true);
+    ASSERT_NE(tablet, nullptr);
+    bool exists = false;
+    ASSERT_TRUE(io::global_local_filesystem()->exists(tablet_path, &exists).ok());
+    EXPECT_TRUE(exists);
+
+    DebugPoints::instance()->remove("TabletManager._resolve_shutdown_tablet.save_meta_failed");
+    tablet.reset();
+    // Resolve normally so the tablet is reclaimed and not leaked across tests.
+    status = _tablet_mgr->start_trash_sweep(
+            sweep_policies(TabletPathGcMode::MOVE_TO_TRASH, TabletPathGcReason::NORMAL_RETENTION));
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_EQ(_tablet_mgr->get_tablet(tablet_id, true), nullptr);
+}
+
+TEST_F(TabletMgrTest, ShutdownTabletDirectDeleteImmuneToHeaderSaveFailure) {
+    constexpr int64_t tablet_id = 211;
+    auto tablet = create_test_tablet(tablet_id);
+    ASSERT_NE(tablet, nullptr);
+    const std::string tablet_path = tablet->tablet_path();
+
+    Status status = _tablet_mgr->drop_tablet(tablet_id, 0, false);
+    ASSERT_TRUE(status.ok()) << status;
+    tablet.reset();
+
+    // The same header-save failure that blocks MOVE_TO_TRASH must NOT block direct
+    // deletion: direct mode skips the snapshot write, so a full/RO disk cannot stall
+    // the urgent reclamation path. This is the regression guard for the P1 review.
+    const int64_t attempts_before = metric_value("shutdown_tablet_direct_delete_attempts_total");
+    const int64_t success_before = metric_value("shutdown_tablet_direct_delete_success_total");
+    config::enable_debug_points = true;
+    DebugPoints::instance()->add("TabletManager._resolve_shutdown_tablet.save_meta_failed");
+
+    status = _tablet_mgr->start_trash_sweep(sweep_policies(
+            TabletPathGcMode::DELETE_DIRECTLY, TabletPathGcReason::HIGH_DISK_WATERMARK));
+    ASSERT_TRUE(status.ok()) << status;
+
+    EXPECT_EQ(metric_value("shutdown_tablet_direct_delete_attempts_total"), attempts_before + 1);
+    EXPECT_EQ(metric_value("shutdown_tablet_direct_delete_success_total"), success_before + 1);
+    EXPECT_EQ(_tablet_mgr->get_tablet(tablet_id, true), nullptr);
+    bool exists = true;
+    ASSERT_TRUE(io::global_local_filesystem()->exists(tablet_path, &exists).ok());
+    EXPECT_FALSE(exists);
+
+    DebugPoints::instance()->remove("TabletManager._resolve_shutdown_tablet.save_meta_failed");
 }
 
 TEST_F(TabletMgrTest, GetRowsetId) {

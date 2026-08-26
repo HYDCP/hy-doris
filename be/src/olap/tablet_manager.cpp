@@ -1356,22 +1356,43 @@ bool TabletManager::_resolve_shutdown_tablet(const TabletSharedPtr& tablet,
             return false;
         }
         if (exists) {
-            // take snapshot of tablet meta
-            auto meta_file_path = fmt::format("{}/{}.hdr", tablet_path, tablet->tablet_id());
-            int64_t save_meta_ts = MonotonicMicros();
-            auto save_st = tablet->tablet_meta()->save(meta_file_path);
-            if (!save_st.ok()) {
-                LOG(WARNING) << "failed to save meta, tablet_id=" << tablet_meta->tablet_id()
-                             << ", tablet_uid=" << tablet_meta->tablet_uid()
-                             << ", error=" << save_st;
-                return false;
+            // MOVE_TO_TRASH needs a tablet-meta snapshot so the trashed directory can be
+            // restored on restart; the snapshot is written under tablet_path and moves into
+            // trash together with the directory. DELETE_DIRECTLY has no restore step, so
+            // writing the snapshot on the same (possibly full/RO) disk would only risk
+            // ENOSPC/EROFS and block the urgent reclamation path. Skip it for direct deletion.
+            if (policy.mode != TabletPathGcMode::DELETE_DIRECTLY) {
+                // take snapshot of tablet meta
+                auto meta_file_path = fmt::format("{}/{}.hdr", tablet_path, tablet->tablet_id());
+                int64_t save_meta_ts = MonotonicMicros();
+                auto save_st = [&]() -> Status {
+                    DBUG_EXECUTE_IF("TabletManager._resolve_shutdown_tablet.save_meta_failed", {
+                        return Status::InternalError(
+                                "injected shutdown tablet meta save failure. tablet_id={}, "
+                                "schema_hash={}",
+                                tablet->tablet_id(), tablet->schema_hash());
+                    });
+                    return tablet->tablet_meta()->save(meta_file_path);
+                }();
+                if (!save_st.ok()) {
+                    LOG(WARNING) << "failed to save meta, tablet_id=" << tablet_meta->tablet_id()
+                                 << ", tablet_uid=" << tablet_meta->tablet_uid()
+                                 << ", error=" << save_st;
+                    return false;
+                }
+                int64_t now = MonotonicMicros();
+                LOG(INFO) << "start to resolve shutdown tablet path. " << tablet_path
+                          << ", mode=" << tablet_path_gc_mode_name(policy.mode)
+                          << ", reason=" << tablet_path_gc_reason_name(policy.reason)
+                          << ". rocksdb get meta cost " << (save_meta_ts - get_meta_ts)
+                          << " us, rocksdb save meta cost " << (now - save_meta_ts) << " us";
+            } else {
+                int64_t now = MonotonicMicros();
+                LOG(INFO) << "start to resolve shutdown tablet path. " << tablet_path
+                          << ", mode=" << tablet_path_gc_mode_name(policy.mode)
+                          << ", reason=" << tablet_path_gc_reason_name(policy.reason)
+                          << ". rocksdb get meta cost " << (now - get_meta_ts) << " us";
             }
-            int64_t now = MonotonicMicros();
-            LOG(INFO) << "start to resolve shutdown tablet path. " << tablet_path
-                      << ", mode=" << tablet_path_gc_mode_name(policy.mode)
-                      << ", reason=" << tablet_path_gc_reason_name(policy.reason)
-                      << ". rocksdb get meta cost " << (save_meta_ts - get_meta_ts)
-                      << " us, rocksdb save meta cost " << (now - save_meta_ts) << " us";
             Status rm_st = _gc_shutdown_tablet_path(tablet, policy);
             if (!rm_st.ok()) {
                 LOG(WARNING) << "failed to resolve shutdown tablet path. tablet_id="
