@@ -90,17 +90,20 @@ constexpr int kShutdownTabletScanChunk = 200;
 // These defaults preserve the historical shutdown sweep behavior when the dynamic config is invalid.
 constexpr int kDefaultShutdownTabletSweepRoundBudget = 200;
 constexpr int kDefaultShutdownTabletSweepIntervalMs = 1000;
-constexpr int kMaxShutdownTabletSweepRoundBudget = 10000;
-constexpr int kMaxShutdownTabletSweepIntervalMs = 10000;
+constexpr int kMinShutdownTabletSweepRoundBudget = 200;
+constexpr int kMaxShutdownTabletSweepRoundBudget = 500;
+constexpr int kMaxShutdownTabletSweepIntervalMs = 1000;
 
 // Read the round budget locally so invalid dynamic values cannot stall the shutdown sweep.
 int get_effective_shutdown_tablet_sweep_round_budget() {
     const int configured_budget = config::shutdown_tablet_sweep_round_budget;
-    if (configured_budget >= 1 && configured_budget <= kMaxShutdownTabletSweepRoundBudget) {
+    if (configured_budget >= kMinShutdownTabletSweepRoundBudget &&
+        configured_budget <= kMaxShutdownTabletSweepRoundBudget) {
         return configured_budget;
     }
     LOG_EVERY_N(WARNING, 100) << "invalid shutdown_tablet_sweep_round_budget=" << configured_budget
-                              << ", valid range=[1, " << kMaxShutdownTabletSweepRoundBudget << "]"
+                              << ", valid range=[" << kMinShutdownTabletSweepRoundBudget << ", "
+                              << kMaxShutdownTabletSweepRoundBudget << "]"
                               << ", fallback to default=" << kDefaultShutdownTabletSweepRoundBudget;
     return kDefaultShutdownTabletSweepRoundBudget;
 }
