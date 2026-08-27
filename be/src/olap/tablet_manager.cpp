@@ -1271,6 +1271,8 @@ Status TabletManager::_gc_shutdown_tablet_path(const TabletSharedPtr& tablet,
         return tablet->data_dir()->gc_tablet_path(tablet->tablet_path(), policy.mode);
     }
 
+    // These metrics cover policy-driven direct deletion only. They exclude orphan-path cleanup
+    // after META_KEY_NOT_FOUND, which bypasses this helper in _resolve_shutdown_tablet.
     g_shutdown_tablet_direct_delete_attempts_total << 1;
     const int64_t start_ms = MonotonicMillis();
     Status status = tablet->data_dir()->gc_tablet_path(tablet->tablet_path(), policy.mode);
