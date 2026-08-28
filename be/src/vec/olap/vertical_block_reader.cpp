@@ -427,16 +427,15 @@ Status VerticalBlockReader::_agg_key_next_block(Block* block, bool* eof) {
 
 Status VerticalBlockReader::_unique_key_next_block(Block* block, bool* eof) {
     if (_reader_context.is_key_column_group) {
-        // Record row_source_buffer current size for key column agg flag
+        // Record row_source_buffer total size for key column agg flag
         // _vcollect_iter->next_batch(block) will fill row_source_buffer but delete sign is ignored
         // we calc delete sign column if it's base compaction and update row_sourece_buffer's agg flag
         // after we get current block
         VLOG_NOTICE << "reader id: " << _id
                     << ", buffer size: " << _row_sources_buffer->buffered_size();
-        uint64_t row_source_idx = _row_sources_buffer->buffered_size();
-        uint64_t row_buffer_size_start = row_source_idx;
-        uint64_t merged_rows_start = _vcollect_iter->merged_rows();
-        uint64_t filtered_rows_start = _stats.rows_del_filtered;
+        const uint64_t total_row_sources_start = _row_sources_buffer->total_size();
+        const uint64_t merged_rows_start = _vcollect_iter->merged_rows();
+        const uint64_t filtered_rows_start = _stats.rows_del_filtered;
 
         auto res = _vcollect_iter->next_batch(block);
         if (UNLIKELY(!res.ok() && !res.is<END_OF_FILE>())) {
@@ -450,10 +449,15 @@ Status VerticalBlockReader::_unique_key_next_block(Block* block, bool* eof) {
             DCHECK_EQ(_block_row_locations.size(), block->rows());
         }
 
-        if (_row_sources_buffer->buffered_size() < row_buffer_size_start) {
-            row_buffer_size_start = 0;
-            row_source_idx = 0;
-        }
+        // append() can spill and then append a batch whose size equals the previous buffered size,
+        // so a size decrease cannot reliably identify a reset. Derive the current batch start from
+        // the monotonic total instead.
+        const uint64_t appended_row_sources =
+                _row_sources_buffer->total_size() - total_row_sources_start;
+        DCHECK_LE(appended_row_sources, _row_sources_buffer->buffered_size());
+        const uint64_t row_buffer_size_start =
+                _row_sources_buffer->buffered_size() - appended_row_sources;
+        uint64_t row_source_idx = row_buffer_size_start;
 
         size_t merged_rows_in_rs_buffer = 0;
         for (uint64_t i = row_buffer_size_start; i < _row_sources_buffer->buffered_size(); i++) {
