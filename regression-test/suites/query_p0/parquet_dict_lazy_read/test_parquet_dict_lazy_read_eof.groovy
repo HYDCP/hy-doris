@@ -49,19 +49,12 @@ suite("test_parquet_dict_lazy_read_eof", "p0") {
     }
 
     def tableName = "parquet_dict_lazy_read_src"
-    // The local() tvf resolves file paths against the backend's DORIS_HOME,
-    // so write the parquet file under <repo>/output/be/tmp which is the
-    // backend home in the regression environment.
-    def dataPath = context.config.dataPath
-    def repoRoot = new File(dataPath).getParentFile().getParentFile().getAbsolutePath()
-    def beHome = "${repoRoot}/output/be"
-    def beTmpDir = new File("${beHome}/tmp")
-    if (!beTmpDir.exists()) {
-        beTmpDir.mkdirs()
-    }
+    // The regression BE config sets user_files_secure_path to '/', so local()
+    // resolves "tmp/..." to the same /tmp directory used by OUTFILE.
+    def beTmpDir = new File("/tmp")
     def uuid = UUID.randomUUID().toString()
     def outfilePrefix = "parquet_dict_lazy_read_eof_${uuid}"
-    def outFilePath = "${beHome}/tmp/${outfilePrefix}"
+    def outFilePath = "${beTmpDir}/${outfilePrefix}"
 
     try {
         sql """ DROP TABLE IF EXISTS ${tableName} """
