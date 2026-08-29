@@ -676,7 +676,7 @@ public class ColocateTableIndex implements Writable {
         writeLock();
         try {
             modifyColocateGroupReplicaAllocation(info.getGroupId(), info.getReplicaAlloc(),
-                    info.getBackendsPerBucketSeq(), false);
+                    info.getBackendsPerBucketSeq(), true /* isReplay */);
         } finally {
             writeUnlock();
         }
@@ -895,7 +895,7 @@ public class ColocateTableIndex implements Writable {
                 backendsPerBucketSeq = newBackendsPerBucketSeq;
                 Preconditions.checkState(backendsPerBucketSeq.size() == replicaAlloc.getAllocMap().size());
                 modifyColocateGroupReplicaAllocation(groupSchema.getGroupId(), replicaAlloc,
-                        backendsPerBucketSeq, true);
+                        backendsPerBucketSeq, false /* isReplay */);
             } else {
                 throw new DdlException("Unknown colocate group property: " + properties.keySet());
             }
@@ -931,6 +931,9 @@ public class ColocateTableIndex implements Writable {
                 Map<String, String> tblProperties = Maps.newHashMap();
                 tblProperties.put("default." + PropertyAnalyzer.PROPERTIES_REPLICATION_ALLOCATION,
                         replicaAlloc.toCreateStmt());
+                // TODO: validate all member tables before mutating any of them. On a normal ALTER, the dynamic
+                // partition validation below can reject min_load_replica_num after this assignment. That leaves
+                // this table and earlier members partially updated in memory while no edit log is written.
                 table.setReplicaAllocation(tblProperties);
                 if (table.dynamicPartitionExists()) {
                     TableProperty tableProperty = table.getTableProperty();

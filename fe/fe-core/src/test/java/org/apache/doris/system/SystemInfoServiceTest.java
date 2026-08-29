@@ -45,6 +45,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -90,6 +91,16 @@ public class SystemInfoServiceTest {
         } catch (AnalysisException e) {
             e.printStackTrace();
         }
+    }
+
+    @Test
+    public void testBeIdComparatorHandlesLargeIdDifference() {
+        Backend lowIdBackend = new Backend(1L, "192.168.1.1", 9050);
+        Backend highIdBackend = new Backend((long) Integer.MAX_VALUE + 3L, "192.168.1.2", 9050);
+        Comparator<Backend> comparator = infoService.new BeIdComparator();
+
+        Assert.assertTrue(comparator.compare(lowIdBackend, highIdBackend) < 0);
+        Assert.assertTrue(comparator.compare(highIdBackend, lowIdBackend) > 0);
     }
 
     @Test
