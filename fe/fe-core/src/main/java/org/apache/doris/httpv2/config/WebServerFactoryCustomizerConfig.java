@@ -52,5 +52,20 @@ public class WebServerFactoryCustomizerConfig implements WebServerFactoryCustomi
                     }
             );
         }
+
+        // Apply the configured header size after all HTTP and HTTPS connectors are created.
+        factory.addServerCustomizers(server -> {
+            for (org.eclipse.jetty.server.Connector connector : server.getConnectors()) {
+                if (connector instanceof ServerConnector) {
+                    ServerConnector serverConnector = (ServerConnector) connector;
+                    HttpConnectionFactory httpFactory =
+                            serverConnector.getConnectionFactory(HttpConnectionFactory.class);
+                    if (httpFactory != null) {
+                        HttpConfiguration httpConfig = httpFactory.getHttpConfiguration();
+                        httpConfig.setRequestHeaderSize(Config.jetty_server_max_http_header_size);
+                    }
+                }
+            }
+        });
     }
 }

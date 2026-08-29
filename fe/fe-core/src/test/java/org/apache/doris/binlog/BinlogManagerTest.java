@@ -63,6 +63,7 @@ public class BinlogManagerTest {
     private long ttl = 3;
 
     private boolean enableDbBinlog = false;
+    private boolean enableTableBinlog = true;
 
     @BeforeClass
     public static void beforeClass() {
@@ -72,6 +73,8 @@ public class BinlogManagerTest {
     @Before
     public void setUp() {
         Assert.assertTrue(tableNumPerDb < 100);
+        enableDbBinlog = false;
+        enableTableBinlog = true;
         frameWork = Maps.newHashMap();
         for (int dbOff = 1; dbOff <= dbNum; ++dbOff) {
             long dbId = dbOff * dbBaseId;
@@ -95,7 +98,7 @@ public class BinlogManagerTest {
 
             @Mock
             public boolean isEnableTable(long dbId, long tableId) {
-                return true;
+                return enableTableBinlog;
             }
 
             @Mock
@@ -136,6 +139,37 @@ public class BinlogManagerTest {
                 return new BinlogConfig();
             }
         };
+    }
+
+    @Test
+    public void testAddSingleTableBinlogWhenOnlyDbBinlogEnabled() throws NoSuchMethodException,
+            InvocationTargetException, IllegalAccessException, NoSuchFieldException {
+        enableDbBinlog = true;
+        enableTableBinlog = false;
+
+        Method addBinlog = BinlogManager.class.getDeclaredMethod("addBinlog", long.class, List.class,
+                long.class, long.class, TBinlogType.class, String.class, boolean.class, Object.class);
+        addBinlog.setAccessible(true);
+        Field dbBinlogMapField = BinlogManager.class.getDeclaredField("dbBinlogMap");
+        dbBinlogMapField.setAccessible(true);
+
+        BinlogManager manager = new BinlogManager();
+        long commitSeq = 1L;
+        addBinlog.invoke(manager, dbBaseId, Lists.newArrayList(tableBaseId), commitSeq, timeNow,
+                TBinlogType.UPSERT, "", false, null);
+
+        Map<Long, DBBinlog> dbBinlogMap = (Map<Long, DBBinlog>) dbBinlogMapField.get(manager);
+        Assert.assertTrue(dbBinlogMap.containsKey(dbBaseId));
+        List<TBinlog> binlogs = Lists.newArrayList();
+        dbBinlogMap.get(dbBaseId).getAllBinlogs(binlogs);
+        boolean found = false;
+        for (TBinlog binlog : binlogs) {
+            if (binlog.getType() == TBinlogType.UPSERT && binlog.getCommitSeq() == commitSeq) {
+                found = true;
+                break;
+            }
+        }
+        Assert.assertTrue(found);
     }
 
     @Test

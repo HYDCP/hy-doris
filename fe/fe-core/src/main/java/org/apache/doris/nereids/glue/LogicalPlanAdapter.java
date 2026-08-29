@@ -49,10 +49,19 @@ public class LogicalPlanAdapter extends StatementBase implements Queriable {
     private ArrayList<String> colLabels;
     private List<FieldInfo> fieldInfos;
     private List<String> viewDdlSqls;
+    // Cache the digest from the logical plan so audit logging can reuse it.
+    private String digest = "";
 
+    /**
+     * Initialize the digest for normal query flows and keep proxy behavior unchanged.
+     */
     public LogicalPlanAdapter(LogicalPlan logicalPlan, StatementContext statementContext) {
         this.logicalPlan = logicalPlan;
         this.statementContext = statementContext;
+        if (statementContext != null && statementContext.getConnectContext() != null
+                && !statementContext.getConnectContext().isProxy()) {
+            digest = logicalPlan == null ? "" : logicalPlan.toDigest();
+        }
     }
 
     @Override
@@ -137,8 +146,7 @@ public class LogicalPlanAdapter extends StatementBase implements Queriable {
     }
 
     public String toDigest() {
-        // TODO: generate real digest
-        return "";
+        return digest;
     }
 
     public static LogicalPlanAdapter of(Plan plan) {

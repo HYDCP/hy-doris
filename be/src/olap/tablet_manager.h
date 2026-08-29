@@ -24,6 +24,7 @@
 #include <stdint.h>
 
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -183,6 +184,26 @@ public:
                                              uint64_t* max_base_rowset_delete_bitmap_score);
 
 private:
+    // FetchResult captures the current batch, whether the current pass reaches the tail,
+    // and how many shutdown entries are scanned under the lock.
+    struct FetchResult {
+        std::vector<TabletSharedPtr> tablets;
+        bool reached_end = false;
+        int scanned_count = 0;
+    };
+
+    // RoundResult captures the outcome and cost of one shutdown tablet sweep round.
+    struct RoundResult {
+        bool need_continue = false;
+        int64_t resolved_count = 0;
+        int64_t failed_count = 0;
+        int64_t elapsed_ms = 0;
+    };
+
+    using ShutdownTabletIter = std::list<TabletSharedPtr>::iterator;
+    using ShutdownTabletResolver = std::function<bool(const TabletSharedPtr&)>;
+    using ShutdownTabletFilter = std::function<bool(const TabletSharedPtr&)>;
+
     // Add a tablet pointer to StorageEngine
     // If force, drop the existing tablet add this new one
     //
@@ -235,6 +256,36 @@ private:
 
     bool _resolve_shutdown_tablet(const TabletSharedPtr& tablet,
                                   const ShutdownTabletGcPolicy& policy);
+
+    // Fetch a bounded batch of shutdown tablets while limiting lock hold time.
+    FetchResult _fetch_shutdown_tablets(ShutdownTabletIter& last_it, int max_to_fetch,
+                                        int scan_chunk,
+                                        const ShutdownTabletFilter& should_fetch = {});
+
+    // Resolve one round of shutdown tablets under the configured success budget.
+    RoundResult _delete_shutdown_tablets_one_round(ShutdownTabletIter& last_it,
+                                                   std::list<TabletSharedPtr>& failed_tablets,
+                                                   const ShutdownTabletResolver& resolve_tablet,
+                                                   int round_budget, int fetch_chunk,
+                                                   int scan_chunk,
+                                                   const ShutdownTabletFilter& should_fetch = {});
+
+    // Sweep shutdown tablets with round-based throttling and retry preservation.
+    Status _sweep_shutdown_tablets(const ShutdownTabletResolver& resolve_tablet,
+                                   const std::function<void(int)>& wait_next_round,
+                                   const ShutdownTabletFilter& should_fetch = {});
+
+    // Add a tablet to the shutdown cleanup backlog.
+    void _enqueue_shutdown_tablet(const TabletSharedPtr& tablet);
+
+    // Adjust the shutdown backlog metric by delta for queue lifecycle changes.
+    void _adjust_shutdown_tablet_backlog(int64_t delta);
+
+#ifdef BE_TEST
+    // Read shutdown sweep metric values for test isolation.
+    int64_t _shutdown_tablet_backlog_value() const;
+    int64_t _shutdown_tablet_last_sweep_ms_value() const;
+#endif
 
 private:
     DISALLOW_COPY_AND_ASSIGN(TabletManager);

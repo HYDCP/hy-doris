@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <cstring>
+
 #include "util/bit_util.h"
 #include "vec/columns/column_dictionary.h"
 #include "vec/columns/column_nullable.h"
@@ -128,6 +130,7 @@ protected:
                 break;
             }
             case ColumnSelectVector::NULL_DATA: {
+                memset(raw_data + data_index, 0, run_length * _type_length);
                 data_index += run_length * _type_length;
                 break;
             }

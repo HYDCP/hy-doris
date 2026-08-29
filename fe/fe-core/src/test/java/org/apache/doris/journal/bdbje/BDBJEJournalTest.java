@@ -41,6 +41,7 @@ import org.apache.logging.log4j.Logger;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.RepeatedTest;
+import org.mockito.Mockito;
 
 import java.io.DataOutput;
 import java.io.File;
@@ -54,9 +55,6 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
-
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 public class BDBJEJournalTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use uppercase
     private static final Logger LOG = LogManager.getLogger(BDBJEJournalTest.class);
@@ -377,10 +375,10 @@ public class BDBJEJournalTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use
             }
         };
 
-        RollbackException rollbackEx = mock(RollbackException.class);
-        when(rollbackEx.getEarliestTransactionId()).thenReturn(0L);
-        BDBEnvironment bdbEnvironment = mock(BDBEnvironment.class);
-        when(bdbEnvironment.getDatabaseNames()).thenThrow(rollbackEx);
+        RollbackException rollbackEx = Mockito.mock(RollbackException.class);
+        Mockito.when(rollbackEx.getEarliestTransactionId()).thenReturn(0L);
+        BDBEnvironment bdbEnvironment = Mockito.mock(BDBEnvironment.class);
+        Mockito.when(bdbEnvironment.getDatabaseNames()).thenThrow(rollbackEx);
         BDBJEJournal journal = new BDBJEJournal("observer");
         Deencapsulation.setField(journal, "bdbEnvironment", bdbEnvironment);
 

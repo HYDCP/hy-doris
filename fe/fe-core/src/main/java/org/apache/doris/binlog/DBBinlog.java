@@ -45,6 +45,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -69,6 +70,8 @@ public class DBBinlog {
     private List<Pair<Long, Long>> droppedPartitions;
     // The commit seq of the dropped tables
     private List<Pair<Long, Long>> droppedTables;
+    // Ids of the dropped tables, mirrors droppedTables for O(1) lookup
+    private Set<Long> droppedTableIds;
     // The commit seq of the dropped indexes
     private List<Pair<Long, Long>> droppedIndexes;
 
@@ -93,6 +96,7 @@ public class DBBinlog {
         timestamps = Lists.newArrayList();
         droppedPartitions = Lists.newArrayList();
         droppedTables = Lists.newArrayList();
+        droppedTableIds = Sets.newHashSet();
         droppedIndexes = Lists.newArrayList();
         lockedBinlogs = Maps.newHashMap();
 
@@ -216,6 +220,13 @@ public class DBBinlog {
         lock.readLock().lock();
         try {
             if (tableId >= 0) {
+                // Check if table is dropped first, before checking tableBinlogMap
+                if (isTableDropped(tableId)) {
+                    LOG.warn("table is dropped. tableId: {}", tableId);
+                    status.setStatusCode(TStatusCode.BINLOG_NOT_FOUND_TABLE);
+                    return Pair.of(status, null);
+                }
+
                 TableBinlog tableBinlog = tableBinlogMap.get(tableId);
                 if (tableBinlog == null) {
                     LOG.warn("table binlog not found. tableId: {}", tableId);
@@ -266,6 +277,13 @@ public class DBBinlog {
         lock.readLock().lock();
         try {
             if (tableId >= 0) {
+                // Check if table is dropped first, before checking tableBinlogMap
+                if (isTableDropped(tableId)) {
+                    LOG.warn("table is dropped. tableId: {}", tableId);
+                    status.setStatusCode(TStatusCode.BINLOG_NOT_FOUND_TABLE);
+                    return Pair.of(status, null);
+                }
+
                 TableBinlog tableBinlog = tableBinlogMap.get(tableId);
                 if (tableBinlog == null) {
                     LOG.warn("table binlog not found. tableId: {}", tableId);
@@ -287,6 +305,12 @@ public class DBBinlog {
         try {
             if (tableId < 0) {
                 return lockDbBinlog(jobUniqueId, lockCommitSeq);
+            }
+
+            // Check if table is dropped first, before checking tableBinlogMap
+            if (isTableDropped(tableId)) {
+                LOG.warn("table is dropped. dbId: {}, tableId: {}", dbId, tableId);
+                return Pair.of(new TStatus(TStatusCode.BINLOG_NOT_FOUND_TABLE), -1L);
             }
 
             tableBinlog = tableBinlogMap.get(tableId);
@@ -609,8 +633,17 @@ public class DBBinlog {
             iter.remove();
         }
         iter = droppedTables.iterator();
+        boolean droppedTablesChanged = false;
         while (iter.hasNext() && iter.next().second < commitSeq) {
             iter.remove();
+            droppedTablesChanged = true;
+        }
+        if (droppedTablesChanged) {
+            // keep droppedTableIds consistent with droppedTables
+            droppedTableIds.clear();
+            for (Pair<Long, Long> entry : droppedTables) {
+                droppedTableIds.add(entry.first);
+            }
         }
         iter = droppedIndexes.iterator();
         while (iter.hasNext() && iter.next().second < commitSeq) {
@@ -631,6 +664,11 @@ public class DBBinlog {
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    // Require: the lock is held by the caller.
+    private boolean isTableDropped(long tableId) {
+        return droppedTableIds.contains(tableId);
     }
 
     public void getBinlogInfo(BaseProcResult result) {
@@ -761,6 +799,7 @@ public class DBBinlog {
             long tableId = ((DropTableRecord) raw).getTableId();
             if (tableId > 0) {
                 droppedTables.add(Pair.of(tableId, commitSeq));
+                droppedTableIds.add(tableId);
             }
         } else if (binlogType == TBinlogType.ALTER_JOB && raw instanceof AlterJobRecord) {
             AlterJobRecord alterJobRecord = (AlterJobRecord) raw;
@@ -780,6 +819,7 @@ public class DBBinlog {
             ReplaceTableOperationLog record = (ReplaceTableOperationLog) raw;
             if (!record.isSwapTable()) {
                 droppedTables.add(Pair.of(record.getOrigTblId(), commitSeq));
+                droppedTableIds.add(record.getOrigTblId());
             }
         } else if (binlogType == TBinlogType.DROP_ROLLUP && raw instanceof DropInfo) {
             long indexId = ((DropInfo) raw).getIndexId();
@@ -800,6 +840,7 @@ public class DBBinlog {
                 droppedPartitions.removeIf(entry -> (entry.first == partitionId));
             } else if (tableId > 0) {
                 droppedTables.removeIf(entry -> (entry.first == tableId));
+                droppedTableIds.remove(tableId);
             }
         } else if ((binlogType == TBinlogType.REPLACE_PARTITIONS) && (raw instanceof ReplacePartitionOperationLog)) {
             ReplacePartitionOperationLog replacePartitionOperationLog = (ReplacePartitionOperationLog) raw;

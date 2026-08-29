@@ -167,6 +167,48 @@ TEST_F(ColumnTypeConverterTest, TestIntegerNarrowingConversions) {
     }
 }
 
+// Regression test for NULL rows being skipped during conversion. A NULL row must not be
+// validated or converted: an out-of-range value sitting at a NULL position must not trip the
+// narrowing overflow check, and the NULL row is left with a default payload while the shared
+// null map is preserved.
+TEST_F(ColumnTypeConverterTest, TestNullRowsSkippedDuringConversion) {
+    TypeDescriptor src_type(TYPE_INT);
+    auto dst_type = std::make_shared<DataTypeInt16>();
+    auto nullable_dst_type = std::make_shared<DataTypeNullable>(dst_type);
+
+    auto converter = converter::ColumnTypeConverter::get_converter(src_type, nullable_dst_type,
+                                                                   converter::COMMON);
+    ASSERT_TRUE(converter->support());
+    ASSERT_FALSE(converter->is_consistent());
+
+    auto src_col = ColumnInt32::create();
+    auto& src_data = src_col->get_data();
+    src_data.push_back(10);
+    // Out of SMALLINT range, but sits at a NULL position, so it must be skipped.
+    src_data.push_back(std::numeric_limits<int16_t>::max() + 1000);
+    src_data.push_back(20);
+
+    auto dst_col = nullable_dst_type->create_column();
+    auto mutable_dst = dst_col->assume_mutable();
+    auto& nullable_col = static_cast<ColumnNullable&>(*mutable_dst);
+    auto& null_map = nullable_col.get_null_map_data();
+    null_map.resize_fill(src_data.size(), 0);
+    null_map[1] = 1; // mark the middle row as NULL
+
+    Status st = converter->convert(reinterpret_cast<ColumnPtr&>(src_col), mutable_dst);
+    ASSERT_TRUE(st.ok());
+
+    auto& nested_col = static_cast<ColumnInt16&>(nullable_col.get_nested_column());
+    ASSERT_EQ(3, nested_col.size());
+    EXPECT_EQ(10, nested_col.get_data()[0]);
+    EXPECT_EQ(0, nested_col.get_data()[1]); // NULL row filled with default payload
+    EXPECT_EQ(20, nested_col.get_data()[2]);
+    // The shared null map must be preserved unchanged.
+    EXPECT_EQ(0, null_map[0]);
+    EXPECT_EQ(1, null_map[1]);
+    EXPECT_EQ(0, null_map[2]);
+}
+
 // Test floating point type conversions
 TEST_F(ColumnTypeConverterTest, TestFloatingPointConversions) {
     // TEST INT ->  FLOAT

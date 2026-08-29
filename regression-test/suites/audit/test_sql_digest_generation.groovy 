@@ -53,6 +53,48 @@ suite("test_sql_digest_generation", "nonConcurrent") {
         logger.info("now sql_digest count: " + nowSqlDigestCount)
 
         assertTrue(nowSqlDigestCount > prevSqlDigestCount, "Count of sql_digest did not increase")
+
+        // Verify that Nereids digest generation distinguishes query shapes.
+        sql """ set enable_nereids_planner = true """
+        sql """ set enable_fallback_to_original_planner = false """
+        def sameShapeSql1 = "select 1 as sql_digest_same_shape_case"
+        def sameShapeSql2 = "select 2 as sql_digest_same_shape_case"
+        def diffShapeSql = "select 1 + 1 as sql_digest_diff_shape_case"
+        sql sameShapeSql1
+        sql sameShapeSql2
+        sql diffShapeSql
+
+        Thread.sleep(10000)
+        sql """call flush_audit_log()"""
+
+        def sameShapeDigest1 = sql """
+            SELECT sql_digest
+            FROM __internal_schema.audit_log
+            WHERE stmt = '${sameShapeSql1}'
+            ORDER BY time DESC
+            LIMIT 1
+        """
+        def sameShapeDigest2 = sql """
+            SELECT sql_digest
+            FROM __internal_schema.audit_log
+            WHERE stmt = '${sameShapeSql2}'
+            ORDER BY time DESC
+            LIMIT 1
+        """
+        def diffShapeDigest = sql """
+            SELECT sql_digest
+            FROM __internal_schema.audit_log
+            WHERE stmt = '${diffShapeSql}'
+            ORDER BY time DESC
+            LIMIT 1
+        """
+
+        assertTrue(sameShapeDigest1.size() == 1 && sameShapeDigest2.size() == 1 && diffShapeDigest.size() == 1,
+                "Failed to fetch sql_digest rows for Nereids queries")
+        assertTrue(sameShapeDigest1[0][0] == sameShapeDigest2[0][0],
+                "Same-shape queries should share the same sql_digest")
+        assertTrue(sameShapeDigest1[0][0] != diffShapeDigest[0][0],
+                "Different query shapes should not share the same sql_digest")
     }
 
     Thread.sleep(10000)

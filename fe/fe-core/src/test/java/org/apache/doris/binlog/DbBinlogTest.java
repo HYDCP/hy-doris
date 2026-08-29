@@ -17,8 +17,13 @@
 
 package org.apache.doris.binlog;
 
+import org.apache.doris.common.Pair;
+import org.apache.doris.persist.RecoverInfo;
+import org.apache.doris.persist.ReplaceTableOperationLog;
 import org.apache.doris.thrift.TBinlog;
 import org.apache.doris.thrift.TBinlogType;
+import org.apache.doris.thrift.TStatus;
+import org.apache.doris.thrift.TStatusCode;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -421,5 +426,150 @@ public class DbBinlogTest {
         // check tombstone
         Assert.assertTrue(tombstone.isDbBinlogTomstone());
         Assert.assertEquals(expiredTime, tombstone.getCommitSeq());
+    }
+
+    private DBBinlog newEnabledDbBinlog(long tableId) {
+        new MockUp<BinlogConfigCache>() {
+            @Mock
+            boolean isEnableDB(long dbId) {
+                return true;
+            }
+
+            @Mock
+            boolean isEnableTable(long dbId, long tableId) {
+                return true;
+            }
+        };
+
+        DBBinlog dbBinlog = new DBBinlog(new BinlogConfigCache(),
+                BinlogTestUtils.newBinlog(dbId, tableId, 1, 1));
+        // add a normal binlog so that tableBinlogMap contains the table entry
+        dbBinlog.addBinlog(BinlogTestUtils.newBinlog(dbId, tableId, 2, 2), null);
+        return dbBinlog;
+    }
+
+    private void addDropTableBinlog(DBBinlog dbBinlog, long tableId, long commitSeq) {
+        TBinlog binlog = BinlogTestUtils.newBinlog(dbId, tableId, commitSeq, commitSeq);
+        binlog.setType(TBinlogType.DROP_TABLE);
+        DropTableRecord record = DropTableRecord.fromJson("{\"tableId\":" + tableId + "}");
+        dbBinlog.addBinlog(binlog, record);
+    }
+
+    @Test
+    public void testGetBinlogAfterDropTable() {
+        DBBinlog dbBinlog = newEnabledDbBinlog(baseTableId);
+
+        // before drop: all table level APIs work
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.getBinlog(baseTableId, -1, 10).first.getStatusCode());
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.getBinlogLag(baseTableId, -1).first.getStatusCode());
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.lockBinlog(baseTableId, "job1", -1).first.getStatusCode());
+
+        addDropTableBinlog(dbBinlog, baseTableId, 3);
+
+        // after drop: all table level APIs return BINLOG_NOT_FOUND_TABLE immediately
+        Pair<TStatus, List<TBinlog>> binlogResult = dbBinlog.getBinlog(baseTableId, -1, 10);
+        Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE, binlogResult.first.getStatusCode());
+        Pair<TStatus, BinlogLagInfo> lagResult = dbBinlog.getBinlogLag(baseTableId, -1);
+        Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE, lagResult.first.getStatusCode());
+        Pair<TStatus, Long> lockResult = dbBinlog.lockBinlog(baseTableId, "job1", -1);
+        Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE, lockResult.first.getStatusCode());
+        Assert.assertEquals(-1L, (long) lockResult.second);
+
+        // db level binlog (tableId = -1) is not affected by dropped tables
+        Assert.assertNotEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
+                dbBinlog.getBinlog(-1, -1, 10).first.getStatusCode());
+        Assert.assertNotEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
+                dbBinlog.getBinlogLag(-1, -1).first.getStatusCode());
+        Assert.assertNotEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
+                dbBinlog.lockBinlog(-1, "job2", -1).first.getStatusCode());
+    }
+
+    @Test
+    public void testGetBinlogAfterRecoverTable() {
+        DBBinlog dbBinlog = newEnabledDbBinlog(baseTableId);
+        addDropTableBinlog(dbBinlog, baseTableId, 3);
+        Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
+                dbBinlog.getBinlog(baseTableId, -1, 10).first.getStatusCode());
+
+        // recover the table, the dropped signal should be cleared automatically
+        TBinlog binlog = BinlogTestUtils.newBinlog(dbId, baseTableId, 4, 4);
+        binlog.setType(TBinlogType.RECOVER_INFO);
+        RecoverInfo recoverInfo = RecoverInfo.fromJson("{\"tableId\":" + baseTableId + "}");
+        dbBinlog.addBinlog(binlog, recoverInfo);
+
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.getBinlog(baseTableId, -1, 10).first.getStatusCode());
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.getBinlogLag(baseTableId, -1).first.getStatusCode());
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.lockBinlog(baseTableId, "job1", -1).first.getStatusCode());
+    }
+
+    @Test
+    public void testDropAndRecreateTableWithSameName() {
+        DBBinlog dbBinlog = newEnabledDbBinlog(baseTableId);
+        addDropTableBinlog(dbBinlog, baseTableId, 3);
+
+        // recreate a table with the same name, the new table gets a new table id
+        long newTableId = baseTableId + 100;
+        dbBinlog.addBinlog(BinlogTestUtils.newBinlog(dbId, newTableId, 4, 4), null);
+
+        // the old id keeps reporting BINLOG_NOT_FOUND_TABLE, the new id works
+        Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
+                dbBinlog.getBinlog(baseTableId, -1, 10).first.getStatusCode());
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.getBinlog(newTableId, -1, 10).first.getStatusCode());
+    }
+
+    @Test
+    public void testReplaceTableDroppedSignal() {
+        DBBinlog dbBinlog = newEnabledDbBinlog(baseTableId);
+
+        // replace table with swap: neither table is treated as dropped
+        TBinlog swapBinlog = BinlogTestUtils.newBinlog(dbId, baseTableId, 3, 3);
+        swapBinlog.setType(TBinlogType.REPLACE_TABLE);
+        ReplaceTableOperationLog swapLog = ReplaceTableOperationLog.fromJson(
+                "{\"origTblId\":" + baseTableId + ",\"swapTable\":true}");
+        dbBinlog.addBinlog(swapBinlog, swapLog);
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.getBinlog(baseTableId, -1, 10).first.getStatusCode());
+
+        // replace table without swap: the orig table is treated as dropped
+        TBinlog replaceBinlog = BinlogTestUtils.newBinlog(dbId, baseTableId, 4, 4);
+        replaceBinlog.setType(TBinlogType.REPLACE_TABLE);
+        ReplaceTableOperationLog replaceLog = ReplaceTableOperationLog.fromJson(
+                "{\"origTblId\":" + baseTableId + ",\"swapTable\":false}");
+        dbBinlog.addBinlog(replaceBinlog, replaceLog);
+        Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
+                dbBinlog.getBinlog(baseTableId, -1, 10).first.getStatusCode());
+    }
+
+    @Test
+    public void testDroppedTableSignalClearedByGc() {
+        // db binlog enabled, all binlogs with timestamp <= expiredTime will be gc'd
+        long expiredTime = 10;
+        Map<String, Long> ttlMap = Maps.newHashMap();
+        MockBinlogConfigCache binlogConfigCache = BinlogTestUtils.newMockBinlogConfigCache(ttlMap);
+        binlogConfigCache.addDbBinlogConfig(dbId, true, expiredTime);
+        binlogConfigCache.addTableBinlogConfig(dbId, baseTableId, true, expiredTime);
+
+        DBBinlog dbBinlog = new DBBinlog(binlogConfigCache,
+                BinlogTestUtils.newBinlog(dbId, baseTableId, 1, 1));
+        dbBinlog.addBinlog(BinlogTestUtils.newBinlog(dbId, baseTableId, 1, 1), null);
+        addDropTableBinlog(dbBinlog, baseTableId, 2);
+        // one more binlog after the drop, so that gcDroppedResources can expire the drop record
+        dbBinlog.addBinlog(BinlogTestUtils.newBinlog(dbId, baseTableId, 3, 3), null);
+
+        Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
+                dbBinlog.getBinlog(baseTableId, -1, 10).first.getStatusCode());
+
+        // the drop record (commitSeq 2) is expired by gc, the signal is cleared
+        dbBinlog.gc();
+        Assert.assertTrue(dbBinlog.getDroppedTables().isEmpty());
+        Assert.assertNotEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
+                dbBinlog.getBinlog(baseTableId, -1, 10).first.getStatusCode());
     }
 }
