@@ -588,6 +588,14 @@ public class Config extends ConfigBase {
             "Minimal number of write successful replicas for load job."})
     public static short min_load_replica_num = -1;
 
+    @ConfField(mutable = true, description = {
+            "当表只有两个副本时，是否忽略 min_load_replica_num=1 并强制要求两个副本均写入成功。"
+                    + "动态修改时需使用 ADMIN SET ALL FRONTENDS CONFIG，使所有 FE 保持一致。",
+            "Whether to ignore min_load_replica_num=1 and require both replicas to be written successfully "
+                    + "for tables with two replicas. Use ADMIN SET ALL FRONTENDS CONFIG for dynamic changes "
+                    + "so that all FEs use the same value."})
+    public static boolean force_majority_load_for_two_replica = true;
+
     @ConfField(description = {"load job 调度器的执行间隔，单位是秒。",
             "The interval of load job scheduler, in seconds."})
     public static int load_checker_interval_second = 5;

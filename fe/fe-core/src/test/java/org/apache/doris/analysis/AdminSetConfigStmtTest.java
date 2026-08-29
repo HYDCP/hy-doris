@@ -104,5 +104,27 @@ public class AdminSetConfigStmtTest extends TestWithFeService {
         Env.getCurrentEnv().setConfig(adminSetConfigStmt, true);
         Assertions.assertEquals(77, Config.alter_table_timeout_second);
     }
-}
 
+    @Test
+    public void testForceMajorityLoadForTwoReplicaConfigScope() throws Exception {
+        boolean originalValue = Config.force_majority_load_for_two_replica;
+        try {
+            String localStmt = "admin set frontend config(\"force_majority_load_for_two_replica\" = \"false\");";
+            AdminSetConfigStmt localConfigStmt = (AdminSetConfigStmt) parseAndAnalyzeStmt(localStmt);
+
+            Assertions.assertFalse(ConfigBase.checkIsMasterOnly("force_majority_load_for_two_replica"));
+            Assertions.assertEquals(RedirectStatus.NO_FORWARD, localConfigStmt.getRedirectStatus());
+
+            String allStmt = "admin set all frontends config("
+                    + "\"force_majority_load_for_two_replica\" = \"false\");";
+            AdminSetConfigStmt allConfigStmt = (AdminSetConfigStmt) parseAndAnalyzeStmt(allStmt);
+            Assertions.assertTrue(allConfigStmt.isApplyToAll());
+            Assertions.assertEquals(RedirectStatus.NO_FORWARD, allConfigStmt.getRedirectStatus());
+
+            Env.getCurrentEnv().setConfig(allConfigStmt, true);
+            Assertions.assertFalse(Config.force_majority_load_for_two_replica);
+        } finally {
+            Config.force_majority_load_for_two_replica = originalValue;
+        }
+    }
+}
