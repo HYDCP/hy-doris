@@ -212,12 +212,10 @@ public class InternalSchemaInitializer extends Thread {
                         } else {
                             TableName tableName = new TableName(InternalCatalog.INTERNAL_CATALOG_NAME,
                                     StatisticConstants.DB_NAME, tbl.getName());
-                            // 1. modify table's default replica allocation
+                            // 1. modify table's default replica num
                             Map<String, String> props = new HashMap<>();
-                            ReplicaAllocation replicaAllocation = new ReplicaAllocation(
-                                    (short) StatisticConstants.STATISTIC_INTERNAL_TABLE_REPLICA_NUM);
-                            props.put("default." + PropertyAnalyzer.PROPERTIES_REPLICATION_ALLOCATION,
-                                    replicaAllocation.toCreateStmt());
+                            props.put("default." + PropertyAnalyzer.PROPERTIES_REPLICATION_NUM,
+                                    "" + StatisticConstants.STATISTIC_INTERNAL_TABLE_REPLICA_NUM);
                             Env.getCurrentEnv().modifyTableDefaultReplicaAllocation(database, tbl, props);
                             // 2. modify each partition's replica num
                             List<AlterClause> clauses = Lists.newArrayList();
