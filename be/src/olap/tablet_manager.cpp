@@ -33,6 +33,7 @@
 #include <ostream>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 #include "bvar/bvar.h"
 #include "common/compiler_util.h" // IWYU pragma: keep
@@ -59,6 +60,7 @@
 #include "olap/txn_manager.h"
 #include "runtime/exec_env.h"
 #include "service/backend_options.h"
+#include "util/debug_points.h"
 #include "util/defer_op.h"
 #include "util/doris_metrics.h"
 #include "util/histogram.h"
@@ -83,6 +85,21 @@ namespace doris {
 using namespace ErrorCode;
 
 namespace {
+bvar::Adder<int64_t> g_shutdown_tablet_direct_delete_attempts_total(
+        "shutdown_tablet_direct_delete_attempts_total");
+bvar::Adder<int64_t> g_shutdown_tablet_direct_delete_success_total(
+        "shutdown_tablet_direct_delete_success_total");
+bvar::Adder<int64_t> g_shutdown_tablet_direct_delete_failed_attempts_total(
+        "shutdown_tablet_direct_delete_failed_attempts_total");
+bvar::Adder<int64_t> g_shutdown_tablet_direct_delete_ms_total(
+        "shutdown_tablet_direct_delete_ms_total");
+bvar::Adder<int64_t> g_shutdown_tablet_direct_delete_clean_trash_total(
+        "shutdown_tablet_direct_delete_clean_trash_total");
+bvar::Adder<int64_t> g_shutdown_tablet_direct_delete_high_watermark_total(
+        "shutdown_tablet_direct_delete_high_watermark_total");
+bvar::Status<int64_t> g_shutdown_tablet_last_sweep_deferred_unused_data_dir(
+        "shutdown_tablet_last_sweep_deferred_unused_data_dir", 0);
+
 // These constants bound each fetch and scan pass while the round budget is read dynamically.
 constexpr int kShutdownTabletFetchChunk = 200;
 constexpr int kShutdownTabletScanChunk = 200;
@@ -1184,7 +1201,7 @@ void TabletManager::build_all_report_tablets_info(std::map<TTabletId, TTablet>* 
     LOG(INFO) << "success to build all report tablets info. tablet_count=" << tablets_info->size();
 }
 
-Status TabletManager::start_trash_sweep() {
+Status TabletManager::start_trash_sweep(const DataDirSweepPolicies& data_dir_sweep_policies) {
     DBUG_EXECUTE_IF("TabletManager.start_trash_sweep.sleep", DBUG_BLOCK);
     std::unique_lock<std::mutex> lock(_gc_tablets_lock, std::defer_lock);
     if (!lock.try_lock()) {
@@ -1229,21 +1246,36 @@ Status TabletManager::start_trash_sweep() {
                   << ", tablet_id=" << tablet_id_with_max_useless_rowset_version_count;
     }
 
-    // Execute the shutdown tablet sweep with round-based throttling.
-    return _sweep_shutdown_tablets(
-            [this](const TabletSharedPtr& tablet) { return _move_tablet_to_trash(tablet); },
+    g_shutdown_tablet_last_sweep_deferred_unused_data_dir.set_value(0);
+    int64_t deferred_unused_data_dir_count = 0;
+    Status sweep_status = _sweep_shutdown_tablets(
+            [this, &data_dir_sweep_policies](const TabletSharedPtr& tablet) {
+                return _resolve_shutdown_tablet(
+                        tablet, _get_shutdown_tablet_gc_policy(data_dir_sweep_policies, tablet));
+            },
             [](int interval_ms) {
 #ifndef BE_TEST
                 std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
 #else
                 static_cast<void>(interval_ms);
 #endif
+            },
+            [this, &data_dir_sweep_policies,
+             &deferred_unused_data_dir_count](const TabletSharedPtr& tablet) {
+                const auto& policy =
+                        _get_shutdown_tablet_gc_policy(data_dir_sweep_policies, tablet);
+                if (!policy.eligible) {
+                    ++deferred_unused_data_dir_count;
+                }
+                return policy.eligible;
             });
+    g_shutdown_tablet_last_sweep_deferred_unused_data_dir.set_value(deferred_unused_data_dir_count);
+    return sweep_status;
 }
 
-TabletManager::FetchResult TabletManager::_fetch_shutdown_tablets(ShutdownTabletIter& last_it,
-                                                                  int max_to_fetch,
-                                                                  int scan_chunk) {
+TabletManager::FetchResult TabletManager::_fetch_shutdown_tablets(
+        ShutdownTabletIter& last_it, int max_to_fetch, int scan_chunk,
+        const ShutdownTabletFilter& should_fetch) {
     DCHECK_GT(max_to_fetch, 0);
     DCHECK_GT(scan_chunk, 0);
 
@@ -1252,8 +1284,8 @@ TabletManager::FetchResult TabletManager::_fetch_shutdown_tablets(ShutdownTablet
     while (last_it != _shutdown_tablets.end() && result.scanned_count < scan_chunk &&
            static_cast<int>(result.tablets.size()) < max_to_fetch) {
         result.scanned_count++;
-        // Skip tablets that are still referenced by other threads in the current pass.
-        if (last_it->use_count() > 1) {
+        // Keep ineligible and referenced tablets in the queue for a later sweep.
+        if ((should_fetch && !should_fetch(*last_it)) || last_it->use_count() > 1) {
             ++last_it;
         } else {
             result.tablets.push_back(*last_it);
@@ -1266,8 +1298,8 @@ TabletManager::FetchResult TabletManager::_fetch_shutdown_tablets(ShutdownTablet
 
 TabletManager::RoundResult TabletManager::_delete_shutdown_tablets_one_round(
         ShutdownTabletIter& last_it, std::list<TabletSharedPtr>& failed_tablets,
-        const std::function<bool(const TabletSharedPtr&)>& move_tablet, int round_budget,
-        int fetch_chunk, int scan_chunk) {
+        const ShutdownTabletResolver& resolve_tablet, int round_budget, int fetch_chunk,
+        int scan_chunk, const ShutdownTabletFilter& should_fetch) {
     DCHECK_GT(round_budget, 0);
     DCHECK_GT(fetch_chunk, 0);
     DCHECK_GT(scan_chunk, 0);
@@ -1278,9 +1310,10 @@ TabletManager::RoundResult TabletManager::_delete_shutdown_tablets_one_round(
     for (;;) {
         const int max_to_fetch = std::min(budget, fetch_chunk);
         DCHECK_GT(max_to_fetch, 0);
-        auto fetch_result = _fetch_shutdown_tablets(last_it, max_to_fetch, scan_chunk);
+        auto fetch_result =
+                _fetch_shutdown_tablets(last_it, max_to_fetch, scan_chunk, should_fetch);
         for (const auto& tablet : fetch_result.tablets) {
-            if (move_tablet(tablet)) {
+            if (resolve_tablet(tablet)) {
                 --budget;
                 ++result.resolved_count;
                 // Decrement the pending backlog after the shutdown entry is fully resolved.
@@ -1302,9 +1335,9 @@ TabletManager::RoundResult TabletManager::_delete_shutdown_tablets_one_round(
     }
 }
 
-Status TabletManager::_sweep_shutdown_tablets(
-        const std::function<bool(const TabletSharedPtr&)>& move_tablet,
-        const std::function<void(int)>& wait_next_round) {
+Status TabletManager::_sweep_shutdown_tablets(const ShutdownTabletResolver& resolve_tablet,
+                                              const std::function<void(int)>& wait_next_round,
+                                              const ShutdownTabletFilter& should_fetch) {
     MonotonicStopWatch sweep_watch(true);
     ShutdownTabletIter last_it;
     {
@@ -1319,9 +1352,9 @@ Status TabletManager::_sweep_shutdown_tablets(
     std::list<TabletSharedPtr> failed_tablets;
     for (;;) {
         auto round_result = _delete_shutdown_tablets_one_round(
-                last_it, failed_tablets, move_tablet,
+                last_it, failed_tablets, resolve_tablet,
                 get_effective_shutdown_tablet_sweep_round_budget(), kShutdownTabletFetchChunk,
-                kShutdownTabletScanChunk);
+                kShutdownTabletScanChunk, should_fetch);
         g_shutdown_tablet_last_round_resolved.set_value(round_result.resolved_count);
         g_shutdown_tablet_last_round_move_failed_attempts.set_value(round_result.failed_count);
         g_shutdown_tablet_last_round_ms.set_value(round_result.elapsed_ms);
@@ -1342,9 +1375,47 @@ Status TabletManager::_sweep_shutdown_tablets(
     return Status::OK();
 }
 
-bool TabletManager::_move_tablet_to_trash(const TabletSharedPtr& tablet) {
-    RETURN_IF_ERROR(register_transition_tablet(tablet->tablet_id(), "move to trash"));
-    Defer defer {[&]() { unregister_transition_tablet(tablet->tablet_id(), "move to trash"); }};
+const ShutdownTabletGcPolicy& TabletManager::_get_shutdown_tablet_gc_policy(
+        const DataDirSweepPolicies& data_dir_sweep_policies, const TabletSharedPtr& tablet) const {
+    auto policy_it = data_dir_sweep_policies.find(tablet->data_dir());
+    CHECK(policy_it != data_dir_sweep_policies.end())
+            << "missing shutdown tablet gc policy. tablet_id=" << tablet->tablet_id()
+            << ", data_dir=" << tablet->data_dir()->path();
+    return policy_it->second.shutdown_tablet_gc;
+}
+
+Status TabletManager::_gc_shutdown_tablet_path(const TabletSharedPtr& tablet,
+                                               const ShutdownTabletGcPolicy& policy) {
+    if (policy.mode != TabletPathGcMode::DELETE_DIRECTLY) {
+        return tablet->data_dir()->gc_tablet_path(tablet->tablet_path(), policy.mode);
+    }
+
+    // These metrics cover policy-driven direct deletion only. They exclude orphan-path cleanup
+    // after META_KEY_NOT_FOUND, which bypasses this helper in _resolve_shutdown_tablet.
+    g_shutdown_tablet_direct_delete_attempts_total << 1;
+    const int64_t start_ms = MonotonicMillis();
+    Status status = tablet->data_dir()->gc_tablet_path(tablet->tablet_path(), policy.mode);
+    g_shutdown_tablet_direct_delete_ms_total << MonotonicMillis() - start_ms;
+    if (!status.ok()) {
+        g_shutdown_tablet_direct_delete_failed_attempts_total << 1;
+        return status;
+    }
+
+    g_shutdown_tablet_direct_delete_success_total << 1;
+    if (policy.reason == TabletPathGcReason::MANUAL_CLEAN_TRASH) {
+        g_shutdown_tablet_direct_delete_clean_trash_total << 1;
+    } else if (policy.reason == TabletPathGcReason::HIGH_DISK_WATERMARK) {
+        g_shutdown_tablet_direct_delete_high_watermark_total << 1;
+    }
+    return status;
+}
+
+bool TabletManager::_resolve_shutdown_tablet(const TabletSharedPtr& tablet,
+                                             const ShutdownTabletGcPolicy& policy) {
+    RETURN_IF_ERROR(register_transition_tablet(tablet->tablet_id(), "resolve shutdown tablet"));
+    Defer defer {[&]() {
+        unregister_transition_tablet(tablet->tablet_id(), "resolve shutdown tablet");
+    }};
 
     TabletSharedPtr tablet_in_not_shutdown = get_tablet(tablet->tablet_id());
     if (tablet_in_not_shutdown) {
@@ -1355,13 +1426,24 @@ bool TabletManager::_move_tablet_to_trash(const TabletSharedPtr& tablet) {
             tablet->clear_cache();
             // shard_id in memory not eq shard_id in shutdown
             if (tablet_in_not_shutdown->tablet_path() != tablet->tablet_path()) {
-                LOG(INFO) << "tablet path not eq shutdown tablet path, move it to trash, tablet_id="
+                LOG(INFO) << "tablet path not eq shutdown tablet path, resolve old path, tablet_id="
                           << tablet_in_not_shutdown->tablet_id()
                           << ", mem manager tablet path=" << tablet_in_not_shutdown->tablet_path()
-                          << ", shutdown tablet path=" << tablet->tablet_path();
-                return tablet->data_dir()->move_to_trash(tablet->tablet_path());
+                          << ", shutdown tablet path=" << tablet->tablet_path()
+                          << ", mode=" << tablet_path_gc_mode_name(policy.mode)
+                          << ", reason=" << tablet_path_gc_reason_name(policy.reason);
+                Status gc_status = _gc_shutdown_tablet_path(tablet, policy);
+                if (!gc_status.ok()) {
+                    LOG(WARNING) << "failed to resolve shutdown tablet path. tablet_id="
+                                 << tablet->tablet_id() << ", tablet_path=" << tablet->tablet_path()
+                                 << ", mode=" << tablet_path_gc_mode_name(policy.mode)
+                                 << ", reason=" << tablet_path_gc_reason_name(policy.reason)
+                                 << ", error=" << gc_status;
+                    return false;
+                }
+                return true;
             } else {
-                LOG(INFO) << "tablet path eq shutdown tablet path, not move to trash, tablet_id="
+                LOG(INFO) << "tablet path eq shutdown tablet path, skip path gc, tablet_id="
                           << tablet_in_not_shutdown->tablet_id()
                           << ", mem manager tablet path=" << tablet_in_not_shutdown->tablet_path()
                           << ", shutdown tablet path=" << tablet->tablet_path();
@@ -1387,7 +1469,7 @@ bool TabletManager::_move_tablet_to_trash(const TabletSharedPtr& tablet) {
 
         tablet->clear_cache();
 
-        // move data to trash
+        // Resolve the shutdown tablet path according to this sweep epoch's DataDir policy.
         const auto& tablet_path = tablet->tablet_path();
         bool exists = false;
         Status exists_st = io::global_local_filesystem()->exists(tablet_path, &exists);
@@ -1395,37 +1477,73 @@ bool TabletManager::_move_tablet_to_trash(const TabletSharedPtr& tablet) {
             return false;
         }
         if (exists) {
-            // take snapshot of tablet meta
-            auto meta_file_path = fmt::format("{}/{}.hdr", tablet_path, tablet->tablet_id());
-            int64_t save_meta_ts = MonotonicMicros();
-            auto save_st = tablet->tablet_meta()->save(meta_file_path);
-            if (!save_st.ok()) {
-                LOG(WARNING) << "failed to save meta, tablet_id=" << tablet_meta->tablet_id()
-                             << ", tablet_uid=" << tablet_meta->tablet_uid()
-                             << ", error=" << save_st;
-                return false;
+            // MOVE_TO_TRASH needs a tablet-meta snapshot so the trashed directory can be
+            // restored on restart; the snapshot is written under tablet_path and moves into
+            // trash together with the directory. DELETE_DIRECTLY has no restore step, so
+            // writing the snapshot on the same (possibly full/RO) disk would only risk
+            // ENOSPC/EROFS and block the urgent reclamation path. Skip it for direct deletion.
+            if (policy.mode != TabletPathGcMode::DELETE_DIRECTLY) {
+                // take snapshot of tablet meta
+                auto meta_file_path = fmt::format("{}/{}.hdr", tablet_path, tablet->tablet_id());
+                int64_t save_meta_ts = MonotonicMicros();
+                auto save_st = [&]() -> Status {
+                    DBUG_EXECUTE_IF("TabletManager._resolve_shutdown_tablet.save_meta_failed", {
+                        return Status::InternalError(
+                                "injected shutdown tablet meta save failure. tablet_id={}, "
+                                "schema_hash={}",
+                                tablet->tablet_id(), tablet->schema_hash());
+                    });
+                    return tablet->tablet_meta()->save(meta_file_path);
+                }();
+                if (!save_st.ok()) {
+                    LOG(WARNING) << "failed to save meta, tablet_id=" << tablet_meta->tablet_id()
+                                 << ", tablet_uid=" << tablet_meta->tablet_uid()
+                                 << ", error=" << save_st;
+                    return false;
+                }
+                int64_t now = MonotonicMicros();
+                LOG(INFO) << "start to resolve shutdown tablet path. " << tablet_path
+                          << ", mode=" << tablet_path_gc_mode_name(policy.mode)
+                          << ", reason=" << tablet_path_gc_reason_name(policy.reason)
+                          << ". rocksdb get meta cost " << (save_meta_ts - get_meta_ts)
+                          << " us, rocksdb save meta cost " << (now - save_meta_ts) << " us";
+            } else {
+                int64_t now = MonotonicMicros();
+                LOG(INFO) << "start to resolve shutdown tablet path. " << tablet_path
+                          << ", mode=" << tablet_path_gc_mode_name(policy.mode)
+                          << ", reason=" << tablet_path_gc_reason_name(policy.reason)
+                          << ". rocksdb get meta cost " << (now - get_meta_ts) << " us";
             }
-            int64_t now = MonotonicMicros();
-            LOG(INFO) << "start to move tablet to trash. " << tablet_path
-                      << ". rocksdb get meta cost " << (save_meta_ts - get_meta_ts)
-                      << " us, rocksdb save meta cost " << (now - save_meta_ts) << " us";
-            Status rm_st = tablet->data_dir()->move_to_trash(tablet_path);
+            Status rm_st = _gc_shutdown_tablet_path(tablet, policy);
             if (!rm_st.ok()) {
-                LOG(WARNING) << "fail to move dir to trash. " << tablet_path;
+                LOG(WARNING) << "failed to resolve shutdown tablet path. tablet_id="
+                             << tablet->tablet_id() << ", tablet_path=" << tablet_path
+                             << ", mode=" << tablet_path_gc_mode_name(policy.mode)
+                             << ", reason=" << tablet_path_gc_reason_name(policy.reason)
+                             << ", error=" << rm_st;
                 return false;
             }
         }
         // remove tablet meta
-        auto remove_st = TabletMetaManager::remove(tablet->data_dir(), tablet->tablet_id(),
-                                                   tablet->schema_hash());
+        auto remove_st = [&]() -> Status {
+            DBUG_EXECUTE_IF("TabletManager._resolve_shutdown_tablet.remove_meta_failed", {
+                return Status::InternalError(
+                        "injected shutdown tablet meta delete failure. tablet_id={}, "
+                        "schema_hash={}",
+                        tablet->tablet_id(), tablet->schema_hash());
+            });
+            return TabletMetaManager::remove(tablet->data_dir(), tablet->tablet_id(),
+                                             tablet->schema_hash());
+        }();
         if (!remove_st.ok()) {
             LOG(WARNING) << "failed to remove meta, tablet_id=" << tablet_meta->tablet_id()
                          << ", tablet_uid=" << tablet_meta->tablet_uid() << ", error=" << remove_st;
             return false;
         }
-        LOG(INFO) << "successfully move tablet to trash. "
-                  << "tablet_id=" << tablet->tablet_id()
-                  << ", schema_hash=" << tablet->schema_hash() << ", tablet_path=" << tablet_path;
+        LOG(INFO) << "successfully resolved shutdown tablet. tablet_id=" << tablet->tablet_id()
+                  << ", schema_hash=" << tablet->schema_hash() << ", tablet_path=" << tablet_path
+                  << ", mode=" << tablet_path_gc_mode_name(policy.mode)
+                  << ", reason=" << tablet_path_gc_reason_name(policy.reason);
         return true;
     } else {
         tablet->clear_cache();
@@ -1442,8 +1560,8 @@ bool TabletManager::_move_tablet_to_trash(const TabletSharedPtr& tablet) {
                           << "tablet_id=" << tablet->tablet_id()
                           << ", schema_hash=" << tablet->schema_hash()
                           << ", delete tablet_path=" << tablet_path;
-                RETURN_IF_ERROR(io::global_local_filesystem()->delete_directory(tablet_path));
-                RETURN_IF_ERROR(DataDir::delete_tablet_parent_path_if_empty(tablet_path));
+                RETURN_IF_ERROR(tablet->data_dir()->gc_tablet_path(
+                        tablet_path, TabletPathGcMode::DELETE_DIRECTLY));
                 return true;
             }
             LOG(WARNING) << "errors while load meta from store, skip this tablet. "

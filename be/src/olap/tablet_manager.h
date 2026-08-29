@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "common/status.h"
+#include "olap/data_dir_sweep_policy.h"
 #include "olap/olap_common.h"
 #include "olap/tablet.h"
 #include "olap/tablet_meta.h"
@@ -142,7 +143,7 @@ public:
 
     void build_all_report_tablets_info(std::map<TTabletId, TTablet>* tablets_info);
 
-    Status start_trash_sweep();
+    Status start_trash_sweep(const DataDirSweepPolicies& data_dir_sweep_policies);
 
     void try_delete_unused_tablet_path(DataDir* data_dir, TTabletId tablet_id,
                                        SchemaHash schema_hash, const std::string& schema_hash_path,
@@ -200,6 +201,8 @@ private:
     };
 
     using ShutdownTabletIter = std::list<TabletSharedPtr>::iterator;
+    using ShutdownTabletResolver = std::function<bool(const TabletSharedPtr&)>;
+    using ShutdownTabletFilter = std::function<bool(const TabletSharedPtr&)>;
 
     // Add a tablet pointer to StorageEngine
     // If force, drop the existing tablet add this new one
@@ -244,19 +247,33 @@ private:
 
     std::shared_mutex& _get_tablets_shard_lock(TTabletId tabletId);
 
+    const ShutdownTabletGcPolicy& _get_shutdown_tablet_gc_policy(
+            const DataDirSweepPolicies& data_dir_sweep_policies,
+            const TabletSharedPtr& tablet) const;
+
+    Status _gc_shutdown_tablet_path(const TabletSharedPtr& tablet,
+                                    const ShutdownTabletGcPolicy& policy);
+
+    bool _resolve_shutdown_tablet(const TabletSharedPtr& tablet,
+                                  const ShutdownTabletGcPolicy& policy);
+
     // Fetch a bounded batch of shutdown tablets while limiting lock hold time.
     FetchResult _fetch_shutdown_tablets(ShutdownTabletIter& last_it, int max_to_fetch,
-                                        int scan_chunk);
+                                        int scan_chunk,
+                                        const ShutdownTabletFilter& should_fetch = {});
 
-    // Delete one round of shutdown tablets under the configured success budget.
-    RoundResult _delete_shutdown_tablets_one_round(
-            ShutdownTabletIter& last_it, std::list<TabletSharedPtr>& failed_tablets,
-            const std::function<bool(const TabletSharedPtr&)>& move_tablet, int round_budget,
-            int fetch_chunk, int scan_chunk);
+    // Resolve one round of shutdown tablets under the configured success budget.
+    RoundResult _delete_shutdown_tablets_one_round(ShutdownTabletIter& last_it,
+                                                   std::list<TabletSharedPtr>& failed_tablets,
+                                                   const ShutdownTabletResolver& resolve_tablet,
+                                                   int round_budget, int fetch_chunk,
+                                                   int scan_chunk,
+                                                   const ShutdownTabletFilter& should_fetch = {});
 
     // Sweep shutdown tablets with round-based throttling and retry preservation.
-    Status _sweep_shutdown_tablets(const std::function<bool(const TabletSharedPtr&)>& move_tablet,
-                                   const std::function<void(int)>& wait_next_round);
+    Status _sweep_shutdown_tablets(const ShutdownTabletResolver& resolve_tablet,
+                                   const std::function<void(int)>& wait_next_round,
+                                   const ShutdownTabletFilter& should_fetch = {});
 
     // Add a tablet to the shutdown cleanup backlog.
     void _enqueue_shutdown_tablet(const TabletSharedPtr& tablet);
@@ -269,8 +286,6 @@ private:
     int64_t _shutdown_tablet_backlog_value() const;
     int64_t _shutdown_tablet_last_sweep_ms_value() const;
 #endif
-
-    bool _move_tablet_to_trash(const TabletSharedPtr& tablet);
 
 private:
     DISALLOW_COPY_AND_ASSIGN(TabletManager);
