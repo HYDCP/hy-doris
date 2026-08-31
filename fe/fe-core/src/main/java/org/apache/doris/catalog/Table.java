@@ -503,7 +503,7 @@ public abstract class Table extends MetaObject implements Writable, TableIf, Gso
             table.readFields(in);
             return table;
         } else {
-            return GsonUtils.GSON.fromJson(Text.readString(in), Table.class);
+            return GsonUtils.fromJsonAsText(in, Table.class);
         }
     }
 
@@ -525,7 +525,9 @@ public abstract class Table extends MetaObject implements Writable, TableIf, Gso
 
     @Override
     public void write(DataOutput out) throws IOException {
-        Text.writeString(out, GsonUtils.GSON.toJson(this));
+        // byte-identical to Text.writeString(out, GsonUtils.GSON.toJson(this)), but
+        // without materializing the whole json String of a huge table in memory
+        GsonUtils.toJsonAsText(out, this);
     }
 
     @Deprecated

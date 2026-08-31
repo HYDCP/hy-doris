@@ -27,10 +27,16 @@ import org.apache.doris.journal.JournalBatch;
 import org.apache.doris.journal.JournalCursor;
 import org.apache.doris.journal.JournalEntity;
 import org.apache.doris.persist.OperationType;
+import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.system.SystemInfoService.HostInfo;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
+import com.sleepycat.bind.tuple.TupleBinding;
+import com.sleepycat.je.Database;
+import com.sleepycat.je.DatabaseEntry;
+import com.sleepycat.je.LockMode;
+import com.sleepycat.je.OperationStatus;
 import com.sleepycat.je.rep.ReplicatedEnvironment;
 import com.sleepycat.je.rep.RollbackException;
 import mockit.Mock;
@@ -53,6 +59,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -341,6 +348,133 @@ public class BDBJEJournalTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use
         Assertions.assertEquals(11, journalId);
 
         journal.close();
+    }
+
+    @RepeatedTest(1)
+    public void testJournalBatchLargeEntityStoresValidBytesOnly() throws Exception {
+        int port = findValidPort();
+        Preconditions.checkArgument(((port > 0) && (port < 65535)));
+        String nodeName = Env.genFeNodeName("127.0.0.1", port, false);
+        long replayedJournalId = 0;
+        File tmpDir = createTmpDir();
+        new MockUp<Env>() {
+            HostInfo selfNode = new HostInfo("127.0.0.1", port);
+            @Mock
+            public String getBdbDir() {
+                return tmpDir.getAbsolutePath();
+            }
+
+            @Mock
+            public HostInfo getSelfNode() {
+                return this.selfNode;
+            }
+
+            @Mock
+            public HostInfo getHelperNode() {
+                return this.selfNode;
+            }
+
+            @Mock
+            public boolean isElectable() {
+                return true;
+            }
+
+            @Mock
+            public long getReplayedJournalId() {
+                return replayedJournalId;
+            }
+        };
+
+        Assertions.assertEquals(tmpDir.getAbsolutePath(), Env.getServingEnv().getBdbDir());
+        BDBJEJournal journal = new BDBJEJournal(nodeName);
+        journal.open();
+        // BDBEnvironment need several seconds election from unknown to master
+        for (int i = 0; i < 10; i++) {
+            if (journal.getBDBEnvironment().getReplicatedEnvironment().getState()
+                    .equals(ReplicatedEnvironment.State.MASTER)) {
+                break;
+            }
+            Thread.sleep(1000);
+        }
+        Assertions.assertEquals(ReplicatedEnvironment.State.MASTER,
+                journal.getBDBEnvironment().getReplicatedEnvironment().getState());
+
+        journal.rollJournal();
+        String largePayload = buildLargeAsciiString(2 * 1024 * 1024);
+        JournalBatch batch = new JournalBatch(3);
+        // CREATE_MTMV_JOB is deprecated, and safe to write any data.
+        String smallData1 = "JournalBatch small item 1";
+        Writable smallWritable1 = new Writable() {
+            @Override
+            public void write(DataOutput out) throws IOException {
+                Text.writeString(out, smallData1);
+            }
+        };
+        batch.addJournal(OperationType.OP_CREATE_MTMV_JOB, smallWritable1);
+        // the large entity crosses several buffer doubling boundaries, so its backing
+        // array is clearly larger than the valid serialized bytes
+        Writable largeWritable = new Writable() {
+            @Override
+            public void write(DataOutput out) throws IOException {
+                GsonUtils.toJsonAsText(out, largePayload);
+            }
+        };
+        batch.addJournal(OperationType.OP_CREATE_MTMV_JOB, largeWritable);
+        String smallData2 = "JournalBatch small item 2";
+        Writable smallWritable2 = new Writable() {
+            @Override
+            public void write(DataOutput out) throws IOException {
+                Text.writeString(out, smallData2);
+            }
+        };
+        batch.addJournal(OperationType.OP_CREATE_MTMV_JOB, smallWritable2);
+
+        JournalBatch.Entity largeEntity = batch.getJournalEntities().get(1);
+        LOG.info("large entity valid length {}, backing array capacity {}",
+                largeEntity.getBinaryDataLength(), largeEntity.getBinaryData().length);
+        Assertions.assertTrue(largeEntity.getBinaryData().length > largeEntity.getBinaryDataLength());
+
+        long firstId = journal.write(batch);
+        Assertions.assertEquals(1, firstId);
+        Assertions.assertEquals(3, journal.getMaxJournalId());
+        Assertions.assertEquals(3, journal.getJournalNum());
+        Assertions.assertEquals(1, journal.getMinJournalId());
+
+        Assertions.assertEquals(1, journal.getDatabaseNames().size());
+        Assertions.assertEquals(1, journal.getDatabaseNames().get(0));
+        Database db = journal.getBDBEnvironment().openDatabase("1");
+
+        // idToKey in BDBJEJournal is private, replicate it here to read the raw entry
+        DatabaseEntry theKey = new DatabaseEntry();
+        TupleBinding<Long> idBinding = TupleBinding.getPrimitiveBinding(Long.class);
+        idBinding.objectToEntry(firstId + 1, theKey);
+        DatabaseEntry storedEntry = new DatabaseEntry();
+        Assertions.assertEquals(OperationStatus.SUCCESS,
+                db.get(null, theKey, storedEntry, LockMode.DEFAULT));
+
+        // only the valid bytes are stored, not the whole backing array
+        Assertions.assertEquals(largeEntity.getBinaryDataLength(), storedEntry.getSize());
+        Assertions.assertNotEquals(largeEntity.getBinaryData().length, storedEntry.getSize());
+        byte[] validBytes = Arrays.copyOfRange(largeEntity.getBinaryData(), 0, largeEntity.getBinaryDataLength());
+        byte[] storedBytes = Arrays.copyOfRange(storedEntry.getData(),
+                storedEntry.getOffset(), storedEntry.getOffset() + storedEntry.getSize());
+        Assertions.assertArrayEquals(validBytes, storedBytes);
+
+        // journal ids are sequential and the large entity's former padding does not
+        // shift its neighbors: every entry reads back correctly
+        for (long id = firstId; id < firstId + 3; id++) {
+            JournalEntity entity = journal.read(id);
+            Assertions.assertNotNull(entity);
+            Assertions.assertEquals(OperationType.OP_CREATE_MTMV_JOB, entity.getOpCode());
+        }
+
+        journal.close();
+    }
+
+    private static String buildLargeAsciiString(int length) {
+        char[] chars = new char[length];
+        Arrays.fill(chars, 'a');
+        return new String(chars);
     }
 
     @RepeatedTest(1)

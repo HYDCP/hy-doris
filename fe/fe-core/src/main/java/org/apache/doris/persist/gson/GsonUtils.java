@@ -203,6 +203,7 @@ import org.apache.doris.load.routineload.RoutineLoadProgress;
 import org.apache.doris.load.routineload.kafka.KafkaDataSourceProperties;
 import org.apache.doris.load.sync.SyncJob;
 import org.apache.doris.load.sync.canal.CanalSyncJob;
+import org.apache.doris.meta.MetaContext;
 import org.apache.doris.mtmv.MTMVMaxTimestampSnapshot;
 import org.apache.doris.mtmv.MTMVSnapshotIdSnapshot;
 import org.apache.doris.mtmv.MTMVSnapshotIf;
@@ -249,7 +250,10 @@ import com.google.gson.internal.Streams;
 import com.google.gson.reflect.TypeToken;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonWriter;
+import org.apache.commons.io.output.UnsynchronizedByteArrayOutputStream;
 import org.apache.commons.lang3.reflect.TypeUtils;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -258,11 +262,17 @@ import java.io.DataInputStream;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.io.OutputStreamWriter;
+import java.io.Reader;
 import java.lang.reflect.Method;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.lang.reflect.TypeVariable;
+import java.nio.charset.CharsetDecoder;
+import java.nio.charset.CharsetEncoder;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
@@ -289,6 +299,8 @@ import java.util.zip.GZIPOutputStream;
  * See the following "GuavaTableAdapter" and "GuavaMultimapAdapter" for example.
  */
 public class GsonUtils {
+    private static final Logger LOG = LogManager.getLogger(GsonUtils.class);
+
     // runtime adapter for class "Type"
     private static RuntimeTypeAdapterFactory<org.apache.doris.catalog.Type> columnTypeAdapterFactory
             = RuntimeTypeAdapterFactory
@@ -475,8 +487,14 @@ public class GsonUtils {
             .registerSubtype(TrinoConnectorExternalDatabase.class, TrinoConnectorExternalDatabase.class.getSimpleName())
             .registerSubtype(TestExternalDatabase.class, TestExternalDatabase.class.getSimpleName());
 
+    // streaming dispatch avoids materializing a whole table as a JsonElement DOM tree:
+    // an OlapTable with millions of tablets is the dominating payload of backup meta,
+    // editlog and image, and its DOM costs dozens of times more transient heap than
+    // the serialized bytes. Same for the nested partition/tablet/replica factories.
     private static RuntimeTypeAdapterFactory<TableIf> tblTypeAdapterFactory = RuntimeTypeAdapterFactory.of(
-                    TableIf.class, "clazz").registerSubtype(ExternalTable.class, ExternalTable.class.getSimpleName())
+                    TableIf.class, "clazz")
+            .withStreamingDispatch(() -> Config.enable_table_meta_streaming_json)
+            .registerSubtype(ExternalTable.class, ExternalTable.class.getSimpleName())
             .registerSubtype(EsExternalTable.class, EsExternalTable.class.getSimpleName())
             .registerSubtype(OlapTable.class, OlapTable.class.getSimpleName())
             .registerSubtype(HMSExternalTable.class, HMSExternalTable.class.getSimpleName())
@@ -526,6 +544,7 @@ public class GsonUtils {
     // runtime adapter for class "CloudReplica".
     private static RuntimeTypeAdapterFactory<Replica> replicaTypeAdapterFactory = RuntimeTypeAdapterFactory
             .of(Replica.class, "clazz")
+            .withStreamingDispatch(() -> Config.enable_table_meta_streaming_json)
             .registerDefaultSubtype(Replica.class)
             .registerSubtype(Replica.class, Replica.class.getSimpleName())
             .registerSubtype(CloudReplica.class, CloudReplica.class.getSimpleName());
@@ -535,6 +554,7 @@ public class GsonUtils {
     static {
         tabletTypeAdapterFactory = RuntimeTypeAdapterFactory
                 .of(Tablet.class, "clazz")
+                .withStreamingDispatch(() -> Config.enable_table_meta_streaming_json)
                 .registerSubtype(Tablet.class, Tablet.class.getSimpleName())
                 .registerSubtype(CloudTablet.class, CloudTablet.class.getSimpleName());
         if (Config.isNotCloudMode()) {
@@ -548,6 +568,7 @@ public class GsonUtils {
     // runtime adapter for class "CloudPartition".
     private static RuntimeTypeAdapterFactory<Partition> partitionTypeAdapterFactory = RuntimeTypeAdapterFactory
             .of(Partition.class, "clazz")
+            .withStreamingDispatch(() -> Config.enable_table_meta_streaming_json)
             .registerDefaultSubtype(Partition.class)
             .registerSubtype(Partition.class, Partition.class.getSimpleName())
             .registerSubtype(CloudPartition.class, CloudPartition.class.getSimpleName());
@@ -1237,6 +1258,107 @@ public class GsonUtils {
             try (InputStreamReader reader = new InputStreamReader(gzipStream)) {
                 return GsonUtils.GSON.fromJson(reader, clazz);
             }
+        }
+    }
+
+    // Text.writeString/readString replace malformed input with the substitution
+    // character (Text.encode/decode with replace=true), keep the same behavior here.
+    private static CharsetEncoder utf8ReplacingEncoder() {
+        return StandardCharsets.UTF_8.newEncoder()
+                .onMalformedInput(CodingErrorAction.REPLACE)
+                .onUnmappableCharacter(CodingErrorAction.REPLACE);
+    }
+
+    private static CharsetDecoder utf8ReplacingDecoder() {
+        return StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPLACE)
+                .onUnmappableCharacter(CodingErrorAction.REPLACE);
+    }
+
+    private static OutputStream asOutputStream(DataOutput out) {
+        if (out instanceof OutputStream) {
+            return (OutputStream) out;
+        }
+        return new OutputStream() {
+            @Override
+            public void write(int b) throws IOException {
+                out.write(b);
+            }
+
+            @Override
+            public void write(byte[] b, int off, int len) throws IOException {
+                out.write(b, off, len);
+            }
+        };
+    }
+
+    /**
+     * Streams {@code GSON.toJson(src)} as a length-prefixed UTF-8 payload. The produced
+     * bytes are identical to {@code Text.writeString(out, GsonUtils.GSON.toJson(src))},
+     * but without materializing the whole json String and its char[]/byte[] copies:
+     * for a several-GB json (e.g. a backup job of millions of tablets), the legacy path
+     * transiently costs ~5x of the json size while this one only buffers the UTF-8 bytes.
+     */
+    public static void toJsonAsText(DataOutput out, Object src) throws IOException {
+        UnsynchronizedByteArrayOutputStream byteStream = UnsynchronizedByteArrayOutputStream.builder().get();
+        try (OutputStreamWriter writer = new OutputStreamWriter(byteStream, utf8ReplacingEncoder())) {
+            GsonUtils.GSON.toJson(src, writer);
+        }
+        out.writeInt(byteStream.size());
+        byteStream.writeTo(asOutputStream(out));
+    }
+
+    /**
+     * Reads a length-prefixed UTF-8 payload written by {@link #toJsonAsText} (or the legacy
+     * {@code Text.writeString(out, json)}).
+     */
+    public static byte[] readJsonBytes(DataInput in) throws IOException {
+        int length = in.readInt();
+        byte[] bytes = new byte[length];
+        in.readFully(bytes, 0, length);
+        return bytes;
+    }
+
+    /**
+     * Deserializes UTF-8 json bytes without decoding them into an intermediate String.
+     */
+    public static <T> T fromJsonBytes(byte[] jsonBytes, Class<T> clazz) throws IOException {
+        try (Reader reader = new InputStreamReader(new ByteArrayInputStream(jsonBytes), utf8ReplacingDecoder())) {
+            return GsonUtils.GSON.fromJson(reader, clazz);
+        }
+    }
+
+    /**
+     * The streaming equivalent of {@code GSON.fromJson(Text.readString(in), clazz)}.
+     */
+    public static <T> T fromJsonAsText(DataInput in, Class<T> clazz) throws IOException {
+        return fromJsonBytes(readJsonBytes(in), clazz);
+    }
+
+    /**
+     * Deep copies {@code src} through a streaming json round trip, the gson based
+     * equivalent of {@code DeepCopy.copy}. Compared with piping through
+     * {@code write(DataOutput)/read(DataInput)}, this avoids the whole json String and
+     * its char[] copies, only the UTF-8 bytes of the json are buffered. Returns null
+     * if the copy fails, same as the DeepCopy contract.
+     */
+    public static <T> T deepCopyViaJsonStream(Object src, Class<T> clazz, int metaVersion) {
+        MetaContext metaContext = new MetaContext();
+        metaContext.setMetaVersion(metaVersion);
+        metaContext.setThreadLocalInfo();
+        try {
+            UnsynchronizedByteArrayOutputStream byteStream = UnsynchronizedByteArrayOutputStream.builder().get();
+            try (OutputStreamWriter writer = new OutputStreamWriter(byteStream, utf8ReplacingEncoder())) {
+                GsonUtils.GSON.toJson(src, writer);
+            }
+            try (Reader reader = new InputStreamReader(byteStream.toInputStream(), utf8ReplacingDecoder())) {
+                return GsonUtils.GSON.fromJson(reader, clazz);
+            }
+        } catch (Exception e) {
+            LOG.warn("failed to copy object via json stream.", e);
+            return null;
+        } finally {
+            MetaContext.remove();
         }
     }
 }

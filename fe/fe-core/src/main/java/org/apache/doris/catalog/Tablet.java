@@ -244,6 +244,12 @@ public class Tablet extends MetaObject {
         return this.replicas;
     }
 
+    // Only used when stripping the replica info of a backed up table copy, never
+    // call it on a tablet which is attached to the catalog.
+    public void clearReplicas() {
+        this.replicas = Lists.newArrayList();
+    }
+
     public Set<Long> getBackendIds() {
         Set<Long> beIds = Sets.newHashSet();
         for (Replica replica : replicas) {

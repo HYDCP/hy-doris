@@ -21,6 +21,7 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.LogUtils;
+import org.apache.doris.common.io.CountingDataOutputStream;
 import org.apache.doris.common.io.DataOutputBuffer;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.NetUtils;
@@ -51,6 +52,7 @@ import com.sleepycat.je.rep.ReplicaWriteException;
 import com.sleepycat.je.rep.ReplicatedEnvironment;
 import com.sleepycat.je.rep.RollbackException;
 import com.sleepycat.je.rep.TimeConsistencyPolicy;
+import org.apache.commons.io.output.NullOutputStream;
 import org.apache.commons.lang3.time.StopWatch;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -144,7 +146,7 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
                 for (int j = 0; j < entitySize; ++j) {
                     JournalBatch.Entity entity = entities.get(j);
                     DatabaseEntry theKey = idToKey(firstId + j);
-                    DatabaseEntry theData = new DatabaseEntry(entity.getBinaryData());
+                    DatabaseEntry theData = new DatabaseEntry(entity.getBinaryData(), 0, entity.getBinaryDataLength());
                     currentJournalDB.put(txn, theKey, theData);  // Put with overwrite, it always success
                     dataSize += theData.getSize();
                     if (i == 0 && LOG.isDebugEnabled()) {
@@ -245,7 +247,7 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
         DataOutputBuffer buffer = new DataOutputBuffer(OUTPUT_BUFFER_INIT_SIZE);
         entity.write(buffer);
 
-        DatabaseEntry theData = new DatabaseEntry(buffer.getData());
+        DatabaseEntry theData = createDatabaseEntry(buffer);
         if (MetricRepo.isInit) {
             MetricRepo.COUNTER_EDIT_LOG_SIZE_BYTES.increase((long) theData.getSize());
             MetricRepo.COUNTER_CURRENT_EDIT_LOG_SIZE_BYTES.increase((long) theData.getSize());
@@ -721,26 +723,35 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
         return bdbEnvironment.getNotReadyReason();
     }
 
-    @Override
-    public boolean exceedMaxJournalSize(short op, Writable writable) throws IOException {
+    static DatabaseEntry createDatabaseEntry(DataOutputBuffer buffer) {
+        return new DatabaseEntry(buffer.getData(), 0, buffer.getLength());
+    }
+
+    static long countJournalSize(short op, Writable writable) throws IOException {
         JournalEntity entity = new JournalEntity();
         entity.setOpCode(op);
         entity.setData(writable);
 
-        DataOutputBuffer buffer = new DataOutputBuffer(OUTPUT_BUFFER_INIT_SIZE);
-        entity.write(buffer);
+        CountingDataOutputStream countingStream = new CountingDataOutputStream(NullOutputStream.INSTANCE);
+        entity.write(countingStream);
+        return countingStream.getCount();
+    }
 
-        DatabaseEntry theData = new DatabaseEntry(buffer.getData());
+    @Override
+    public boolean exceedMaxJournalSize(short op, Writable writable) throws IOException {
+        // 1GB
+        return exceedMaxJournalSize(op, writable, 1 << 30);
+    }
+
+    static boolean exceedMaxJournalSize(short op, Writable writable, long maxJournalSize) throws IOException {
+        // only count the serialized size instead of buffering the whole entity,
+        // the entity of a huge backup/restore job may take GBs in memory
+        long serializedSize = countJournalSize(op, writable);
 
         if (LOG.isDebugEnabled()) {
-            LOG.debug("opCode = {}, journal size = {}", op, theData.getSize());
+            LOG.debug("opCode = {}, journal size = {}", op, serializedSize);
         }
 
-        // 1GB
-        if (theData.getSize() > (1 << 30)) {
-            return true;
-        }
-
-        return false;
+        return serializedSize > maxJournalSize;
     }
 }

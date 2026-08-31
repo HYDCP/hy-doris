@@ -1631,6 +1631,36 @@ public class Config extends ConfigBase {
     public static boolean enable_backup_restore_job_streaming_json = true;
 
     /**
+     * A internal config, to reduce table meta (table/partition/tablet/replica) json serialization
+     * memory by streaming. The serialized bytes are identical to the legacy tree mode.
+     */
+    @ConfField(mutable = true, masterOnly = false, description = {
+            "是否启用表元数据(table/partition/tablet/replica)多态分发的流式 JSON 序列化，"
+                    + "用于降低 FE 序列化大表元数据(如 backup meta、editlog、image)时的内存峰值",
+            "Whether to enable streaming JSON serialization for table meta (table/partition/tablet/replica) "
+                    + "polymorphic dispatch, to reduce FE heap peak when serializing large table meta "
+                    + "(e.g. backup meta, editlog, image)"
+    })
+    public static volatile boolean enable_table_meta_streaming_json = false;
+
+    /**
+     * A internal config, whether to reserve the replica info of tablets in backup meta.
+     *
+     * The replica info of the backed up table is never used by restore jobs (replicas are
+     * always re-created on restore), so it can be stripped to reduce the backup meta size and
+     * the FE memory usage of large backup jobs. Keep the legacy behavior by default for a
+     * conservative rollout.
+     */
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "备份元数据中是否保留 tablet 的副本信息。恢复时副本总是被重建，副本信息从不被使用，"
+                    + "可关闭此配置以降低大规模备份任务的元数据大小和 FE 内存占用",
+            "Whether to reserve the replica info of tablets in backup meta. Replicas are always "
+                    + "re-created on restore and the backed up replica info is never used. Disable this "
+                    + "configuration to reduce backup meta size and FE memory usage of large backup jobs"
+    })
+    public static volatile boolean backup_meta_reserve_replica_info = true;
+
+    /**
      * A internal config, to reduce the restore job size during serialization by compress.
      *
      * WARNING: Once this option is enabled and a restore is performed, the FE version cannot be rolled back.

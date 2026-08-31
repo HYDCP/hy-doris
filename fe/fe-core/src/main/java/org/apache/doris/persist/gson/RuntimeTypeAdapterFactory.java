@@ -117,6 +117,13 @@ import java.util.function.BooleanSupplier;
  * Both the type field name ({@code "type"}) and the type labels ({@code
  * "Rectangle"}) are configurable.
  *
+ * <p>When streaming dispatch is enabled, the type field must be the first field
+ * for registered subtypes. The streaming writer always emits it first. Legacy
+ * payloads without a type field remain readable only when a default subtype is
+ * registered; in that case the consumed first field name is replayed to the
+ * default subtype adapter. Payloads generated outside Doris with a type field
+ * in any other position are not supported in streaming mode.
+ *
  * <h3>Registering Types</h3>
  * Create a {@code RuntimeTypeAdapterFactory} by passing the base type and type
  * field
@@ -271,8 +278,11 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
 
     /**
      * Enables streaming dispatch. Only valid for factories without
-     * {@code maintainType} and without a default subtype, where the type field
-     * is guaranteed to be the first json field.
+     * {@code maintainType}. When the type field is present it must be the first
+     * json field, which holds for all Doris-generated journals/images. For
+     * factories with a default subtype, a payload whose first field is not the
+     * type field is treated as legacy data of the default subtype and the
+     * consumed field name is replayed to the delegate.
      */
     public RuntimeTypeAdapterFactory<T> withStreamingDispatch() {
         return withStreamingDispatch(() -> true);
@@ -343,8 +353,7 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
         return new TypeAdapter<R>() {
             @Override
             public R read(JsonReader in) throws IOException {
-                if (streamingDispatchEnabled.getAsBoolean() && defaultDelegate == null
-                        && in.peek() == JsonToken.BEGIN_OBJECT) {
+                if (streamingDispatchEnabled.getAsBoolean() && in.peek() == JsonToken.BEGIN_OBJECT) {
                     return readStreaming(in);
                 }
                 JsonElement jsonElement = Streams.parse(in);
@@ -377,11 +386,25 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
             private R readStreaming(JsonReader in) throws IOException {
                 in.beginObject();
                 if (!in.hasNext()) {
+                    if (defaultDelegate != null) {
+                        // empty object without the type field, legacy data of the default subtype
+                        @SuppressWarnings("unchecked") // registration requires that subtype extends T
+                        R result = (R) defaultDelegate.read(new EnteredObjectJsonReader(in));
+                        return result;
+                    }
                     throw new JsonParseException("cannot deserialize " + baseType
                             + " because it does not define a field named " + typeFieldName);
                 }
                 String firstName = in.nextName();
                 if (!typeFieldName.equals(firstName)) {
+                    if (defaultDelegate != null) {
+                        // Doris always emits the type field first, so a payload starting with
+                        // another field is legacy data written before this factory existed,
+                        // handled by the default subtype. Replay the consumed field name.
+                        @SuppressWarnings("unchecked") // registration requires that subtype extends T
+                        R result = (R) defaultDelegate.read(new EnteredObjectJsonReader(in, firstName));
+                        return result;
+                    }
                     throw new JsonParseException("cannot deserialize " + baseType + " in streaming mode because"
                             + " the first field is '" + firstName + "' instead of '" + typeFieldName + "'");
                 }
@@ -610,6 +633,10 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
      * A pass-through JsonReader for a stream whose top level BEGIN_OBJECT (and the type
      * field) has already been consumed by readStreaming(): the first beginObject() call
      * is a no-op, everything else is forwarded.
+     *
+     * When the payload has no leading type field (legacy data of the default subtype),
+     * readStreaming() has already consumed the first field NAME to inspect it; that name
+     * is replayed to the delegate adapter through the pendingName buffer.
      */
     private static final class EnteredObjectJsonReader extends JsonReader {
         private static final Reader UNUSED_READER = new Reader() {
@@ -655,10 +682,18 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
 
         private final JsonReader delegate;
         private boolean topObjectEntered = false;
+        // the first field name of the top level object which has already been consumed
+        // from the delegate and needs to be replayed, or null
+        private String pendingName;
 
         EnteredObjectJsonReader(JsonReader delegate) {
+            this(delegate, null);
+        }
+
+        EnteredObjectJsonReader(JsonReader delegate, String pendingName) {
             super(UNUSED_READER);
             this.delegate = delegate;
+            this.pendingName = pendingName;
             // isLenient() is final and cannot be forwarded, sync the flag instead
             setLenient(delegate.isLenient());
         }
@@ -677,6 +712,9 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
         public JsonToken peek() throws IOException {
             if (!topObjectEntered) {
                 return JsonToken.BEGIN_OBJECT;
+            }
+            if (pendingName != null) {
+                return JsonToken.NAME;
             }
             return delegate.peek();
         }
@@ -698,11 +736,19 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
 
         @Override
         public boolean hasNext() throws IOException {
+            if (topObjectEntered && pendingName != null) {
+                return true;
+            }
             return delegate.hasNext();
         }
 
         @Override
         public String nextName() throws IOException {
+            if (topObjectEntered && pendingName != null) {
+                String name = pendingName;
+                pendingName = null;
+                return name;
+            }
             return delegate.nextName();
         }
 

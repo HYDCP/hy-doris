@@ -88,8 +88,15 @@ public class JournalBatch {
             return op;
         }
 
+        // Returns the raw backing array of the internal buffer, whose capacity may be
+        // larger than the serialized data. Callers must use getBinaryDataLength() to
+        // determine the valid byte range.
         public byte[] getBinaryData() {
             return data.getData();
+        }
+
+        public int getBinaryDataLength() {
+            return data.getLength();
         }
     }
 }

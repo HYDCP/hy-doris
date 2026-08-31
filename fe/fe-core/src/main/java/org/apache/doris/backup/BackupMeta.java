@@ -21,7 +21,6 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.common.FeMetaVersion;
-import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.meta.MetaContext;
 import org.apache.doris.persist.gson.GsonPostProcessable;
@@ -131,14 +130,15 @@ public class BackupMeta implements Writable, GsonPostProcessable {
             backupMeta.readFields(in);
             return backupMeta;
         } else {
-            String json = Text.readString(in);
-            return GsonUtils.GSON.fromJson(json, BackupMeta.class);
+            return GsonUtils.fromJsonAsText(in, BackupMeta.class);
         }
     }
 
     @Override
     public void write(DataOutput out) throws IOException {
-        Text.writeString(out, GsonUtils.GSON.toJson(this));
+        // byte-identical to Text.writeString(out, GsonUtils.GSON.toJson(this)), but
+        // without materializing the whole json String of a huge meta in memory
+        GsonUtils.toJsonAsText(out, this);
     }
 
     @Deprecated

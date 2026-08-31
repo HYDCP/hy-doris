@@ -31,6 +31,8 @@ import com.google.gson.annotations.SerializedName;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.Map;
 
@@ -176,6 +178,15 @@ public abstract class AbstractJob implements Writable {
 
     public abstract Status updateRepo(Repository repo);
 
+    /**
+     * Checks whether the length-prefixed payload read by {@code GsonUtils.readJsonBytes}
+     * is the COMPRESSED_JOB_ID marker, the byte level equivalent of
+     * {@code COMPRESSED_JOB_ID.equals(Text.readString(in))}.
+     */
+    public static boolean isCompressedJobMarker(byte[] bytes) {
+        return Arrays.equals(bytes, COMPRESSED_JOB_ID.getBytes(StandardCharsets.UTF_8));
+    }
+
     public static AbstractJob read(DataInput in) throws IOException {
         if (Env.getCurrentEnvJournalVersion() < FeMetaVersion.VERSION_136) {
             AbstractJob job = null;
@@ -192,11 +203,11 @@ public abstract class AbstractJob implements Writable {
             job.readFields(in);
             return job;
         } else {
-            String json = Text.readString(in);
-            if (COMPRESSED_JOB_ID.equals(json)) {
+            byte[] jsonBytes = GsonUtils.readJsonBytes(in);
+            if (isCompressedJobMarker(jsonBytes)) {
                 return GsonUtils.fromJsonCompressed(in, AbstractJob.class);
             } else {
-                return GsonUtils.GSON.fromJson(json, AbstractJob.class);
+                return GsonUtils.fromJsonBytes(jsonBytes, AbstractJob.class);
             }
         }
     }
@@ -222,7 +233,9 @@ public abstract class AbstractJob implements Writable {
             Text.writeString(out, COMPRESSED_JOB_ID);
             GsonUtils.toJsonCompressed(out, this);
         } else {
-            Text.writeString(out, GsonUtils.GSON.toJson(this));
+            // byte-identical to Text.writeString(out, GsonUtils.GSON.toJson(this)), but
+            // without materializing the whole json String of a huge job in memory
+            GsonUtils.toJsonAsText(out, this);
         }
     }
 

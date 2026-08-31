@@ -1439,11 +1439,11 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             job.readFields(in);
             return job;
         } else {
-            String json = Text.readString(in);
-            if (AbstractJob.COMPRESSED_JOB_ID.equals(json)) {
+            byte[] jsonBytes = GsonUtils.readJsonBytes(in);
+            if (AbstractJob.isCompressedJobMarker(jsonBytes)) {
                 return GsonUtils.fromJsonCompressed(in, BackupJob.class);
             } else {
-                return GsonUtils.GSON.fromJson(json, BackupJob.class);
+                return GsonUtils.fromJsonBytes(jsonBytes, BackupJob.class);
             }
         }
     }

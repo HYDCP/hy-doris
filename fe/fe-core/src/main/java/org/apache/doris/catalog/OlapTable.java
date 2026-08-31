@@ -48,7 +48,6 @@ import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
-import org.apache.doris.common.io.DeepCopy;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.util.PropertyAnalyzer;
 import org.apache.doris.common.util.Util;
@@ -1761,7 +1760,9 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
 
     @Override
     public void write(DataOutput out) throws IOException {
-        Text.writeString(out, GsonUtils.GSON.toJson(this));
+        // byte-identical to Text.writeString(out, GsonUtils.GSON.toJson(this)), but
+        // without materializing the whole json String of a huge table in memory
+        GsonUtils.toJsonAsText(out, this);
     }
 
     @Deprecated
@@ -1950,7 +1951,9 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
     }
 
     public OlapTable selectiveCopy(Collection<String> reservedPartitions, IndexExtState extState, boolean isForBackup) {
-        OlapTable copied = DeepCopy.copy(this, OlapTable.class, FeConstants.meta_version);
+        // the streaming equivalent of DeepCopy.copy, without materializing the whole
+        // json String / char[] of a huge table in memory
+        OlapTable copied = GsonUtils.deepCopyViaJsonStream(this, OlapTable.class, FeConstants.meta_version);
         if (copied == null) {
             LOG.warn("failed to copy olap table: " + getName());
             return null;
@@ -1986,8 +1989,15 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
             for (MaterializedIndex idx : partition.getMaterializedIndices(extState)) {
                 idx.setState(IndexState.NORMAL);
                 for (Tablet tablet : idx.getTablets()) {
-                    for (Replica replica : tablet.getReplicas()) {
-                        replica.setState(ReplicaState.NORMAL);
+                    if (isForBackup && !Config.backup_meta_reserve_replica_info) {
+                        // the replica info of the backed up table is never used by restore
+                        // (replicas are always re-created with new ids and backends), strip
+                        // it to reduce the backup meta size and the job memory footprint
+                        tablet.clearReplicas();
+                    } else {
+                        for (Replica replica : tablet.getReplicas()) {
+                            replica.setState(ReplicaState.NORMAL);
+                        }
                     }
                 }
             }
@@ -2027,7 +2037,7 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
             t.readFields(in);
             return t;
         }
-        return GsonUtils.GSON.fromJson(Text.readString(in), OlapTable.class);
+        return GsonUtils.fromJsonAsText(in, OlapTable.class);
     }
 
     /*
