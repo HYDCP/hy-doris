@@ -24,6 +24,7 @@ import org.apache.doris.catalog.JdbcTable;
 import org.apache.doris.datasource.ExternalDatabase;
 import org.apache.doris.datasource.ExternalTable;
 import org.apache.doris.datasource.SchemaCacheValue;
+import org.apache.doris.datasource.jdbc.client.JdbcClientException;
 import org.apache.doris.qe.AutoCloseConnectContext;
 import org.apache.doris.qe.StmtExecutor;
 import org.apache.doris.statistics.AnalysisInfo;
@@ -121,7 +122,9 @@ public class JdbcExternalTable extends ExternalTable {
         // 1. Retrieve remote column information
         List<Column> columns = ((JdbcExternalCatalog) catalog).listColumns(remoteDbName, remoteName);
         if (columns == null || columns.isEmpty()) {
-            return Optional.empty();
+            throw new JdbcClientException(
+                    "failed to get jdbc columns info for remote table `%s.%s` in catalog `%s`: no columns returned",
+                    remoteDbName, remoteName, catalog.getName());
         }
 
         // 2. Generate local column names from remote names

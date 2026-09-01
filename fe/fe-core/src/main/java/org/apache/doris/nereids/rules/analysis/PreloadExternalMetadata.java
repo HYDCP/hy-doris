@@ -17,16 +17,20 @@
 
 package org.apache.doris.nereids.rules.analysis;
 
+import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.Env;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.datasource.ExternalTable;
 import org.apache.doris.nereids.ExternalMetadataPreloadResult;
 import org.apache.doris.nereids.ExternalTablePreloadInfo;
 import org.apache.doris.nereids.StatementContext;
+import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.qe.ConnectContext;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -98,7 +102,12 @@ public class PreloadExternalMetadata {
             statementContext.loadSnapshot(table, Optional.empty(), Optional.empty());
         }
         if (preloadSchema) {
-            table.getBaseSchema();
+            List<Column> schema = table.getBaseSchema();
+            if (schema == null || schema.isEmpty()) {
+                Env.getCurrentEnv().getExtMetaCacheMgr().invalidateTableCache(table);
+                throw new AnalysisException("Failed to preload schema for external table "
+                        + getExternalTableLogName(table) + ": no columns returned");
+            }
         }
         if (preloadPartition) {
             table.initSelectedPartitions(statementContext.getSnapshot(table));
