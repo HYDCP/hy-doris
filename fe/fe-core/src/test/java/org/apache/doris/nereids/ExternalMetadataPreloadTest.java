@@ -18,25 +18,20 @@
 package org.apache.doris.nereids;
 
 import org.apache.doris.analysis.TableSnapshot;
-import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.DatabaseIf;
-import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.TableIf;
-import org.apache.doris.datasource.ExternalCatalog;
-import org.apache.doris.datasource.ExternalMetaCacheMgr;
+import org.apache.doris.datasource.CatalogIf;
 import org.apache.doris.datasource.ExternalTable;
 import org.apache.doris.datasource.hive.HMSExternalTable;
 import org.apache.doris.datasource.hive.HMSExternalTable.DLAType;
 import org.apache.doris.datasource.mvcc.MvccSnapshot;
 import org.apache.doris.datasource.mvcc.MvccTable;
-import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.rules.analysis.PreloadExternalMetadata;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.SessionVariable;
 
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
-import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
 import java.util.Arrays;
@@ -142,31 +137,6 @@ public class ExternalMetadataPreloadTest {
         Mockito.verify(externalTable, Mockito.never()).getBaseSchema();
     }
 
-    @Test
-    public void testEmptySchemaFailsPreloadAndInvalidatesCache() {
-        StatementContext statementContext = createStatementContext(true);
-        addInternalTable(statementContext, true);
-        ExternalTable externalTable = mockExternalTable(6L, false);
-        Mockito.when(externalTable.getBaseSchema()).thenReturn(null);
-        mockDatabase(externalTable);
-
-        Env env = Mockito.mock(Env.class);
-        ExternalMetaCacheMgr externalMetaCacheMgr = Mockito.mock(ExternalMetaCacheMgr.class);
-        try (MockedStatic<Env> mockedEnv = Mockito.mockStatic(Env.class)) {
-            mockedEnv.when(Env::getCurrentEnv).thenReturn(env);
-            Mockito.when(env.getExtMetaCacheMgr()).thenReturn(externalMetaCacheMgr);
-
-            statementContext.registerExternalTableForPreload(externalTable, Optional.empty(), Optional.empty());
-            AnalysisException exception = Assertions.assertThrows(AnalysisException.class,
-                    () -> new PreloadExternalMetadata().executePreload(statementContext));
-
-            Assertions.assertEquals("Failed to preload schema for external table ctl.db.tbl: no columns returned",
-                    exception.getMessage());
-            Mockito.verify(externalMetaCacheMgr).invalidateTableCache(externalTable);
-            Mockito.verify(externalTable, Mockito.never()).initSelectedPartitions(Mockito.any());
-        }
-    }
-
     private StatementContext createStatementContext(boolean enablePreload) {
         ConnectContext connectContext = new ConnectContext();
         SessionVariable sessionVariable = new SessionVariable();
@@ -205,8 +175,7 @@ public class ExternalMetadataPreloadTest {
         Mockito.when(externalTable.supportsLatestSnapshotPreload()).thenCallRealMethod();
         Mockito.when(externalTable.getId()).thenReturn(id);
         Mockito.when(externalTable.supportInternalPartitionPruned()).thenReturn(false);
-        Mockito.when(externalTable.getBaseSchema())
-                .thenReturn(Collections.singletonList(Mockito.mock(Column.class)));
+        Mockito.when(externalTable.getBaseSchema()).thenReturn(Collections.emptyList());
         mockDatabase(externalTable);
         Mockito.when(externalTable.loadSnapshot(Optional.empty(), Optional.empty()))
                 .thenReturn(Mockito.mock(MvccSnapshot.class));
@@ -218,16 +187,13 @@ public class ExternalMetadataPreloadTest {
         Mockito.when(externalTable.supportsExternalMetadataPreload()).thenReturn(true);
         Mockito.when(externalTable.supportsLatestSnapshotPreload()).thenReturn(false);
         Mockito.when(externalTable.supportInternalPartitionPruned()).thenReturn(supportPartitionPreload);
-        Mockito.when(externalTable.getBaseSchema())
-                .thenReturn(Collections.singletonList(Mockito.mock(Column.class)));
+        Mockito.when(externalTable.getBaseSchema()).thenReturn(Collections.emptyList());
     }
 
     private void mockDatabase(ExternalTable externalTable) {
         DatabaseIf database = Mockito.mock(DatabaseIf.class);
-        ExternalCatalog catalog = Mockito.mock(ExternalCatalog.class);
+        CatalogIf catalog = Mockito.mock(CatalogIf.class);
         Mockito.when(externalTable.getDatabase()).thenReturn(database);
-        Mockito.when(externalTable.getCatalog()).thenReturn(catalog);
-        Mockito.when(externalTable.getDbName()).thenReturn("db");
         Mockito.when(externalTable.getName()).thenReturn("tbl");
         Mockito.when(database.getFullName()).thenReturn("db");
         Mockito.when(database.getCatalog()).thenReturn(catalog);

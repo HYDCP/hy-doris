@@ -116,15 +116,24 @@ public class JdbcExternalTable extends ExternalTable {
     }
 
     @Override
+    public List<Column> getFullSchema() {
+        List<Column> schema = super.getFullSchema();
+        if (schema == null || schema.isEmpty()) {
+            throw new JdbcClientException(
+                    "failed to get jdbc columns info for remote table `%s.%s` in catalog `%s`: no columns returned",
+                    getRemoteDbName(), getRemoteName(), catalog.getName());
+        }
+        return schema;
+    }
+
+    @Override
     public Optional<SchemaCacheValue> initSchema() {
         String remoteDbName = ((ExternalDatabase<?>) this.getDatabase()).getRemoteName();
 
         // 1. Retrieve remote column information
         List<Column> columns = ((JdbcExternalCatalog) catalog).listColumns(remoteDbName, remoteName);
         if (columns == null || columns.isEmpty()) {
-            throw new JdbcClientException(
-                    "failed to get jdbc columns info for remote table `%s.%s` in catalog `%s`: no columns returned",
-                    remoteDbName, remoteName, catalog.getName());
+            return Optional.empty();
         }
 
         // 2. Generate local column names from remote names
