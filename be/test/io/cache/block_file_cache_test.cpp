@@ -7925,6 +7925,12 @@ TEST_F(BlockFileCacheTest, cached_remote_file_reader_direct_read_and_evict_cache
     context.stats = &rstats;
     context.query_id = query_id;
     ASSERT_TRUE(FileCacheFactory::instance()->create_file_cache(cache_base_path, settings).ok());
+    BlockFileCache* cache = FileCacheFactory::instance()->get_by_path(cache_base_path);
+    for (int i = 0; i < 1000 && !cache->get_async_open_success(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(cache->get_async_open_success());
+
     FileReaderSPtr local_reader;
     ASSERT_TRUE(global_local_filesystem()->open_file(tmp_file, &local_reader));
     io::FileReaderOptions opts;
@@ -7942,7 +7948,6 @@ TEST_F(BlockFileCacheTest, cached_remote_file_reader_direct_read_and_evict_cache
             reader->read_at(100, Slice(buffer.data(), buffer.size()), &bytes_read, &io_ctx).ok());
     EXPECT_EQ(std::string(64_kb, '0'), buffer);
 
-    auto cache = FileCacheFactory::instance()->_path_to_cache[cache_base_path];
     EXPECT_GT(cache->_cur_cache_size, 0);
 
     auto ret_str = FileCacheFactory::instance()->clear_file_caches(
