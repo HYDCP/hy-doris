@@ -20,7 +20,11 @@ package org.apache.doris.catalog;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.io.CountingDataOutputStream;
 import org.apache.doris.meta.MetaContext;
+import org.apache.doris.mysql.privilege.Auth;
 import org.apache.doris.persist.meta.MetaHeader;
+import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.ConnectScheduler;
+import org.apache.doris.service.ExecuteEnv;
 
 import mockit.Expectations;
 import org.junit.Assert;
@@ -34,6 +38,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.util.List;
 import java.util.Random;
 
 public class EnvTest {
@@ -139,5 +144,52 @@ public class EnvTest {
         dis.close();
 
         deleteDir(dir);
+    }
+
+    @Test
+    public void testGetAllAliveSessionIds() {
+        FeConstants.runningUnitTest = true;
+        Env env = Env.getCurrentEnv();
+        ConnectScheduler scheduler = ExecuteEnv.getInstance().getScheduler();
+
+        // The UT env has no user properties, so getMaxConn would return 0 and
+        // reject registration; mock it to a large enough limit.
+        Auth auth = env.getAuth();
+        new Expectations(auth) {
+            {
+                auth.getMaxConn(anyString);
+                minTimes = 0;
+                result = 1024;
+            }
+        };
+
+        ConnectContext ctx1 = new ConnectContext();
+        ctx1.setEnv(env);
+        ctx1.setQualifiedUser("root");
+        Assert.assertTrue(scheduler.submit(ctx1));
+        ctx1.init();
+
+        ConnectContext ctx2 = new ConnectContext();
+        ctx2.setEnv(env);
+        ctx2.setQualifiedUser("root");
+        Assert.assertTrue(scheduler.submit(ctx2));
+        ctx2.init();
+
+        try {
+            Assert.assertEquals(-1, scheduler.getConnectPoolMgr().registerConnection(ctx1));
+            Assert.assertEquals(-1, scheduler.getConnectPoolMgr().registerConnection(ctx2));
+
+            List<String> sessionIds = env.getAllAliveSessionIds();
+            Assert.assertTrue(sessionIds.contains(ctx1.getSessionId()));
+            Assert.assertTrue(sessionIds.contains(ctx2.getSessionId()));
+
+            scheduler.getConnectPoolMgr().unregisterConnection(ctx1);
+            sessionIds = env.getAllAliveSessionIds();
+            Assert.assertFalse(sessionIds.contains(ctx1.getSessionId()));
+            Assert.assertTrue(sessionIds.contains(ctx2.getSessionId()));
+        } finally {
+            scheduler.getConnectPoolMgr().unregisterConnection(ctx1);
+            scheduler.getConnectPoolMgr().unregisterConnection(ctx2);
+        }
     }
 }

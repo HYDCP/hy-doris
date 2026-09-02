@@ -923,7 +923,7 @@ public class ConnectContext {
             for (String dbName : dbToTempTableNamesMap.keySet()) {
                 for (String tableName : dbToTempTableNamesMap.get(dbName)) {
                     LOG.info("request to delete temporary table: {}.{}", dbName, tableName);
-                    String dropTableSql = String.format("drop table `%s`", tableName);
+                    String dropTableSql = String.format("drop table `%s`.`%s`", dbName, tableName);
                     OriginStatement originStmt = new OriginStatement(dropTableSql, 0);
                     MasterOpExecutor masterOpExecutor = new MasterOpExecutor(originStmt, this, redirectStatus, false);
                     if (LOG.isDebugEnabled()) {

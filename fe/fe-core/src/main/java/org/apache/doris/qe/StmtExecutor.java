@@ -27,6 +27,7 @@ import org.apache.doris.analysis.Analyzer;
 import org.apache.doris.analysis.CreateRoutineLoadStmt;
 import org.apache.doris.analysis.CreateTableAsSelectStmt;
 import org.apache.doris.analysis.CreateTableLikeStmt;
+import org.apache.doris.analysis.CreateTableStmt;
 import org.apache.doris.analysis.DdlStmt;
 import org.apache.doris.analysis.DeleteStmt;
 import org.apache.doris.analysis.DropPartitionClause;
@@ -165,6 +166,7 @@ import org.apache.doris.nereids.trees.plans.commands.LoadCommand;
 import org.apache.doris.nereids.trees.plans.commands.PrepareCommand;
 import org.apache.doris.nereids.trees.plans.commands.UnsupportedCommand;
 import org.apache.doris.nereids.trees.plans.commands.UpdateCommand;
+import org.apache.doris.nereids.trees.plans.commands.info.CreateTableInfo;
 import org.apache.doris.nereids.trees.plans.commands.insert.BatchInsertIntoTableCommand;
 import org.apache.doris.nereids.trees.plans.commands.insert.InsertIntoTableCommand;
 import org.apache.doris.nereids.trees.plans.commands.insert.InsertOverwriteTableCommand;
@@ -1319,6 +1321,7 @@ public class StmtExecutor {
         }
         masterOpExecutor.setMoreStmtExists(moreStmtExists);
         masterOpExecutor.execute();
+        recordTempTableOfForwardedDdl();
         if (parsedStmt instanceof SetStmt) {
             SetStmt setStmt = (SetStmt) parsedStmt;
             setStmt.modifySetVarsForExecute();
@@ -1344,6 +1347,45 @@ public class StmtExecutor {
                 }
             }
         }
+    }
+
+    // Temporary table ddl is executed on master FE with a proxy ConnectContext, so master FE only
+    // records the temporary table in the proxy session. Record it in the original session on this
+    // follower FE too, otherwise ConnectContext.deleteTempTable() can not find the temporary table
+    // when this session exits and the temporary table would be leaked.
+    private void recordTempTableOfForwardedDdl() {
+        // status code 0 means the forwarded ddl is executed successfully on master FE
+        if (masterOpExecutor.getStatusCode() != 0) {
+            return;
+        }
+        if (parsedStmt instanceof LogicalPlanAdapter) {
+            LogicalPlan logicalPlan = ((LogicalPlanAdapter) parsedStmt).getLogicalPlan();
+            if (logicalPlan instanceof CreateTableCommand) {
+                CreateTableInfo createTableInfo = ((CreateTableCommand) logicalPlan).getCreateTableInfo();
+                if (createTableInfo.isTemp()) {
+                    context.addTempTableToDB(createTableInfo.getDbName(),
+                            Util.generateTempTableInnerName(createTableInfo.getTableName()));
+                }
+            }
+        } else if (parsedStmt instanceof CreateTableStmt) {
+            CreateTableStmt createTableStmt = (CreateTableStmt) parsedStmt;
+            if (createTableStmt.isTemp()) {
+                context.addTempTableToDB(getForwardedDdlDbName(createTableStmt.getDbName()),
+                        Util.generateTempTableInnerName(createTableStmt.getTableName()));
+            }
+        } else if (parsedStmt instanceof DropTableStmt) {
+            DropTableStmt dropTableStmt = (DropTableStmt) parsedStmt;
+            // the dropped table may be a temporary table created by this session, remove it from the
+            // session's map so that it will not be dropped again when this session exits.
+            context.removeTempTableFromDB(getForwardedDdlDbName(dropTableStmt.getDbName()),
+                    Util.generateTempTableInnerName(dropTableStmt.getTableName()));
+        }
+    }
+
+    // The forwarded ddl stmt is not analyzed on this follower FE, so its db name may be unset,
+    // in which case master FE resolves the table in the session's current database.
+    private String getForwardedDdlDbName(String dbName) {
+        return Strings.isNullOrEmpty(dbName) ? context.getDatabase() : dbName;
     }
 
     public void updateProfile(boolean isFinished) {

@@ -879,7 +879,8 @@ public class Env {
     }
 
     private void refreshSession(String sessionId) {
-        sessionReportTimeMap.put(sessionId, System.currentTimeMillis());
+        // TODO: do nothing now until we fix memory link on Env#sessionReportTimeMap and Env#aliveSessionSet
+        // sessionReportTimeMap.put(sessionId, System.currentTimeMillis());
     }
 
     public void checkAndRefreshSession(String sessionId) {
@@ -7020,7 +7021,8 @@ public class Env {
     }
 
     public void registerSessionInfo(String sessionId) {
-        this.aliveSessionSet.add(sessionId);
+        // TODO: do nothing now until we fix memory link on Env#sessionReportTimeMap and Env#aliveSessionSet
+        // this.aliveSessionSet.add(sessionId);
     }
 
     public void unregisterSessionInfo(String sessionId) {
@@ -7028,7 +7030,16 @@ public class Env {
     }
 
     public List<String> getAllAliveSessionIds() {
-        return new ArrayList<>(aliveSessionSet);
+        // Derive from the live connection registry instead of aliveSessionSet:
+        // the registry always reflects real client sessions, needs no
+        // register/unregister bookkeeping (which leaked, see #59535), and keeps
+        // alive-session reporting accurate for an old-version master during
+        // rolling upgrades.
+        List<String> sessionIds = new ArrayList<>();
+        for (ConnectContext ctx : ExecuteEnv.getInstance().getScheduler().getConnectionMap().values()) {
+            sessionIds.add(ctx.getSessionId());
+        }
+        return sessionIds;
     }
 }
 

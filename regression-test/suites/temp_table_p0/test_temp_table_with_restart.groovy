@@ -18,6 +18,11 @@
 import org.apache.doris.regression.suite.ClusterOptions
 
 suite('test_temp_table_with_restart', 'p0,docker') {
+    if (true) {
+        // Auto cleanup of orphan temp tables is disabled by the backport of #59535
+        // (session tracking mem leak). This case asserts that behavior, skip it.
+        return
+    }
     def options = new ClusterOptions()
     options.setFeNum(2)
     options.setBeNum(1)
