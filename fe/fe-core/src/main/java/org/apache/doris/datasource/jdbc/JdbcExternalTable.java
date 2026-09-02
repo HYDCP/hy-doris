@@ -24,6 +24,7 @@ import org.apache.doris.catalog.JdbcTable;
 import org.apache.doris.datasource.ExternalDatabase;
 import org.apache.doris.datasource.ExternalTable;
 import org.apache.doris.datasource.SchemaCacheValue;
+import org.apache.doris.datasource.jdbc.client.JdbcClientException;
 import org.apache.doris.qe.AutoCloseConnectContext;
 import org.apache.doris.qe.StmtExecutor;
 import org.apache.doris.statistics.AnalysisInfo;
@@ -112,6 +113,17 @@ public class JdbcExternalTable extends ExternalTable {
     @Override
     public boolean supportsExternalMetadataPreload() {
         return true;
+    }
+
+    @Override
+    public List<Column> getFullSchema() {
+        List<Column> schema = super.getFullSchema();
+        if (schema == null || schema.isEmpty()) {
+            throw new JdbcClientException(
+                    "failed to get jdbc columns info for remote table `%s.%s` in catalog `%s`: no columns returned",
+                    getRemoteDbName(), getRemoteName(), catalog.getName());
+        }
+        return schema;
     }
 
     @Override
