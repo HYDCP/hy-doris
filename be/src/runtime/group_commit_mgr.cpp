@@ -221,7 +221,7 @@ void LoadBlockQueue::_cancel_without_lock(const Status& st) {
             Status::Cancelled("cancel group_commit, label=" + label + ", status=" + st.to_string());
     int before_block_queues_bytes = _all_block_queues_bytes->load();
     while (!_block_queue.empty()) {
-        const BlockData& block_data = _block_queue.front().block;
+        const BlockData& block_data = _block_queue.front();
         _all_block_queues_bytes->fetch_sub(block_data.block_bytes, std::memory_order_relaxed);
         _block_queue.pop_front();
     }
