@@ -76,6 +76,10 @@ public class TableBinlog {
             dummy = binlog;
         } else {
             dummy = BinlogUtils.newDummyBinlog(binlog.getDbId(), tableId);
+            BinlogConfig binlogConfig = binlogConfigCache.getTableBinlogConfig(dbId, tableId);
+            if (binlogConfig != null) {
+                dummy.setData(binlogConfig.toString());
+            }
         }
         binlogs.add(dummy);
         this.binlogConfigCache = binlogConfigCache;
@@ -87,6 +91,15 @@ public class TableBinlog {
 
     public long getTableId() {
         return tableId;
+    }
+
+    public void updateBinlogConfig(BinlogConfig binlogConfig) {
+        lock.writeLock().lock();
+        try {
+            getDummyBinlog().setData(binlogConfig.toString());
+        } finally {
+            lock.writeLock().unlock();
+        }
     }
 
     // not thread safety, do this without lock
@@ -256,6 +269,9 @@ public class TableBinlog {
     public BinlogTombstone gc() {
         // step 1: get expire time
         BinlogConfig tableBinlogConfig = binlogConfigCache.getTableBinlogConfig(dbId, tableId);
+        if (tableBinlogConfig == null && getDummyBinlog().isSetData()) {
+            tableBinlogConfig = BinlogConfig.fromJson(getDummyBinlog().getData());
+        }
         Boolean isCleanFullBinlog = false;
         if (tableBinlogConfig == null) {
             return null;

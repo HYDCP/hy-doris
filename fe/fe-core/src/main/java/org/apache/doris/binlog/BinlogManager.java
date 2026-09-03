@@ -19,6 +19,7 @@ package org.apache.doris.binlog;
 
 import org.apache.doris.alter.AlterJobV2;
 import org.apache.doris.alter.IndexChangeJob;
+import org.apache.doris.catalog.BinlogConfig;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.Config;
@@ -291,6 +292,7 @@ public class BinlogManager {
         long dbId = info.getDbId();
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getTableId());
+        refreshTableBinlogConfig(dbId, info.getTableId());
         long timestamp = System.currentTimeMillis();
         TBinlogType type = TBinlogType.MODIFY_TABLE_PROPERTY;
         String data = info.toJson();
@@ -427,6 +429,7 @@ public class BinlogManager {
         }
 
         long dbId = info.getDbId();
+        cacheTableBinlogConfig(info.getOrigTblId(), info.getOrigTblBinlogConfig());
         List<Long> tableIds = Lists.newArrayList();
         tableIds.add(info.getOrigTblId());
         long timestamp = System.currentTimeMillis();
@@ -434,6 +437,29 @@ public class BinlogManager {
         String data = info.toJson();
 
         addBinlog(dbId, tableIds, commitSeq, timestamp, type, data, false, info);
+    }
+
+    public void cacheTableBinlogConfig(long tableId, BinlogConfig binlogConfig) {
+        if (binlogConfig != null) {
+            binlogConfigCache.putTableBinlogConfig(tableId, binlogConfig);
+            updateTableBinlogConfig(tableId, binlogConfig);
+        }
+    }
+
+    private void refreshTableBinlogConfig(long dbId, long tableId) {
+        binlogConfigCache.remove(tableId);
+        cacheTableBinlogConfig(tableId, binlogConfigCache.getTableBinlogConfig(dbId, tableId));
+    }
+
+    private void updateTableBinlogConfig(long tableId, BinlogConfig binlogConfig) {
+        lock.readLock().lock();
+        try {
+            for (DBBinlog dbBinlog : dbBinlogMap.values()) {
+                dbBinlog.updateTableBinlogConfig(tableId, binlogConfig);
+            }
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     public void addModifyDistributionNum(ModifyTableDefaultDistributionBucketNumOperationLog info, long commitSeq) {
@@ -808,6 +834,10 @@ public class BinlogManager {
                                 currentDbBinlogEnable);
                         dbBinlogMap.put(dbId, dbBinlog);
                     } else {
+                        if (binlog.isSetData()) {
+                            binlogConfigCache.putTableBinlogConfig(binlog.getBelong(),
+                                    BinlogConfig.fromJson(binlog.getData()));
+                        }
                         tableDummies.add(binlog);
                     }
                 } else {

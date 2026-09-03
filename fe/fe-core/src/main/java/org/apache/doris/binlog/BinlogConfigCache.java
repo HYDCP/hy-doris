@@ -164,6 +164,15 @@ public class BinlogConfigCache {
         return tableBinlogConfig.getTtlSeconds();
     }
 
+    public void putTableBinlogConfig(long tableId, BinlogConfig binlogConfig) {
+        lock.writeLock().lock();
+        try {
+            dbTableBinlogEnableMap.put(tableId, new BinlogConfig(binlogConfig));
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
     public void remove(long id) {
         lock.writeLock().lock();
         try {
