@@ -63,6 +63,15 @@ namespace doris {
 class TabletMgrTest : public testing::Test {
 public:
     virtual void SetUp() {
+        // ConfigTest clears the global config registry. Re-register these process-lifetime
+        // config fields so this fixture does not depend on test suite execution order.
+        config::Register shutdown_tablet_sweep_round_budget_register(
+                "int32_t", "shutdown_tablet_sweep_round_budget",
+                &config::shutdown_tablet_sweep_round_budget, "200", true);
+        config::Register shutdown_tablet_sweep_interval_ms_register(
+                "int32_t", "shutdown_tablet_sweep_interval_ms",
+                &config::shutdown_tablet_sweep_interval_ms, "1000", true);
+
         _original_enable_debug_points = config::enable_debug_points;
         DebugPoints::instance()->remove("DataDir.gc_tablet_path.delete_directly_failed");
         DebugPoints::instance()->remove(
