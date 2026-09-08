@@ -189,4 +189,8 @@ public class BinlogConfig implements Writable {
         binlogConfig.mergeFromProperties(properties);
         return binlogConfig;
     }
+
+    public static BinlogConfig fromJson(String json) {
+        return GsonUtils.GSON.fromJson(json, BinlogConfig.class);
+    }
 }
