@@ -91,6 +91,18 @@ public class CatalogRecycleBin extends MasterDaemon implements Writable, GsonPos
     private ConcurrentHashMap<Long, RecyclePartitionInfo> idToPartition;
     private ConcurrentHashMap<Long, Long> idToRecycleTime;
 
+    private static final class ExpiredCandidate<T> {
+        private final long id;
+        private final T recycleInfo;
+        private final long recycleTime;
+
+        ExpiredCandidate(long id, T recycleInfo, long recycleTime) {
+            this.id = id;
+            this.recycleInfo = recycleInfo;
+            this.recycleTime = recycleTime;
+        }
+    }
+
     // Caches below to avoid calculate meta with same name every demon run cycle.
     // When the meta is updated, these caches should be updated too. No need to
     // persist these caches because they can be recalculated when FE restarting.
@@ -294,17 +306,25 @@ public class CatalogRecycleBin extends MasterDaemon implements Writable, GsonPos
                 && latency > Config.catalog_trash_expire_second * 1000L;
     }
 
+    private <T> boolean isSameGenerationAndExpired(ExpiredCandidate<T> candidate,
+            Map<Long, T> recycleInfoMap, long currentTimeMs) {
+        return recycleInfoMap.get(candidate.id) == candidate.recycleInfo
+                && idToRecycleTime.get(candidate.id) == candidate.recycleTime
+                && isExpire(candidate.id, currentTimeMs);
+    }
+
     private void eraseDatabase(long currentTimeMs, int keepNum) {
         int eraseNum = 0;
         StopWatch watch = StopWatch.createStarted();
         try {
-            // 1. collect expired database IDs under read lock
-            List<Long> expiredIds = new ArrayList<>();
+            // 1. collect expired database generations under read lock
+            List<ExpiredCandidate<RecycleDatabaseInfo>> expiredCandidates = new ArrayList<>();
             readLock();
             try {
                 for (Map.Entry<Long, RecycleDatabaseInfo> entry : idToDatabase.entrySet()) {
                     if (isExpire(entry.getKey(), currentTimeMs)) {
-                        expiredIds.add(entry.getKey());
+                        expiredCandidates.add(new ExpiredCandidate<>(entry.getKey(), entry.getValue(),
+                                idToRecycleTime.get(entry.getKey())));
                     }
                 }
             } finally {
@@ -312,13 +332,14 @@ public class CatalogRecycleBin extends MasterDaemon implements Writable, GsonPos
             }
 
             // 2. erase each expired database one at a time
-            for (Long dbId : expiredIds) {
+            for (ExpiredCandidate<RecycleDatabaseInfo> candidate : expiredCandidates) {
                 writeLock();
                 try {
-                    RecycleDatabaseInfo dbInfo = idToDatabase.remove(dbId);
-                    if (dbInfo == null) {
+                    long dbId = candidate.id;
+                    if (!isSameGenerationAndExpired(candidate, idToDatabase, currentTimeMs)) {
                         continue;
                     }
+                    RecycleDatabaseInfo dbInfo = idToDatabase.remove(dbId);
                     Database db = dbInfo.getDb();
                     idToRecycleTime.remove(dbId);
 
@@ -449,13 +470,14 @@ public class CatalogRecycleBin extends MasterDaemon implements Writable, GsonPos
         int eraseNum = 0;
         StopWatch watch = StopWatch.createStarted();
         try {
-            // 1. collect expired table IDs under read lock
-            List<Long> expiredIds = new ArrayList<>();
+            // 1. collect expired table generations under read lock
+            List<ExpiredCandidate<RecycleTableInfo>> expiredCandidates = new ArrayList<>();
             readLock();
             try {
                 for (Map.Entry<Long, RecycleTableInfo> entry : idToTable.entrySet()) {
                     if (isExpire(entry.getKey(), currentTimeMs)) {
-                        expiredIds.add(entry.getKey());
+                        expiredCandidates.add(new ExpiredCandidate<>(entry.getKey(), entry.getValue(),
+                                idToRecycleTime.get(entry.getKey())));
                     }
                 }
             } finally {
@@ -463,13 +485,14 @@ public class CatalogRecycleBin extends MasterDaemon implements Writable, GsonPos
             }
 
             // 2. erase each expired table one at a time
-            for (Long tableId : expiredIds) {
+            for (ExpiredCandidate<RecycleTableInfo> candidate : expiredCandidates) {
                 writeLock();
                 try {
-                    RecycleTableInfo tableInfo = idToTable.remove(tableId);
-                    if (tableInfo == null) {
+                    long tableId = candidate.id;
+                    if (!isSameGenerationAndExpired(candidate, idToTable, currentTimeMs)) {
                         continue;
                     }
+                    RecycleTableInfo tableInfo = idToTable.remove(tableId);
                     Table table = tableInfo.getTable();
                     if (table.isManagedTable()) {
                         Env.getCurrentEnv().onEraseOlapTable((OlapTable) table, false);
@@ -581,13 +604,14 @@ public class CatalogRecycleBin extends MasterDaemon implements Writable, GsonPos
         int eraseNum = 0;
         StopWatch watch = StopWatch.createStarted();
         try {
-            // 1. collect expired partition IDs under read lock
-            List<Long> expiredIds = new ArrayList<>();
+            // 1. collect expired partition generations under read lock
+            List<ExpiredCandidate<RecyclePartitionInfo>> expiredCandidates = new ArrayList<>();
             readLock();
             try {
                 for (Map.Entry<Long, RecyclePartitionInfo> entry : idToPartition.entrySet()) {
                     if (isExpire(entry.getKey(), currentTimeMs)) {
-                        expiredIds.add(entry.getKey());
+                        expiredCandidates.add(new ExpiredCandidate<>(entry.getKey(), entry.getValue(),
+                                idToRecycleTime.get(entry.getKey())));
                     }
                 }
             } finally {
@@ -595,13 +619,14 @@ public class CatalogRecycleBin extends MasterDaemon implements Writable, GsonPos
             }
 
             // 2. erase each expired partition one at a time (microbatch)
-            for (Long partitionId : expiredIds) {
+            for (ExpiredCandidate<RecyclePartitionInfo> candidate : expiredCandidates) {
                 writeLock();
                 try {
-                    RecyclePartitionInfo partitionInfo = idToPartition.remove(partitionId);
-                    if (partitionInfo == null) {
+                    long partitionId = candidate.id;
+                    if (!isSameGenerationAndExpired(candidate, idToPartition, currentTimeMs)) {
                         continue;
                     }
+                    RecyclePartitionInfo partitionInfo = idToPartition.remove(partitionId);
                     Partition partition = partitionInfo.getPartition();
                     Env.getCurrentEnv().onErasePartition(partition);
                     idToRecycleTime.remove(partitionId);
