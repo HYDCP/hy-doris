@@ -25,6 +25,7 @@ import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.io.Text;
+import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.meta.MetaContext;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.thrift.TStorageMedium;
@@ -58,6 +59,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
 
 public class CatalogRecycleBinTest {
@@ -1128,64 +1130,80 @@ public class CatalogRecycleBinTest {
 
     @Test
     public void testMicrobatchEraseReleasesLockBetweenItems() throws Exception {
-        CatalogRecycleBin recycleBin = Env.getCurrentRecycleBin();
-
-        // Recycle many partitions
-        int numPartitions = 50;
+        CatalogRecycleBin recycleBin = new CatalogRecycleBin();
+        int numPartitions = 3;
         for (int i = 1; i <= numPartitions; i++) {
-            MaterializedIndex index = new MaterializedIndex(6000 + i, IndexState.NORMAL);
-            RandomDistributionInfo dist = new RandomDistributionInfo(1);
-            Partition partition = new Partition(7000 + i, "epart_" + i, index, dist);
-            recycleBin.recyclePartition(
-                    CatalogTestUtil.testDbId1, CatalogTestUtil.testTableId1,
+            Partition partition = new Partition(7000 + i, "epart_" + i,
+                    new MaterializedIndex(6000 + i, IndexState.NORMAL), new RandomDistributionInfo(1));
+            recycleBin.recyclePartition(CatalogTestUtil.testDbId1, CatalogTestUtil.testTableId1,
                     CatalogTestUtil.testTable1, partition, null, null,
-                    new DataProperty(TStorageMedium.HDD), new ReplicaAllocation((short) 3),
-                    false, false);
+                    new DataProperty(TStorageMedium.HDD), new ReplicaAllocation((short) 3), false, false);
+            recycleBin.setRecycleTimeByIdForReplay(7000 + i, 0L);
         }
 
-        // Verify all were recycled
-        Set<Long> dbIds = Sets.newHashSet();
-        Set<Long> tableIds = Sets.newHashSet();
-        Set<Long> partitionIds = Sets.newHashSet();
-        recycleBin.getRecycleIds(dbIds, tableIds, partitionIds);
-        Assert.assertEquals(numPartitions, partitionIds.size());
+        CountDownLatch firstEraseUnlocked = new CountDownLatch(1);
+        CountDownLatch continueErase = new CountDownLatch(1);
+        ReentrantReadWriteLock originalLock = Deencapsulation.getField(recycleBin, "lock");
+        ReentrantReadWriteLock testLock = new ReentrantReadWriteLock() {
+            private final WriteLock writeLock = new WriteLock(this) {
+                @Override
+                public void unlock() {
+                    super.unlock();
+                    if (Thread.currentThread().getName().equals("microbatch-erase")
+                            && firstEraseUnlocked.getCount() != 0) {
+                        firstEraseUnlocked.countDown();
+                        try {
+                            Assert.assertTrue("Timed out waiting to resume erase",
+                                    continueErase.await(30, TimeUnit.SECONDS));
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError(e);
+                        }
+                    }
+                }
+            };
 
-        // Now run erase daemon which should process items one at a time
-        // While erase is running, a concurrent recyclePartition should be able to
-        // proceed between items (not blocked for the entire erase duration)
-        AtomicBoolean recycleCompleted = new AtomicBoolean(false);
-        AtomicBoolean eraseStarted = new AtomicBoolean(false);
-
-        Thread eraseThread = new Thread(() -> {
-            eraseStarted.set(true);
-            recycleBin.runAfterCatalogReady();
-        });
-
-        eraseThread.start();
-
-        // Wait briefly for erase to start, then try to recycle a new partition
-        Thread.sleep(50);
-        if (eraseStarted.get()) {
-            MaterializedIndex newIndex = new MaterializedIndex(8000, IndexState.NORMAL);
-            RandomDistributionInfo newDist = new RandomDistributionInfo(1);
-            Partition newPartition = new Partition(9000, "new_part", newIndex, newDist);
-            recycleBin.recyclePartition(
-                    CatalogTestUtil.testDbId1, CatalogTestUtil.testTableId1,
-                    CatalogTestUtil.testTable1, newPartition, null, null,
-                    new DataProperty(TStorageMedium.HDD), new ReplicaAllocation((short) 3),
-                    false, false);
-            recycleCompleted.set(true);
-        }
-
-        eraseThread.join(60_000);
-        Assert.assertFalse("Erase thread should have finished", eraseThread.isAlive());
-
-        // The new partition should have been recycled successfully
-        if (eraseStarted.get()) {
-            Assert.assertTrue("recyclePartition should succeed during erase",
-                    recycleCompleted.get());
+            @Override
+            public WriteLock writeLock() {
+                return writeLock;
+            }
+        };
+        Deencapsulation.setField(recycleBin, "lock", testLock);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> erase = executor.submit(() -> {
+                Thread.currentThread().setName("microbatch-erase");
+                Deencapsulation.invoke(recycleBin, "erasePartition", System.currentTimeMillis(), -1);
+            });
+            Assert.assertTrue("First erase did not release its lock",
+                    firstEraseUnlocked.await(10, TimeUnit.SECONDS));
+            // Read and write in a separate worker so a retained batch lock fails by timeout.
+            Future<?> recycle = executor.submit(() -> {
+                Set<Long> partitionIds = Sets.newHashSet();
+                recycleBin.getRecycleIds(Sets.newHashSet(), Sets.newHashSet(), partitionIds);
+                Assert.assertEquals("Exactly one expired partition must have been erased",
+                        numPartitions - 1, partitionIds.size());
+                Partition partition = new Partition(9000, "new_part",
+                        new MaterializedIndex(8000, IndexState.NORMAL), new RandomDistributionInfo(1));
+                recycleBin.recyclePartition(CatalogTestUtil.testDbId1, CatalogTestUtil.testTableId1,
+                        CatalogTestUtil.testTable1, partition, null, null,
+                        new DataProperty(TStorageMedium.HDD), new ReplicaAllocation((short) 3), false, false);
+            });
+            recycle.get(10, TimeUnit.SECONDS);
+            Assert.assertFalse("Erase must still be paused", erase.isDone());
+            continueErase.countDown();
+            erase.get(10, TimeUnit.SECONDS);
+            for (int i = 1; i <= numPartitions; i++) {
+                Assert.assertFalse(recycleBin.isRecyclePartition(CatalogTestUtil.testDbId1,
+                        CatalogTestUtil.testTableId1, 7000 + i));
+            }
             Assert.assertTrue(recycleBin.isRecyclePartition(CatalogTestUtil.testDbId1,
                     CatalogTestUtil.testTableId1, 9000));
+        } finally {
+            continueErase.countDown();
+            executor.shutdown();
+            Assert.assertTrue("Workers did not finish", executor.awaitTermination(30, TimeUnit.SECONDS));
+            Deencapsulation.setField(recycleBin, "lock", originalLock);
         }
     }
 }

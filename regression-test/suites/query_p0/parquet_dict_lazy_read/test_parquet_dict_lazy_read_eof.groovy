@@ -15,12 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Covers the parquet lazy-read EOF path with dictionary-encoded predicates:
-// when a predicate on a dictionary-encoded string column filters out all
-// remaining rows, the reader returns an empty batch directly at EOF and the
-// dictionary-coded predicate column must be converted back to plain string
-// columns before the block is reused, otherwise stale dictionary codes leak
-// into later batches and downstream operators.
+// Smoke coverage for Parquet dictionary filtering and decoding.
+// EOF-first lazy-read type restoration is covered by ParquetLazyEofTest in BE UT.
 import org.codehaus.groovy.runtime.IOGroovyMethods
 
 suite("test_parquet_dict_lazy_read_eof", "p0") {
@@ -98,21 +94,19 @@ suite("test_parquet_dict_lazy_read_eof", "p0") {
                 "format" = "parquet")
             """
 
-            // Predicate on the dictionary-encoded column matches nothing:
-            // the reader hits the lazy-read EOF path with all rows filtered.
+            // Dictionary predicate matches nothing (the row group may be pruned).
             def emptyResult = sql "select count(*) from (${tvf}) t where s = 'not_exist'"
             assertEquals(0, emptyResult[0][0])
 
-            // Predicate matches a subset while other columns are lazily read.
+            // Dictionary predicate matches a subset.
             def str1Count = sql "select count(*) from (${tvf}) t where s = 'str_1'"
             assertEquals(srcStr1[0][0], str1Count[0][0])
 
-            // Predicate column is also projected, mixed with lazy columns.
+            // Check another dictionary value.
             def str2Count = sql "select count(*) from (${tvf}) t where s = 'str_2'"
             assertEquals(srcStr2[0][0], str2Count[0][0])
 
-            // Value check after dictionary decoding, with a filter that
-            // passes every row.
+            // Value check after dictionary decoding.
             def sample = sql "select s, count(*) from (${tvf}) t group by s order by s"
             assertEquals(3, sample.size())
             assertEquals("str_0", sample[0][0])

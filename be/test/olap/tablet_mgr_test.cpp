@@ -954,7 +954,7 @@ TEST_F(TabletMgrTest, DeleteShutdownTabletsRoundKeepsFailuresOutOfBudget) {
 TEST_F(TabletMgrTest, SweepShutdownTabletsReloadsBudgetEachRound) {
     // Update the config after the first round and verify the next round observes it.
     std::vector<TabletSharedPtr> tablets;
-    for (int i = 0; i < 201; ++i) {
+    for (int i = 0; i < 601; ++i) {
         tablets.push_back(create_mock_shutdown_tablet());
     }
     reset_shutdown_tablets(tablets);
@@ -971,11 +971,12 @@ TEST_F(TabletMgrTest, SweepShutdownTabletsReloadsBudgetEachRound) {
             },
             [&](int) {
                 ++wait_count;
+                EXPECT_EQ(move_attempts, 200);
                 config::shutdown_tablet_sweep_round_budget = 500;
             });
 
     EXPECT_TRUE(sweep_st.ok());
-    EXPECT_EQ(move_attempts, 201);
+    EXPECT_EQ(move_attempts, 601);
     EXPECT_EQ(wait_count, 1);
     EXPECT_EQ(shutdown_tablet_count(), 0);
 }
