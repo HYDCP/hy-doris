@@ -124,13 +124,30 @@ public class BackupHandler extends MasterDaemon implements Writable {
     private final LocalStagingCleanerDaemon localStagingCleaner =
             new LocalStagingCleanerDaemon("backupLocalStagingCleaner", Config.backup_handler_update_interval_millis);
 
-    // Per-directory mutual exclusion between staging writers (BackupJob.saveMetaInfo) and the
-    // orphan staging deleter, keyed by normalized absolute job dir path. Static so that writers
-    // and deleters always agree on one lock instance per directory regardless of which handler
-    // instance they reach; computeIfAbsent on the ConcurrentHashMap keeps registration atomic.
-    // Entries stay for the process lifetime; their number is bounded by the number of distinct
-    // staging directories ever written or deleted on this FE.
-    private static final Map<Path, ReentrantLock> JOB_DIR_WRITE_LOCKS = new ConcurrentHashMap<>();
+    // Mutual exclusion between staging writers (BackupJob.saveMetaInfo) and the orphan staging
+    // deleter for one job dir. Striped by normalized absolute path instead of keyed by it, so the
+    // lock table has a fixed size: a per-path map would keep one Path and one lock alive for every
+    // staging directory ever written or deleted on this FE. A stripe collision only serializes
+    // unrelated directories for the duration of one staging write or one directory deletion.
+    // Static so that writers and deleters always agree on one lock instance per directory
+    // regardless of which handler instance they reach.
+    private static final int JOB_DIR_WRITE_LOCK_STRIPE_NUM = 64;
+    private static final ReentrantLock[] JOB_DIR_WRITE_LOCKS = new ReentrantLock[JOB_DIR_WRITE_LOCK_STRIPE_NUM];
+
+    static {
+        for (int i = 0; i < JOB_DIR_WRITE_LOCK_STRIPE_NUM; i++) {
+            JOB_DIR_WRITE_LOCKS[i] = new ReentrantLock();
+        }
+    }
+
+    // Staging directories whose writer has not published its job into the managed jobs yet, with
+    // the number of writers holding the reservation. replayAddJob writes the staging dir inside
+    // replayRun() and only publishes the job afterwards, so between the last file write and the
+    // publish the directory is referenced by nothing and its mtime may already be older than the
+    // retention: the orphan deleter also skips the directories reserved here. Entries are removed
+    // once the job is published (or the replay fails), so the map size is bounded by the number of
+    // replays in flight.
+    private static final Map<Path, Integer> UNPUBLISHED_STAGING_DIRS = new ConcurrentHashMap<>();
 
     // this lock is used for handling one backup or restore request at a time.
     private ReentrantLock seqlock = new ReentrantLock();
@@ -911,11 +928,30 @@ public class BackupHandler extends MasterDaemon implements Writable {
     }
 
     /**
-     * Returns the per-directory lock serializing staging writers ({@link BackupJob#saveMetaInfo})
-     * and the orphan staging deleter for one job dir. Callers must unlock it themselves.
+     * Returns the lock serializing staging writers ({@link BackupJob#saveMetaInfo}) and the orphan
+     * staging deleter for one job dir. Callers must unlock it themselves.
      */
-    static ReentrantLock getJobDirWriteLock(Path normalizedJobDir) {
-        return JOB_DIR_WRITE_LOCKS.computeIfAbsent(normalizedJobDir, k -> new ReentrantLock());
+    static ReentrantLock getJobDirWriteLock(Path jobDir) {
+        Path normalizedJobDir = jobDir.toAbsolutePath().normalize();
+        return JOB_DIR_WRITE_LOCKS[Math.floorMod(normalizedJobDir.hashCode(), JOB_DIR_WRITE_LOCK_STRIPE_NUM)];
+    }
+
+    /**
+     * Reserves a staging dir whose job is not published yet, so the orphan deleter keeps it even
+     * when it is unreferenced and its mtime is already expired. Every reservation must be released
+     * by {@link #releaseUnpublishedStagingDir} once the job is published or the write failed.
+     */
+    static void reserveUnpublishedStagingDir(Path jobDir) {
+        UNPUBLISHED_STAGING_DIRS.merge(jobDir.toAbsolutePath().normalize(), 1, Integer::sum);
+    }
+
+    static void releaseUnpublishedStagingDir(Path jobDir) {
+        UNPUBLISHED_STAGING_DIRS.computeIfPresent(jobDir.toAbsolutePath().normalize(),
+                (path, writers) -> writers > 1 ? writers - 1 : null);
+    }
+
+    private static boolean isStagingDirUnpublished(Path normalizedJobDir) {
+        return UNPUBLISHED_STAGING_DIRS.containsKey(normalizedJobDir);
     }
 
     /**
@@ -971,7 +1007,11 @@ public class BackupHandler extends MasterDaemon implements Writable {
                 ReentrantLock jobDirWriteLock = getJobDirWriteLock(normalizedJobDir);
                 jobDirWriteLock.lock();
                 try {
-                    if (isJobDirReferenced(normalizedJobDir)
+                    // Check the reservation before the references: a writer drops its reservation
+                    // only after publishing, so an absent reservation means the reference re-check
+                    // below already sees that writer's job.
+                    if (isStagingDirUnpublished(normalizedJobDir)
+                            || isJobDirReferenced(normalizedJobDir)
                             || Files.getLastModifiedTime(normalizedJobDir, LinkOption.NOFOLLOW_LINKS).toMillis()
                                     > orphanExpireBeforeMs) {
                         continue;
@@ -1246,6 +1286,26 @@ public class BackupHandler extends MasterDaemon implements Writable {
     }
 
     public void replayAddJob(AbstractJob job) {
+        // A replayed backup job writes its staging dir inside replayRun(), but only becomes
+        // visible to the orphan staging deleter once addBackupOrRestoreJob() publishes it below.
+        // The per-dir write lock taken by the writer covers the file writes only, and the dir
+        // mtime stops being refreshed once the last file is created, so a long write plus the
+        // write-to-publish gap can leave an expired, unreferenced dir for the deleter to remove.
+        // Reserve the dir across both, and release it only after the job is published.
+        Path stagingDir = job instanceof BackupJob ? ((BackupJob) job).getLocalStagingDirPath() : null;
+        if (stagingDir != null) {
+            reserveUnpublishedStagingDir(stagingDir);
+        }
+        try {
+            replayAddJobInternal(job);
+        } finally {
+            if (stagingDir != null) {
+                releaseUnpublishedStagingDir(stagingDir);
+            }
+        }
+    }
+
+    private void replayAddJobInternal(AbstractJob job) {
         LOG.info("replay backup/restore job: {}", job);
 
         if (job.isCancelled()) {

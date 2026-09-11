@@ -78,6 +78,7 @@ import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -1074,6 +1075,71 @@ public class BackupJobTest {
         cleanerThread.join(10000);
         Assert.assertFalse(cleanerThread.isAlive());
         Assert.assertFalse(writerDir.exists());
+    }
+
+    @Test
+    public void testReplayAddJobKeepsStagingDirUntilJobPublished() throws Exception {
+        long nowMs = System.currentTimeMillis();
+
+        // a replay is in progress on this FE: the current job of the db is not done yet
+        BackupJob existingJob = new BackupJob("replay_gap_existing", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL, env, repoId, 0);
+        Deencapsulation.invoke(backupHandler, "addBackupOrRestoreJob", dbId, existingJob);
+
+        BackupJob replayedJob = new BackupJob("replay_gap_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL, env, repoId, 0);
+        Deencapsulation.setField(replayedJob, "state", BackupJobState.FINISHED);
+        Path stagingDir = replayedJob.getLocalStagingDirPath();
+        Files.createDirectories(stagingDir);
+        // a slow meta write leaves the dir mtime older than the (clamped) retention: creating the
+        // last file refreshes the dir mtime, writing its content does not
+        Files.setLastModifiedTime(stagingDir, FileTime.fromMillis(nowMs - TimeUnit.DAYS.toMillis(3)));
+
+        new MockUp<BackupJob>() {
+            @Mock
+            public void replayRun() {
+                // stands in for the real writer: the staging dir is fully written and its write
+                // lock is released, but replayAddJob has not published the job yet. This is the
+                // production order, replayRun() returns before addBackupOrRestoreJob() runs.
+                Deencapsulation.invoke(backupHandler, "cleanupOrphanBackupJobLocalJobDirs", nowMs);
+            }
+        };
+
+        backupHandler.replayAddJob(replayedJob);
+
+        Assert.assertTrue("expired staging dir was deleted in the write-to-publish window",
+                Files.exists(stagingDir));
+        Map<?, ?> unpublishedStagingDirs = (Map<?, ?>) getBackupHandlerStaticField("UNPUBLISHED_STAGING_DIRS");
+        // the reservation is released once the job is published, so the map stays bounded by the
+        // number of replays in flight
+        Assert.assertFalse(unpublishedStagingDirs.containsKey(stagingDir.toAbsolutePath().normalize()));
+    }
+
+    @Test
+    public void testJobDirWriteLocksAreStriped() throws Exception {
+        int stripeNum = (int) getBackupHandlerStaticField("JOB_DIR_WRITE_LOCK_STRIPE_NUM");
+        IdentityHashMap<ReentrantLock, Boolean> distinctLocks = new IdentityHashMap<>();
+        Path firstJobDir = null;
+        for (int i = 0; i < 10000; i++) {
+            Path jobDir = BackupHandler.BACKUP_ROOT_DIR.resolve("repo__" + repoId)
+                    .resolve("striped_label_" + i + "__2026-09-11-10-00-00");
+            if (firstJobDir == null) {
+                firstJobDir = jobDir;
+            }
+            distinctLocks.put(BackupHandler.getJobDirWriteLock(jobDir), Boolean.TRUE);
+        }
+        // the lock table has a fixed size, it does not retain one lock per staging dir ever seen
+        Assert.assertTrue(distinctLocks.size() <= stripeNum);
+        // and writers and deleters still agree on one lock per directory, however the path is spelled
+        Assert.assertSame(BackupHandler.getJobDirWriteLock(firstJobDir),
+                BackupHandler.getJobDirWriteLock(firstJobDir.toAbsolutePath().normalize()));
+    }
+
+    // Deencapsulation.getField(Class, String) rejects a null target, so read static fields directly
+    private static Object getBackupHandlerStaticField(String fieldName) throws Exception {
+        Field field = BackupHandler.class.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.get(null);
     }
 
     private void waitForCleanerQueuedOn(ReentrantLock writeLock) throws InterruptedException {
