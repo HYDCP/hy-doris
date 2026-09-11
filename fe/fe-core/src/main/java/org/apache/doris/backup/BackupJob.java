@@ -81,6 +81,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
@@ -944,6 +945,12 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         localJobDirPath = Paths.get(BackupHandler.BACKUP_ROOT_DIR.toString(),
                                     "repo__" + repoId, label + "__" + createTimeStr).normalize();
 
+        // Serialize with the orphan staging deleter: replayAddJob writes this directory before
+        // the job is published into the managed jobs, so only this lock keeps an in-progress
+        // write from being deleted as an orphan.
+        ReentrantLock jobDirWriteLock =
+                BackupHandler.getJobDirWriteLock(localJobDirPath.toAbsolutePath().normalize());
+        jobDirWriteLock.lock();
         try {
             // 1. create local job dir of this backup job
             File jobDir = new File(localJobDirPath.toString());
@@ -1011,6 +1018,8 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         } catch (Exception e) {
             status = new Status(ErrCode.COMMON_ERROR, "failed to save meta info and job info file: " + e.getMessage());
             return;
+        } finally {
+            jobDirWriteLock.unlock();
         }
 
         if (replay) {

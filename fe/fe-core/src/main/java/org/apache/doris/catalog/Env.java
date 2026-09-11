@@ -1993,6 +1993,10 @@ public class Env {
         workloadRuntimeStatusMgr.start();
         admissionControl.start();
         splitSourceManager.start();
+
+        // backup local staging cleaner, needed on every FE because journal replay on
+        // non-master FEs also writes staging dirs and fills the pending cleanup queue
+        getBackupHandler().startLocalStagingCleaner();
     }
 
     private void transferToNonMaster(FrontendNodeType newType) {
