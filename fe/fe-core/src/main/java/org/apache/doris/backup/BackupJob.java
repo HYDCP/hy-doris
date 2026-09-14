@@ -81,6 +81,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
@@ -936,14 +937,36 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         }
     }
 
-    private void saveMetaInfo(boolean replay) {
+    /**
+     * The local staging dir this job writes in saveMetaInfo(). Derived from repo id, label and
+     * create time, so callers can resolve it before the directory exists and before
+     * localJobDirPath is set, and protect the directory across the whole write.
+     */
+    public Path getLocalStagingDirPath() {
         String createTimeStr = TimeUtils.longToTimeString(createTime,
                 TimeUtils.getDatetimeFormatWithHyphenWithTimeZone());
         // local job dir: backup/repo__repo_id/label__createtime/
         // Add repo_id to isolate jobs from different repos.
-        localJobDirPath = Paths.get(BackupHandler.BACKUP_ROOT_DIR.toString(),
-                                    "repo__" + repoId, label + "__" + createTimeStr).normalize();
+        return Paths.get(BackupHandler.BACKUP_ROOT_DIR.toString(),
+                         "repo__" + repoId, label + "__" + createTimeStr).normalize();
+    }
 
+    private void saveMetaInfo(boolean replay) {
+        String createTimeStr = TimeUtils.longToTimeString(createTime,
+                TimeUtils.getDatetimeFormatWithHyphenWithTimeZone());
+        // Keep a local copy: the reservation and the lock must be released with the same path
+        // even if localJobDirPath is cleared meanwhile.
+        Path jobDirPath = getLocalStagingDirPath();
+        localJobDirPath = jobDirPath;
+
+        // Keep the orphan staging deleter away from this directory for the whole write: the
+        // write lock serializes the file operations, and the reservation both covers the moment
+        // before the lock is taken and hands the localJobDirPath assignment above to the deleter,
+        // which checks the reservation before deleting. On the replay path this reservation nests
+        // inside the one replayAddJob holds until the job is published.
+        BackupHandler.reserveUnpublishedStagingDir(jobDirPath);
+        ReentrantLock jobDirWriteLock = BackupHandler.getJobDirWriteLock(jobDirPath);
+        jobDirWriteLock.lock();
         try {
             // 1. create local job dir of this backup job
             File jobDir = new File(localJobDirPath.toString());
@@ -1011,6 +1034,9 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         } catch (Exception e) {
             status = new Status(ErrCode.COMMON_ERROR, "failed to save meta info and job info file: " + e.getMessage());
             return;
+        } finally {
+            jobDirWriteLock.unlock();
+            BackupHandler.releaseUnpublishedStagingDir(jobDirPath);
         }
 
         if (replay) {

@@ -78,10 +78,12 @@ import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class BackupJobTest {
 
@@ -929,6 +931,223 @@ public class BackupJobTest {
         } finally {
             Config.backup_orphan_dir_cleanup_interval_second = oldCleanupIntervalSecond;
         }
+    }
+
+    @Test
+    public void testLocalStagingCleanerCleansTerminalAndOrphanDirs() throws Exception {
+        Deencapsulation.setField(backupHandler, "isInit", true);
+        long nowMs = System.currentTimeMillis();
+
+        // terminal remote job whose staging dir also exists on a follower after journal replay
+        BackupJob finishedJob = new BackupJob("cleaner_finished", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL, env, repoId, 0);
+        File finishedDir = createLocalJobDir("cleaner_finished");
+        File metaInfo = new File(finishedDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(finishedDir, Repository.PREFIX_JOB_INFO + "2026-09-10-10-00-00");
+        Assert.assertTrue(metaInfo.createNewFile());
+        Assert.assertTrue(jobInfo.createNewFile());
+        Deencapsulation.setField(finishedJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(finishedJob, "localJobDirPath", null);
+        Deencapsulation.setField(finishedJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(finishedJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+        Deencapsulation.invoke(backupHandler, "addBackupOrRestoreJob", dbId, finishedJob);
+
+        // evicted terminal job sitting in the pending cleanup queue
+        BackupJob pendingJob = new BackupJob("cleaner_pending", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL, env, repoId, 0);
+        File pendingDir = createLocalJobDir("cleaner_pending");
+        Deencapsulation.setField(pendingJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(pendingJob, "localJobDirPath", pendingDir.toPath());
+        Deque<BackupJob> pendingCleanupJobs = Deencapsulation.getField(backupHandler, "pendingCleanupJobs");
+        pendingCleanupJobs.add(pendingJob);
+
+        File orphanDir = createRepoJobDir(repoId, "cleaner_orphan");
+        Files.setLastModifiedTime(orphanDir.toPath(), FileTime.fromMillis(nowMs - TimeUnit.DAYS.toMillis(3)));
+
+        Object cleaner = Deencapsulation.getField(backupHandler, "localStagingCleaner");
+        Deencapsulation.invoke(cleaner, "runAfterCatalogReady");
+
+        Assert.assertFalse(finishedDir.exists());
+        Assert.assertFalse(pendingDir.exists());
+        Assert.assertFalse(orphanDir.exists());
+        Assert.assertTrue(pendingCleanupJobs.isEmpty());
+    }
+
+    @Test
+    public void testRunAfterCatalogReadyDoesNotCleanStagingDirs() throws Exception {
+        Deencapsulation.setField(backupHandler, "isInit", true);
+
+        BackupJob finishedJob = new BackupJob("master_no_cleanup", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL, env, repoId, 0);
+        File finishedDir = createLocalJobDir("master_no_cleanup");
+        Deencapsulation.setField(finishedJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(finishedJob, "localJobDirPath", finishedDir.toPath());
+        Deencapsulation.invoke(backupHandler, "addBackupOrRestoreJob", dbId, finishedJob);
+
+        // the backup handler daemon only advances jobs now; staging cleanup has moved to the
+        // local staging cleaner daemon which runs on every serving FE
+        backupHandler.runAfterCatalogReady();
+        Assert.assertTrue(finishedDir.exists());
+
+        Object cleaner = Deencapsulation.getField(backupHandler, "localStagingCleaner");
+        Deencapsulation.invoke(cleaner, "runAfterCatalogReady");
+        Assert.assertFalse(finishedDir.exists());
+    }
+
+    @Test
+    public void testOrphanCleanupClampsTooSmallKeepMaxSecond() throws Exception {
+        int oldOrphanKeepSecond = Config.backup_orphan_dir_keep_max_second;
+        Config.backup_orphan_dir_keep_max_second = 1;
+        try {
+            long nowMs = System.currentTimeMillis();
+            File recentOrphanDir = createRepoJobDir(repoId, "clamp_recent_orphan");
+            Files.setLastModifiedTime(recentOrphanDir.toPath(),
+                    FileTime.fromMillis(nowMs - TimeUnit.SECONDS.toMillis(5)));
+
+            Deencapsulation.invoke(backupHandler, "cleanupOrphanBackupJobLocalJobDirs", nowMs);
+            // without the clamp a 1s retention would delete a 5s-old directory that may still be
+            // written by concurrent replay
+            Assert.assertTrue(recentOrphanDir.exists());
+            Assert.assertTrue(Deencapsulation.getField(backupHandler, "orphanDirKeepMaxClampWarned"));
+
+            Files.setLastModifiedTime(recentOrphanDir.toPath(),
+                    FileTime.fromMillis(nowMs - TimeUnit.SECONDS.toMillis(400)));
+            Deencapsulation.invoke(backupHandler, "cleanupOrphanBackupJobLocalJobDirs", nowMs);
+            Assert.assertFalse(recentOrphanDir.exists());
+        } finally {
+            Config.backup_orphan_dir_keep_max_second = oldOrphanKeepSecond;
+        }
+    }
+
+    @Test
+    public void testOrphanCleanupSkipsDirRevalidatedAsReferenced() throws Exception {
+        long nowMs = System.currentTimeMillis();
+        File writerDir = createRepoJobDir(repoId, "writer_pinned_orphan");
+        Files.setLastModifiedTime(writerDir.toPath(), FileTime.fromMillis(nowMs - TimeUnit.DAYS.toMillis(3)));
+        Path normalizedDir = writerDir.toPath().toAbsolutePath().normalize();
+
+        // simulate a replay writer holding the dir write lock while building the staging dir
+        ReentrantLock writeLock = BackupHandler.getJobDirWriteLock(normalizedDir);
+        writeLock.lock();
+        Thread cleanerThread = new Thread(
+                () -> Deencapsulation.invoke(backupHandler, "cleanupOrphanBackupJobLocalJobDirs", nowMs));
+        try {
+            cleanerThread.start();
+            waitForCleanerQueuedOn(writeLock);
+            Assert.assertTrue(writerDir.exists());
+
+            // the writer finishes and the replayed job is published, referencing the dir. The
+            // orphan scan already snapshotted its references before this, so only the
+            // revalidation under the write lock can save the dir.
+            BackupJob replayedJob = new BackupJob("writer_pinned_label", dbId, UnitTestUtil.DB_NAME,
+                    Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL, env, repoId, 0);
+            Deencapsulation.setField(replayedJob, "state", BackupJobState.FINISHED);
+            Deencapsulation.setField(replayedJob, "localJobDirPath", normalizedDir);
+            Deencapsulation.invoke(backupHandler, "addBackupOrRestoreJob", dbId, replayedJob);
+        } finally {
+            writeLock.unlock();
+        }
+        cleanerThread.join(10000);
+        Assert.assertFalse(cleanerThread.isAlive());
+        Assert.assertTrue(writerDir.exists());
+    }
+
+    @Test
+    public void testOrphanCleanupDeletesDirAfterWriterReleases() throws Exception {
+        long nowMs = System.currentTimeMillis();
+        File writerDir = createRepoJobDir(repoId, "writer_released_orphan");
+        Files.setLastModifiedTime(writerDir.toPath(), FileTime.fromMillis(nowMs - TimeUnit.DAYS.toMillis(3)));
+        Path normalizedDir = writerDir.toPath().toAbsolutePath().normalize();
+
+        ReentrantLock writeLock = BackupHandler.getJobDirWriteLock(normalizedDir);
+        writeLock.lock();
+        Thread cleanerThread = new Thread(
+                () -> Deencapsulation.invoke(backupHandler, "cleanupOrphanBackupJobLocalJobDirs", nowMs));
+        try {
+            cleanerThread.start();
+            waitForCleanerQueuedOn(writeLock);
+            Assert.assertTrue(writerDir.exists());
+        } finally {
+            writeLock.unlock();
+        }
+        // no job ever references the dir: once the writer releases, the revalidation under the
+        // write lock still sees an unreferenced, expired dir and deletes it
+        cleanerThread.join(10000);
+        Assert.assertFalse(cleanerThread.isAlive());
+        Assert.assertFalse(writerDir.exists());
+    }
+
+    @Test
+    public void testReplayAddJobKeepsStagingDirUntilJobPublished() throws Exception {
+        long nowMs = System.currentTimeMillis();
+
+        // a replay is in progress on this FE: the current job of the db is not done yet
+        BackupJob existingJob = new BackupJob("replay_gap_existing", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL, env, repoId, 0);
+        Deencapsulation.invoke(backupHandler, "addBackupOrRestoreJob", dbId, existingJob);
+
+        BackupJob replayedJob = new BackupJob("replay_gap_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL, env, repoId, 0);
+        Deencapsulation.setField(replayedJob, "state", BackupJobState.FINISHED);
+        Path stagingDir = replayedJob.getLocalStagingDirPath();
+        Files.createDirectories(stagingDir);
+        // a slow meta write leaves the dir mtime older than the (clamped) retention: creating the
+        // last file refreshes the dir mtime, writing its content does not
+        Files.setLastModifiedTime(stagingDir, FileTime.fromMillis(nowMs - TimeUnit.DAYS.toMillis(3)));
+
+        new MockUp<BackupJob>() {
+            @Mock
+            public void replayRun() {
+                // stands in for the real writer: the staging dir is fully written and its write
+                // lock is released, but replayAddJob has not published the job yet. This is the
+                // production order, replayRun() returns before addBackupOrRestoreJob() runs.
+                Deencapsulation.invoke(backupHandler, "cleanupOrphanBackupJobLocalJobDirs", nowMs);
+            }
+        };
+
+        backupHandler.replayAddJob(replayedJob);
+
+        Assert.assertTrue("expired staging dir was deleted in the write-to-publish window",
+                Files.exists(stagingDir));
+        Map<?, ?> unpublishedStagingDirs = (Map<?, ?>) getBackupHandlerStaticField("UNPUBLISHED_STAGING_DIRS");
+        // the reservation is released once the job is published, so the map stays bounded by the
+        // number of replays in flight
+        Assert.assertFalse(unpublishedStagingDirs.containsKey(stagingDir.toAbsolutePath().normalize()));
+    }
+
+    @Test
+    public void testJobDirWriteLocksAreStriped() throws Exception {
+        int stripeNum = (int) getBackupHandlerStaticField("JOB_DIR_WRITE_LOCK_STRIPE_NUM");
+        IdentityHashMap<ReentrantLock, Boolean> distinctLocks = new IdentityHashMap<>();
+        Path firstJobDir = null;
+        for (int i = 0; i < 10000; i++) {
+            Path jobDir = BackupHandler.BACKUP_ROOT_DIR.resolve("repo__" + repoId)
+                    .resolve("striped_label_" + i + "__2026-09-11-10-00-00");
+            if (firstJobDir == null) {
+                firstJobDir = jobDir;
+            }
+            distinctLocks.put(BackupHandler.getJobDirWriteLock(jobDir), Boolean.TRUE);
+        }
+        // the lock table has a fixed size, it does not retain one lock per staging dir ever seen
+        Assert.assertTrue(distinctLocks.size() <= stripeNum);
+        // and writers and deleters still agree on one lock per directory, however the path is spelled
+        Assert.assertSame(BackupHandler.getJobDirWriteLock(firstJobDir),
+                BackupHandler.getJobDirWriteLock(firstJobDir.toAbsolutePath().normalize()));
+    }
+
+    // Deencapsulation.getField(Class, String) rejects a null target, so read static fields directly
+    private static Object getBackupHandlerStaticField(String fieldName) throws Exception {
+        Field field = BackupHandler.class.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.get(null);
+    }
+
+    private void waitForCleanerQueuedOn(ReentrantLock writeLock) throws InterruptedException {
+        long deadlineMs = System.currentTimeMillis() + 10000;
+        while (!writeLock.hasQueuedThreads() && System.currentTimeMillis() < deadlineMs) {
+            Thread.sleep(10);
+        }
+        Assert.assertTrue("cleaner did not block on the dir write lock", writeLock.hasQueuedThreads());
     }
 
     /**

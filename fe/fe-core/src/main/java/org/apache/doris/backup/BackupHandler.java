@@ -83,6 +83,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -97,6 +98,9 @@ public class BackupHandler extends MasterDaemon implements Writable {
     public static final int SIGNATURE_VERSION = 1;
     public static final Path BACKUP_ROOT_DIR = Paths.get(Config.tmp_dir, "backup").normalize();
     public static final Path RESTORE_ROOT_DIR = Paths.get(Config.tmp_dir, "restore").normalize();
+    // Effective orphan staging retention is never allowed below this value, see
+    // cleanupOrphanBackupJobLocalJobDirs.
+    private static final long MIN_ORPHAN_DIR_KEEP_MAX_SECOND = 300;
     private RepositoryMgr repoMgr = new RepositoryMgr();
 
     // this lock is used for updating dbIdToBackupOrRestoreJobs
@@ -110,8 +114,40 @@ public class BackupHandler extends MasterDaemon implements Writable {
     // Evicted terminal jobs remain here until their staging directories are cleaned.
     // Protected by jobLock and not persisted.
     private final Deque<BackupJob> pendingCleanupJobs = new LinkedList<>();
-    // Accessed only by the backup handler daemon thread.
+    // Accessed only by the local staging cleaner daemon thread.
     private long lastOrphanJobDirCleanupTimeMs = 0;
+    // Set once the retention clamp below has been logged, to avoid log spam.
+    // Accessed only by the local staging cleaner daemon thread.
+    private boolean orphanDirKeepMaxClampWarned = false;
+
+    // Runs local staging cleanup on every serving FE; started from Env.startNonMasterDaemonThreads().
+    private final LocalStagingCleanerDaemon localStagingCleaner =
+            new LocalStagingCleanerDaemon("backupLocalStagingCleaner", Config.backup_handler_update_interval_millis);
+
+    // Mutual exclusion between staging writers (BackupJob.saveMetaInfo) and the orphan staging
+    // deleter for one job dir. Striped by normalized absolute path instead of keyed by it, so the
+    // lock table has a fixed size: a per-path map would keep one Path and one lock alive for every
+    // staging directory ever written or deleted on this FE. A stripe collision only serializes
+    // unrelated directories for the duration of one staging write or one directory deletion.
+    // Static so that writers and deleters always agree on one lock instance per directory
+    // regardless of which handler instance they reach.
+    private static final int JOB_DIR_WRITE_LOCK_STRIPE_NUM = 64;
+    private static final ReentrantLock[] JOB_DIR_WRITE_LOCKS = new ReentrantLock[JOB_DIR_WRITE_LOCK_STRIPE_NUM];
+
+    static {
+        for (int i = 0; i < JOB_DIR_WRITE_LOCK_STRIPE_NUM; i++) {
+            JOB_DIR_WRITE_LOCKS[i] = new ReentrantLock();
+        }
+    }
+
+    // Staging directories whose writer has not published its job into the managed jobs yet, with
+    // the number of writers holding the reservation. replayAddJob writes the staging dir inside
+    // replayRun() and only publishes the job afterwards, so between the last file write and the
+    // publish the directory is referenced by nothing and its mtime may already be older than the
+    // retention: the orphan deleter also skips the directories reserved here. Entries are removed
+    // once the job is published (or the replay fails), so the map size is bounded by the number of
+    // replays in flight.
+    private static final Map<Path, Integer> UNPUBLISHED_STAGING_DIRS = new ConcurrentHashMap<>();
 
     // this lock is used for handling one backup or restore request at a time.
     private ReentrantLock seqlock = new ReentrantLock();
@@ -211,13 +247,37 @@ public class BackupHandler extends MasterDaemon implements Writable {
             job.setEnv(env);
             job.run();
         }
-        long nowMs = System.currentTimeMillis();
-        long cleanupStartNanos = System.nanoTime();
-        CleanupStats currentJobStats = cleanupBackupJobLocalJobDirs(nowMs);
-        CleanupStats pendingJobStats = cleanupPendingBackupJobLocalJobDirs();
-        CleanupStats orphanStats = cleanupOrphanBackupJobLocalJobDirsIfNecessary(nowMs);
-        long cleanupElapsedMs = elapsedMillis(cleanupStartNanos);
-        logCleanupStats(currentJobStats, pendingJobStats, orphanStats, cleanupElapsedMs);
+    }
+
+    /**
+     * Local staging cleanup must run on every serving FE (master/follower/observer): replaying
+     * backup journals on non-master FEs also writes staging files and fills pendingCleanupJobs,
+     * while the backup handler daemon only runs on the master. Unlike the backup handler daemon,
+     * this daemon never advances jobs or touches repositories, so it needs no master role.
+     */
+    private class LocalStagingCleanerDaemon extends MasterDaemon {
+        LocalStagingCleanerDaemon(String name, long intervalMs) {
+            super(name, intervalMs);
+        }
+
+        @Override
+        protected void runAfterCatalogReady() {
+            if (!isInit) {
+                if (!init()) {
+                    return;
+                }
+            }
+            long nowMs = System.currentTimeMillis();
+            long cleanupStartNanos = System.nanoTime();
+            CleanupStats currentJobStats = cleanupBackupJobLocalJobDirs(nowMs);
+            CleanupStats pendingJobStats = cleanupPendingBackupJobLocalJobDirs();
+            CleanupStats orphanStats = cleanupOrphanBackupJobLocalJobDirsIfNecessary(nowMs);
+            logCleanupStats(currentJobStats, pendingJobStats, orphanStats, elapsedMillis(cleanupStartNanos));
+        }
+    }
+
+    public synchronized void startLocalStagingCleaner() {
+        localStagingCleaner.start();
     }
 
     // handle create repository stmt
@@ -809,9 +869,22 @@ public class BackupHandler extends MasterDaemon implements Writable {
             return stats;
         }
 
+        // replayAddJob writes the staging directory before the job enters the referenced set, so a
+        // directory being written by concurrent replay is protected only by its mtime. Clamp the
+        // retention to keep that window safe even under an extreme configured retention.
+        long orphanKeepMaxSecond = Config.backup_orphan_dir_keep_max_second;
+        if (orphanKeepMaxSecond < MIN_ORPHAN_DIR_KEEP_MAX_SECOND) {
+            if (!orphanDirKeepMaxClampWarned) {
+                LOG.warn("backup_orphan_dir_keep_max_second={} is below {}s, clamping to protect staging "
+                        + "directories being written by concurrent replay",
+                        orphanKeepMaxSecond, MIN_ORPHAN_DIR_KEEP_MAX_SECOND);
+                orphanDirKeepMaxClampWarned = true;
+            }
+            orphanKeepMaxSecond = MIN_ORPHAN_DIR_KEEP_MAX_SECOND;
+        }
+
         Set<Path> referencedJobDirs = getReferencedBackupJobDirs(backupRootDir);
-        long orphanExpireBeforeMs = nowMs
-                - TimeUnit.SECONDS.toMillis(Config.backup_orphan_dir_keep_max_second);
+        long orphanExpireBeforeMs = nowMs - TimeUnit.SECONDS.toMillis(orphanKeepMaxSecond);
         try {
             for (Path repoDir : listChildDirectories(backupRootDir)) {
                 if (!repoDir.getFileName().toString().startsWith("repo__")) {
@@ -854,6 +927,59 @@ public class BackupHandler extends MasterDaemon implements Writable {
         return referencedJobDirs;
     }
 
+    /**
+     * Returns the lock serializing staging writers ({@link BackupJob#saveMetaInfo}) and the orphan
+     * staging deleter for one job dir. Callers must unlock it themselves.
+     */
+    static ReentrantLock getJobDirWriteLock(Path jobDir) {
+        Path normalizedJobDir = jobDir.toAbsolutePath().normalize();
+        return JOB_DIR_WRITE_LOCKS[Math.floorMod(normalizedJobDir.hashCode(), JOB_DIR_WRITE_LOCK_STRIPE_NUM)];
+    }
+
+    /**
+     * Reserves a staging dir whose job is not published yet, so the orphan deleter keeps it even
+     * when it is unreferenced and its mtime is already expired. Every reservation must be released
+     * by {@link #releaseUnpublishedStagingDir} once the job is published or the write failed.
+     */
+    static void reserveUnpublishedStagingDir(Path jobDir) {
+        UNPUBLISHED_STAGING_DIRS.merge(jobDir.toAbsolutePath().normalize(), 1, Integer::sum);
+    }
+
+    static void releaseUnpublishedStagingDir(Path jobDir) {
+        UNPUBLISHED_STAGING_DIRS.computeIfPresent(jobDir.toAbsolutePath().normalize(),
+                (path, writers) -> writers > 1 ? writers - 1 : null);
+    }
+
+    private static boolean isStagingDirUnpublished(Path normalizedJobDir) {
+        return UNPUBLISHED_STAGING_DIRS.containsKey(normalizedJobDir);
+    }
+
+    /**
+     * Re-checks whether any current, history or pending-cleanup job references the job dir.
+     * Used by the orphan deleter to revalidate candidates selected from a stale snapshot.
+     */
+    private boolean isJobDirReferenced(Path normalizedJobDir) {
+        jobLock.lock();
+        try {
+            for (Deque<AbstractJob> jobs : dbIdToBackupOrRestoreJobs.values()) {
+                for (AbstractJob job : jobs) {
+                    if (job instanceof BackupJob
+                            && normalizedJobDir.equals(((BackupJob) job).getLocalJobDirPath())) {
+                        return true;
+                    }
+                }
+            }
+            for (BackupJob pendingJob : pendingCleanupJobs) {
+                if (normalizedJobDir.equals(pendingJob.getLocalJobDirPath())) {
+                    return true;
+                }
+            }
+            return false;
+        } finally {
+            jobLock.unlock();
+        }
+    }
+
     private void cleanupOrphanJobDirsInRepo(Path repoDir, Set<Path> referencedJobDirs,
                                             long orphanExpireBeforeMs, CleanupStats stats) {
         List<Path> jobDirs;
@@ -875,7 +1001,25 @@ public class BackupHandler extends MasterDaemon implements Writable {
                                 > orphanExpireBeforeMs) {
                     continue;
                 }
-                BackupJob.deleteLocalJobDirRecursively(normalizedJobDir);
+                // Serialize with a staging writer that may be building this directory right now
+                // (replayAddJob writes the staging dir before the job is published), then
+                // revalidate the deletion conditions under the same mutual exclusion.
+                ReentrantLock jobDirWriteLock = getJobDirWriteLock(normalizedJobDir);
+                jobDirWriteLock.lock();
+                try {
+                    // Check the reservation before the references: a writer drops its reservation
+                    // only after publishing, so an absent reservation means the reference re-check
+                    // below already sees that writer's job.
+                    if (isStagingDirUnpublished(normalizedJobDir)
+                            || isJobDirReferenced(normalizedJobDir)
+                            || Files.getLastModifiedTime(normalizedJobDir, LinkOption.NOFOLLOW_LINKS).toMillis()
+                                    > orphanExpireBeforeMs) {
+                        continue;
+                    }
+                    BackupJob.deleteLocalJobDirRecursively(normalizedJobDir);
+                } finally {
+                    jobDirWriteLock.unlock();
+                }
                 stats.directoriesCleaned++;
                 LOG.info("cleaned orphan backup job dir: {}, elapsed_ms={}", normalizedJobDir,
                         elapsedMillis(cleanupStartNanos));
@@ -1142,6 +1286,26 @@ public class BackupHandler extends MasterDaemon implements Writable {
     }
 
     public void replayAddJob(AbstractJob job) {
+        // A replayed backup job writes its staging dir inside replayRun(), but only becomes
+        // visible to the orphan staging deleter once addBackupOrRestoreJob() publishes it below.
+        // The per-dir write lock taken by the writer covers the file writes only, and the dir
+        // mtime stops being refreshed once the last file is created, so a long write plus the
+        // write-to-publish gap can leave an expired, unreferenced dir for the deleter to remove.
+        // Reserve the dir across both, and release it only after the job is published.
+        Path stagingDir = job instanceof BackupJob ? ((BackupJob) job).getLocalStagingDirPath() : null;
+        if (stagingDir != null) {
+            reserveUnpublishedStagingDir(stagingDir);
+        }
+        try {
+            replayAddJobInternal(job);
+        } finally {
+            if (stagingDir != null) {
+                releaseUnpublishedStagingDir(stagingDir);
+            }
+        }
+    }
+
+    private void replayAddJobInternal(AbstractJob job) {
         LOG.info("replay backup/restore job: {}", job);
 
         if (job.isCancelled()) {
