@@ -215,6 +215,18 @@ public class DBBinlog {
         return dbId;
     }
 
+    public void updateTableBinlogConfig(long tableId, BinlogConfig binlogConfig) {
+        lock.writeLock().lock();
+        try {
+            TableBinlog tableBinlog = tableBinlogMap.get(tableId);
+            if (tableBinlog != null) {
+                tableBinlog.updateBinlogConfig(binlogConfig);
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
     public Pair<TStatus, List<TBinlog>> getBinlog(long tableId, long prevCommitSeq, long numAcquired) {
         TStatus status = new TStatus(TStatusCode.OK);
         lock.readLock().lock();
