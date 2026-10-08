@@ -928,6 +928,7 @@ under the License.
                     <useFile>false</useFile>
                     <argLine>
                         -Xmx1024m -javaagent:${settings.localRepository}/org/jmockit/jmockit/${jmockit.version}/jmockit-${jmockit.version}.jar @{argLine}
+                        --add-opens=java.base/java.nio=ALL-UNNAMED
                     </argLine>
                 </configuration>
             </plugin>
