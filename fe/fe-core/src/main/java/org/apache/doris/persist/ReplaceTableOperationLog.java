@@ -17,6 +17,7 @@
 
 package org.apache.doris.persist;
 
+import org.apache.doris.catalog.BinlogConfig;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.persist.gson.GsonUtils;
@@ -40,16 +41,25 @@ public class ReplaceTableOperationLog implements Writable {
     private String newTblName;
     @SerializedName(value = "swapTable")
     private boolean swapTable;
+    @SerializedName(value = "origTblBinlogConfig")
+    private BinlogConfig origTblBinlogConfig;
 
     public ReplaceTableOperationLog(long dbId, long origTblId,
             String origTblName, long newTblId, String newTblName,
             boolean swapTable) {
+        this(dbId, origTblId, origTblName, newTblId, newTblName, swapTable, null);
+    }
+
+    public ReplaceTableOperationLog(long dbId, long origTblId,
+            String origTblName, long newTblId, String newTblName,
+            boolean swapTable, BinlogConfig origTblBinlogConfig) {
         this.dbId = dbId;
         this.origTblId = origTblId;
         this.origTblName = origTblName;
         this.newTblId = newTblId;
         this.newTblName = newTblName;
         this.swapTable = swapTable;
+        this.origTblBinlogConfig = origTblBinlogConfig == null ? null : new BinlogConfig(origTblBinlogConfig);
     }
 
     public long getDbId() {
@@ -74,6 +84,10 @@ public class ReplaceTableOperationLog implements Writable {
 
     public boolean isSwapTable() {
         return swapTable;
+    }
+
+    public BinlogConfig getOrigTblBinlogConfig() {
+        return origTblBinlogConfig;
     }
 
     public String toJson() {
