@@ -36,7 +36,9 @@
 #include <ctime>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <sstream>
 #include <string>
@@ -70,6 +72,7 @@
 #include "runtime/fragment_mgr.h"
 #include "runtime/index_policy/index_policy_mgr.h"
 #include "runtime/memory/global_memory_arbitrator.h"
+#include "runtime/memory/mem_tracker_limiter.h"
 #include "runtime/snapshot_loader.h"
 #include "runtime/user_function_cache.h"
 #include "service/backend_options.h"
@@ -79,6 +82,7 @@
 #include "storage/data_dir.h"
 #include "storage/olap_common.h"
 #include "storage/rowset/rowset_meta.h"
+#include "storage/restore_digest/restore_digest.h"
 #include "storage/snapshot/snapshot_manager.h"
 #include "storage/storage_engine.h"
 #include "storage/storage_policy.h"
@@ -154,6 +158,30 @@ void remove_task_info(const TTaskType::type task_type, int64_t signature) {
 }
 
 void finish_task(const TFinishTaskRequest& finish_task_request) {
+    // Debug point: the report of the task is lost, to see the FE resend the task. Params: task_type (the TTaskType
+    // value, any if unset), times (how many reports are lost after the debug point is added, default 1).
+    DBUG_EXECUTE_IF("WorkPool.finish_task.lost", {
+        static std::mutex lost_mutex;
+        static std::weak_ptr<DebugPoint> lost_for;
+        static int lost_times = 0;
+        auto ptype = dp->param<int>("task_type", -1);
+        if (ptype < 0 || ptype == static_cast<int>(finish_task_request.task_type)) {
+            std::lock_guard lock(lost_mutex);
+            // a debug point added again is another object; an expired weak_ptr never equals a live one,
+            // so the count is reset even if the address is reused
+            if (lost_for.lock() != dp) {
+                lost_for = dp;
+                lost_times = 0;
+            }
+            if (lost_times < dp->param<int>("times", 1)) {
+                ++lost_times;
+                LOG(INFO) << "debug point " << DP_NAME << ": the report of task type "
+                          << finish_task_request.task_type
+                          << " signature=" << finish_task_request.signature << " is lost";
+                return;
+            }
+        }
+    });
     // Return result to FE
     TMasterResult result;
     uint32_t try_time = 0;
@@ -438,6 +466,7 @@ bvar::LatencyRecorder g_publish_version_latency("doris_pk", "publish_version");
 
 bvar::Adder<uint64_t> ALTER_INVERTED_INDEX_count("task", "ALTER_INVERTED_INDEX");
 bvar::Adder<uint64_t> CHECK_CONSISTENCY_count("task", "CHECK_CONSISTENCY");
+bvar::Adder<uint64_t> RESTORE_DIGEST_count("task", "RESTORE_DIGEST");
 bvar::Adder<uint64_t> UPLOAD_count("task", "UPLOAD");
 bvar::Adder<uint64_t> DOWNLOAD_count("task", "DOWNLOAD");
 bvar::Adder<uint64_t> MAKE_SNAPSHOT_count("task", "MAKE_SNAPSHOT");
@@ -470,6 +499,7 @@ void add_task_count(const TAgentTaskRequest& task, int n) {
         return;
     ADD_TASK_COUNT(ALTER_INVERTED_INDEX)
     ADD_TASK_COUNT(CHECK_CONSISTENCY)
+    ADD_TASK_COUNT(RESTORE_DIGEST)
     ADD_TASK_COUNT(UPLOAD)
     ADD_TASK_COUNT(DOWNLOAD)
     ADD_TASK_COUNT(MAKE_SNAPSHOT)
@@ -1309,6 +1339,12 @@ void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskReques
     finish_task_request.__set_signature(req.signature);
     finish_task_request.__set_task_status(status.to_thrift());
     finish_task_request.__set_tablet_files(tablet_files);
+    if (status.ok()) {
+        finish_task_request.__set_manifest_roots(loader->uploaded_manifest_roots());
+        if (!loader->uploaded_prefix_digest_roots().empty()) {
+            finish_task_request.__set_prefix_digest_roots(loader->uploaded_prefix_digest_roots());
+        }
+    }
 
     finish_task(finish_task_request);
     remove_task_info(req.task_type, req.signature);
@@ -1322,6 +1358,10 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
 
     // TODO: download
     std::vector<int64_t> downloaded_tablet_ids;
+    std::vector<int64_t> manifest_verified_tablets;
+    bool manifest_digest_checked = false;
+
+    SnapshotDownloadStats download_stats;
 
     auto status = Status::OK();
     if (download_request.__isset.remote_tablet_snapshots) {
@@ -1330,6 +1370,9 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
         SCOPED_ATTACH_TASK(loader->resource_ctx());
         status = loader->remote_http_download(download_request.remote_tablet_snapshots,
                                               &downloaded_tablet_ids);
+        manifest_verified_tablets = loader->manifest_verified_tablets();
+        manifest_digest_checked = loader->manifest_digest_checked();
+        download_stats = loader->download_stats();
     } else {
         std::unique_ptr<SnapshotLoader> loader = std::make_unique<SnapshotLoader>(
                 engine, env, download_request.job_id, req.signature, download_request.broker_addr,
@@ -1340,8 +1383,17 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
                                       : TStorageBackendType::type::BROKER,
                               download_request.__isset.location ? download_request.location : "");
         if (status.ok()) {
+            if (download_request.__isset.manifest_roots) {
+                loader->set_manifest_roots(download_request.manifest_roots);
+            }
+            if (download_request.__isset.incremental_ranges) {
+                loader->set_incremental_ranges(download_request.incremental_ranges);
+            }
             status = loader->download(download_request.src_dest_map, &downloaded_tablet_ids);
         }
+        manifest_verified_tablets = loader->manifest_verified_tablets();
+        manifest_digest_checked = loader->manifest_digest_checked();
+        download_stats = loader->download_stats();
     }
 
     if (!status.ok()) {
@@ -1361,6 +1413,12 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
     finish_task_request.__set_signature(req.signature);
     finish_task_request.__set_task_status(status.to_thrift());
     finish_task_request.__set_downloaded_tablet_ids(downloaded_tablet_ids);
+    if (status.ok()) {
+        // Always set, so that FE knows the manifest is supported even if no tablet is verified.
+        finish_task_request.__set_manifest_verified_tablets(manifest_verified_tablets);
+        finish_task_request.__set_manifest_digest_checked(manifest_digest_checked);
+        finish_task_request.__set_download_stats(download_stats.to_thrift());
+    }
 
     finish_task(finish_task_request);
     remove_task_info(req.task_type, req.signature);
@@ -1415,6 +1473,226 @@ void download_callback(CloudStorageEngine& engine, ExecEnv* env, const TAgentTas
     }
 }
 
+// Computes the logical digest of a tablet for a snapshot / RESTORE_DIGEST task and converts the
+// outcome to the thrift struct. NOT_SUPPORTED and failures are reported through status_code and
+// status_msg (root is left empty), the caller decides whether they fail the task. If `prefix` is
+// not null, the decomposed digest is produced as well (prefix->produced tells), from the same pass.
+TLogicalDigest compute_logical_digest_for_task(StorageEngine& engine, int64_t tablet_id,
+                                               int64_t version, int threads,
+                                               PrefixDigestOutput* prefix) {
+    LogicalDigestResult result;
+    Status st;
+    Status prefix_status = Status::OK();
+    const auto start = std::chrono::steady_clock::now();
+    {
+        auto mem_tracker = MemTrackerLimiter::create_shared(
+                MemTrackerLimiter::Type::OTHER,
+                "RestoreDigest#tabletId=" + std::to_string(tablet_id));
+        SCOPED_ATTACH_TASK(mem_tracker);
+        st = get_tablet_logical_digest(engine, tablet_id, version, threads,
+                                       RestoreDigestCache::instance(), &result,
+                                       prefix != nullptr ? &prefix->digest : nullptr,
+                                       &prefix_status,
+                                       prefix != nullptr ? &prefix->from_cache : nullptr);
+    }
+    if (prefix != nullptr) {
+        prefix->produced = st.ok() && prefix_status.ok() && prefix->digest != nullptr;
+        if (!prefix->produced) {
+            prefix->reason = st.ok() ? prefix_status.to_string() : st.to_string();
+        }
+    }
+    TLogicalDigest digest;
+    digest.__set_algo_version(static_cast<int32_t>(RestoreDigest::kAlgoVersion));
+    if (st.ok()) {
+        digest.__set_schema_sig(result.schema_sig);
+        digest.__set_root(result.root);
+        digest.__set_rows(static_cast<int64_t>(result.rows));
+        digest.__set_status_code("OK");
+        LOG(INFO) << "logical digest done, tablet_id=" << tablet_id << ", version=" << version
+                  << ", rows=" << result.rows << ", root=" << result.root
+                  << ", from_cache=" << result.from_cache
+                  << ", rowsets_sig=" << result.rowsets_sig.substr(0, 8)
+                  << ", decomposed_from_cache=" << (prefix != nullptr && prefix->from_cache)
+                  << ", cache_decomposed_entries="
+                  << RestoreDigestCache::instance()->decomposed_count()
+                  << ", cache_decomposed_bytes="
+                  << RestoreDigestCache::instance()->decomposed_bytes() << ", elapsed_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+    } else {
+        digest.__set_status_code(st.is<ErrorCode::NOT_IMPLEMENTED_ERROR>() ? "NOT_SUPPORTED"
+                                                                           : "ERROR");
+        digest.__set_status_msg(st.to_string());
+        LOG(WARNING) << "logical digest not available, tablet_id=" << tablet_id
+                     << ", version=" << version << ", status=" << st;
+    }
+    return digest;
+}
+
+// The rowsets of the snapshot, from the tablet meta in the snapshot dir, as (start, end) versions.
+Status snapshot_rowset_versions(const std::string& hdr_path,
+                                std::set<std::pair<int64_t, int64_t>>* versions) {
+    TabletMetaPB pb;
+    RETURN_IF_ERROR(TabletMeta::load_from_file(hdr_path, &pb));
+    for (const auto& rs : pb.rs_metas()) {
+        versions->emplace(rs.start_version(), rs.end_version());
+    }
+    return Status::OK();
+}
+
+// Writes the decomposed digest next to the manifest of the snapshot, and records the outcome in
+// `digest`: prefix_root if the file is written, prefix_msg otherwise. Never fails the snapshot.
+void write_snapshot_prefix_digest(const std::string& snapshot_path, int64_t tablet_id,
+                                  int32_t schema_hash, PrefixDigestOutput& prefix,
+                                  TLogicalDigest* digest) {
+    std::string reason = prefix.reason;
+    if (prefix.produced) {
+        // The digest was computed on the live tablet after the snapshot was made. If a compaction
+        // has changed the rowsets in between, its boundaries are not those of the snapshot files.
+        std::set<std::pair<int64_t, int64_t>> in_snapshot;
+        Status st = snapshot_rowset_versions(
+                fmt::format("{}/{}/{}/{}.hdr", snapshot_path, tablet_id, schema_hash, tablet_id),
+                &in_snapshot);
+        std::set<std::pair<int64_t, int64_t>> in_digest;
+        for (const auto& rs : prefix.digest->rowsets) {
+            in_digest.emplace(rs.start_version, rs.end_version);
+        }
+        if (!st.ok()) {
+            reason = fmt::format("failed to read the tablet meta of the snapshot: {}", st.to_string());
+        } else if (in_snapshot != in_digest) {
+            reason = "the rowsets of the tablet changed after the snapshot was made";
+        } else {
+            std::string content = prefix.digest->serialize();
+            std::string root;
+            st = write_prefix_digest_file(
+                    content,
+                    fmt::format("{}/{}/{}", snapshot_path, tablet_id,
+                                RestoreDigestDecomposed::kLocalFileName),
+                    &root);
+            if (st.ok()) {
+                digest->__set_prefix_root(root);
+                digest->__set_prefix_bytes(static_cast<int64_t>(content.size()));
+                LOG(INFO) << "decomposed digest written, tablet_id=" << tablet_id
+                          << ", rowsets=" << prefix.digest->rowsets.size()
+                          << ", marks=" << prefix.digest->marks.size() << ", bytes=" << content.size()
+                          << ", root=" << root;
+                return;
+            }
+            reason = fmt::format("failed to write the decomposed digest: {}", st.to_string());
+        }
+    }
+    digest->__set_prefix_msg(reason);
+    LOG(INFO) << "no decomposed digest, tablet_id=" << tablet_id << ", reason: " << reason;
+}
+
+// The incremental restore: compares the digest of the tablet at `version` (already computed in `digest`) with the one
+// composed from the decomposed digest file of the backup at the same version, and checks that the backup can be cut
+// there. Sets prefix_verdict (and prefix_msg) of `digest`.
+void verify_prefix_digest(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req,
+                          TLogicalDigest* digest) {
+    const auto& digest_req = req.restore_digest_req;
+    const auto& source = digest_req.prefix_source;
+    auto fail = [&](const char* verdict, const std::string& msg) {
+        digest->__set_prefix_verdict(verdict);
+        digest->__set_prefix_msg(msg);
+        LOG(WARNING) << "restore digest prefix check of tablet " << digest_req.tablet_id
+                     << " at version " << digest_req.version << ": " << verdict << ", " << msg;
+    };
+    if (digest->status_code != "OK") {
+        fail("ERROR", "the digest of the local tablet is not available: " + digest->status_msg);
+        return;
+    }
+    RestoreDigestDecomposed decomposed;
+    Status st;
+    if (source.__isset.remote_tablet_snapshot) {
+        st = fetch_prefix_digest_from_remote_be(source.remote_tablet_snapshot, source.root,
+                                                &decomposed);
+    } else if (source.__isset.remote_path && source.__isset.location) {
+        TabletSharedPtr tablet = engine.tablet_manager()->get_tablet(digest_req.tablet_id);
+        if (tablet == nullptr) {
+            fail("ERROR", "the local tablet is not found");
+            return;
+        }
+        // the temporary file of the download is put in the snapshot dir of the store
+        std::string tmp_dir = fmt::format("{}/{}", tablet->data_dir()->path(), SNAPSHOT_PREFIX);
+        st = io::global_local_filesystem()->create_directory(tmp_dir);
+        if (st.ok()) {
+            SnapshotLoader loader(engine, env, 0, req.signature, source.broker_addr,
+                                  source.broker_prop);
+            SCOPED_ATTACH_TASK(loader.resource_ctx());
+            st = loader.init(source.__isset.storage_backend ? source.storage_backend
+                                                            : TStorageBackendType::type::BROKER,
+                             source.location);
+            if (st.ok()) {
+                st = loader.fetch_prefix_digest_to_dir(source.remote_path, tmp_dir,
+                                                       source.remote_tablet_id, source.root,
+                                                       &decomposed);
+            }
+        }
+    } else {
+        st = Status::InvalidArgument("the prefix source has neither a remote path nor a snapshot");
+    }
+    if (!st.ok()) {
+        fail("ERROR", "failed to read the decomposed digest of the backup: " + st.to_string());
+        return;
+    }
+    if (decomposed.algo_version != static_cast<uint32_t>(digest->algo_version) ||
+        decomposed.schema_sig != digest->schema_sig) {
+        fail("SCHEMA_MISMATCH", "the algorithm version or the schema signature differs");
+        return;
+    }
+    if (decomposed.base_version != source.end_version) {
+        fail("ERROR", fmt::format("the decomposed digest is at version {}, expected {}",
+                                  decomposed.base_version, source.end_version));
+        return;
+    }
+    if (!decomposed.is_boundary(digest_req.version)) {
+        fail("NOT_BOUNDARY", fmt::format("version {} is not the end version of a rowset of the backup",
+                                         digest_req.version));
+        return;
+    }
+    RestoreDigest composed;
+    st = decomposed.compose(digest_req.version, &composed);
+    if (!st.ok()) {
+        fail("ERROR", "failed to compose the digest of the backup: " + st.to_string());
+        return;
+    }
+    if (composed.root != digest->root) {
+        fail("MISMATCH", fmt::format("the digest of the backup at version {} is {}, the local one is {}",
+                                     digest_req.version, composed.root, digest->root));
+        return;
+    }
+    digest->__set_prefix_verdict("OK");
+    LOG(INFO) << "restore digest prefix check of tablet " << digest_req.tablet_id << " at version "
+              << digest_req.version << ": OK, root " << digest->root;
+}
+
+void restore_digest_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req) {
+    const auto& digest_req = req.restore_digest_req;
+    LOG(INFO) << "get restore digest task. signature=" << req.signature
+              << ", tablet_id=" << digest_req.tablet_id << ", version=" << digest_req.version;
+    int threads = digest_req.__isset.threads ? digest_req.threads : 0;
+    TLogicalDigest digest = compute_logical_digest_for_task(engine, digest_req.tablet_id,
+                                                            digest_req.version, threads);
+    if (digest_req.__isset.prefix_source) {
+        verify_prefix_digest(engine, env, req, &digest);
+    }
+
+    // The task itself succeeds as long as the digest was asked and answered; NOT_SUPPORTED and
+    // errors are carried in the digest.
+    TFinishTaskRequest finish_task_request;
+    finish_task_request.__set_backend(BackendOptions::get_local_backend());
+    finish_task_request.__set_task_type(req.task_type);
+    finish_task_request.__set_signature(req.signature);
+    finish_task_request.__set_task_status(Status::OK().to_thrift());
+    finish_task_request.__set_request_version(digest_req.version);
+    finish_task_request.__set_logical_digest(digest);
+
+    finish_task(finish_task_request);
+    remove_task_info(req.task_type, req.signature);
+}
+
 void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req) {
     const auto& snapshot_request = req.snapshot_req;
 
@@ -1423,8 +1701,24 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     std::string snapshot_path;
     bool allow_incremental_clone = false; // not used
     std::vector<std::string> snapshot_files;
-    Status status = engine.snapshot_mgr()->make_snapshot(snapshot_request, &snapshot_path,
-                                                         &allow_incremental_clone);
+    std::string manifest_root;
+    const bool local_source =
+            snapshot_request.__isset.restore_local_source && snapshot_request.restore_local_source;
+    LocalSourceStats local_source_stats;
+    Status status;
+    if (local_source && snapshot_request.__isset.restore_incremental &&
+        snapshot_request.restore_incremental) {
+        SnapshotLoader loader(engine, ExecEnv::GetInstance(),
+                              snapshot_request.__isset.job_id ? snapshot_request.job_id : 0,
+                              snapshot_request.tablet_id);
+        SCOPED_ATTACH_TASK(loader.resource_ctx());
+        status = loader.make_local_source_snapshot_and_load(snapshot_request, &snapshot_path,
+                                                            &local_source_stats);
+    } else {
+        status = engine.snapshot_mgr()->make_snapshot(snapshot_request, &snapshot_path,
+                                                      &allow_incremental_clone,
+                                                      local_source ? &local_source_stats : nullptr);
+    }
     if (status.ok() && snapshot_request.__isset.list_files) {
         // list and save all snapshot files
         // snapshot_path like: data/snapshot/20180417205230.1.86400
@@ -1435,9 +1729,56 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
                                     snapshot_request.schema_hash);
         status = io::global_local_filesystem()->list(path, true, &files, &exists);
         if (status.ok()) {
+            bool compute_digest =
+                    snapshot_request.__isset.compute_digest && snapshot_request.compute_digest;
+            // The manifest of the snapshot: the name and size (and the sha256 if required) of each
+            // file, written next to the snapshot dir, one level up:
+            // <snapshot_path>/<tablet_id>/manifest
+            SnapshotManifest manifest;
+            manifest.tablet_id = snapshot_request.tablet_id;
             for (auto& file : files) {
                 snapshot_files.push_back(file.file_name);
+                SnapshotManifestFile manifest_file;
+                manifest_file.name = file.file_name;
+                manifest_file.size = file.file_size;
+                // the tablet meta file is rewritten in restore, it has no digest.
+                if (compute_digest && !file.file_name.ends_with(".hdr")) {
+                    status = compute_file_digests((path / file.file_name).native(), nullptr,
+                                                  &manifest_file.sha256, &manifest_file.size);
+                    if (!status.ok()) {
+                        break;
+                    }
+                }
+                manifest.files.push_back(std::move(manifest_file));
             }
+            if (status.ok()) {
+                status = write_snapshot_manifest(
+                        manifest,
+                        fmt::format("{}/{}/{}", snapshot_path, snapshot_request.tablet_id,
+                                    SnapshotManifest::kLocalFileName),
+                        &manifest_root);
+            }
+        }
+    }
+    // The digest never fails the snapshot task: NOT_SUPPORTED and errors are reported in it.
+    std::optional<TLogicalDigest> logical_digest;
+    if (status.ok() && snapshot_request.__isset.compute_logical_digest &&
+        snapshot_request.compute_logical_digest) {
+        if (snapshot_request.__isset.version) {
+            PrefixDigestOutput prefix;
+            const bool with_prefix = config::restore_digest_prefix_enabled;
+            logical_digest = compute_logical_digest_for_task(
+                    engine, snapshot_request.tablet_id, snapshot_request.version, 0,
+                    with_prefix ? &prefix : nullptr);
+            if (with_prefix && logical_digest->status_code == "OK") {
+                write_snapshot_prefix_digest(snapshot_path, snapshot_request.tablet_id,
+                                             snapshot_request.schema_hash, prefix, &*logical_digest);
+            }
+        } else {
+            TLogicalDigest digest;
+            digest.__set_status_code("ERROR");
+            digest.__set_status_msg("the snapshot request has no version");
+            logical_digest = digest;
         }
     }
     if (!status.ok()) {
@@ -1460,6 +1801,21 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     finish_task_request.__set_signature(req.signature);
     finish_task_request.__set_snapshot_path(snapshot_path);
     finish_task_request.__set_snapshot_files(snapshot_files);
+    if (status.ok() && snapshot_request.__isset.list_files) {
+        finish_task_request.__set_manifest_root(manifest_root);
+    }
+    if (logical_digest.has_value()) {
+        finish_task_request.__set_logical_digest(*logical_digest);
+    }
+    if (status.ok() && local_source) {
+        TDownloadStats stats;
+        stats.__set_local_source_tablets(local_source_stats.tablets);
+        stats.__set_local_source_linked_files(local_source_stats.linked_files);
+        stats.__set_local_source_linked_bytes(local_source_stats.linked_bytes);
+        stats.__set_local_source_copied_files(local_source_stats.copied_files);
+        stats.__set_local_source_copied_bytes(local_source_stats.copied_bytes);
+        finish_task_request.__set_download_stats(stats);
+    }
     finish_task_request.__set_task_status(status.to_thrift());
 
     finish_task(finish_task_request);
@@ -1537,7 +1893,15 @@ void move_dir_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
     } else {
         SnapshotLoader loader(engine, env, move_dir_req.job_id, move_dir_req.tablet_id);
         SCOPED_ATTACH_TASK(loader.resource_ctx());
-        status = loader.move(move_dir_req.src, tablet, true);
+        if (move_dir_req.__isset.incremental) {
+            status = loader.append_increment(
+                    move_dir_req.src, tablet, move_dir_req.incremental,
+                    move_dir_req.__isset.backup_logical_digest ? &move_dir_req.backup_logical_digest
+                                                               : nullptr,
+                    move_dir_req.__isset.local_source_loaded && move_dir_req.local_source_loaded);
+        } else {
+            status = loader.move(move_dir_req.src, tablet, true);
+        }
     }
 
     if (!status.ok()) {

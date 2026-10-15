@@ -124,6 +124,9 @@ void AgentServer::start_workers(StorageEngine& engine, ExecEnv* exec_env) {
     _workers[TTaskType::CHECK_CONSISTENCY] = std::make_unique<TaskWorkerPool>(
         "CHECK_CONSISTENCY", config::check_consistency_worker_count, [&engine](auto&& task) { return check_consistency_callback(engine, task); });
 
+    _workers[TTaskType::RESTORE_DIGEST] = std::make_unique<TaskWorkerPool>(
+        "RESTORE_DIGEST", config::restore_digest_task_concurrency, [&engine, exec_env](auto&& task) { return restore_digest_callback(engine, exec_env, task); });
+
     _workers[TTaskType::UPLOAD] = std::make_unique<TaskWorkerPool>(
             "UPLOAD", config::upload_worker_count, [&engine, exec_env](auto&& task) { return upload_callback(engine, exec_env, task); });
 

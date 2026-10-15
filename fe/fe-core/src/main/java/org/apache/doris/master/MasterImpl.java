@@ -50,6 +50,7 @@ import org.apache.doris.task.DownloadTask;
 import org.apache.doris.task.PublishVersionTask;
 import org.apache.doris.task.PushCooldownConfTask;
 import org.apache.doris.task.PushTask;
+import org.apache.doris.task.RestoreDigestTask;
 import org.apache.doris.task.SnapshotTask;
 import org.apache.doris.task.StorageMediaMigrationTask;
 import org.apache.doris.task.UpdateTabletMetaInfoTask;
@@ -174,7 +175,7 @@ public class MasterImpl {
                         && taskType != TTaskType.CREATE && taskType != TTaskType.UPDATE_TABLET_META_INFO
                         && taskType != TTaskType.STORAGE_MEDIUM_MIGRATE
                         && taskType != TTaskType.CALCULATE_DELETE_BITMAP
-                        && taskType != TTaskType.REALTIME_PUSH) {
+                        && taskType != TTaskType.REALTIME_PUSH && taskType != TTaskType.RESTORE_DIGEST) {
                     return result;
                 }
             }
@@ -220,6 +221,9 @@ public class MasterImpl {
                     break;
                 case DOWNLOAD:
                     finishDownloadTask(task, request);
+                    break;
+                case RESTORE_DIGEST:
+                    finishRestoreDigest(task, request);
                     break;
                 case MOVE:
                     finishMoveDirTask(task, request);
@@ -639,6 +643,14 @@ public class MasterImpl {
         task.setFinished(true);
         if (Env.getCurrentEnv().getBackupHandler().handleDownloadSnapshotTask(downloadTask, request)) {
             AgentTaskQueue.removeTask(task.getBackendId(), TTaskType.DOWNLOAD, task.getSignature());
+        }
+    }
+
+    private void finishRestoreDigest(AgentTask task, TFinishTaskRequest request) {
+        RestoreDigestTask digestTask = (RestoreDigestTask) task;
+        task.setFinished(true);
+        if (Env.getCurrentEnv().getBackupHandler().handleFinishedRestoreDigestTask(digestTask, request)) {
+            AgentTaskQueue.removeTask(task.getBackendId(), TTaskType.RESTORE_DIGEST, task.getSignature());
         }
     }
 

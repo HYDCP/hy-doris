@@ -113,6 +113,10 @@ enum TStatusCode {
     // Signal to finish fragments on BE by FE.
     FINISHED = 76,
 
+    // The downloaded tablet snapshot of a restore does not match the manifest of the backup, even after
+    // downloading it again. FE cancels the restore job at once.
+    RESTORE_MANIFEST_MISMATCH = 77,
+
     // used for cloud
     DELETE_BITMAP_LOCK_ERROR = 100,
     SC_COMPACTION_CONFLICT = 101,

@@ -270,6 +270,8 @@ TabletMeta::TabletMeta(const TabletMeta& b)
           _binlog_config(b._binlog_config),
           _tablet_role(b._tablet_role),
           _binlog_tablet_id(b._binlog_tablet_id),
+          _restore_stage(b._restore_stage),
+          _has_restore_stage(b._has_restore_stage),
           _compaction_policy(b._compaction_policy),
           _time_series_compaction_goal_size_mbytes(b._time_series_compaction_goal_size_mbytes),
           _time_series_compaction_file_count_threshold(
@@ -926,6 +928,13 @@ void TabletMeta::init_from_pb(const TabletMetaPB& tablet_meta_pb) {
     }
     _tablet_role = tablet_meta_pb.tablet_role();
     _binlog_tablet_id = tablet_meta_pb.binlog_tablet_id();
+    if (tablet_meta_pb.has_restore_stage()) {
+        _restore_stage = tablet_meta_pb.restore_stage();
+        _has_restore_stage = true;
+    } else {
+        _restore_stage.Clear();
+        _has_restore_stage = false;
+    }
     _compaction_policy = tablet_meta_pb.compaction_policy();
     _time_series_compaction_goal_size_mbytes =
             tablet_meta_pb.time_series_compaction_goal_size_mbytes();
@@ -1031,6 +1040,9 @@ void TabletMeta::to_meta_pb(TabletMetaPB* tablet_meta_pb, bool cloud_get_rowset_
     tablet_meta_pb->set_tablet_role(_tablet_role);
     if (_binlog_tablet_id > 0) {
         tablet_meta_pb->set_binlog_tablet_id(_binlog_tablet_id);
+    }
+    if (_has_restore_stage) {
+        *tablet_meta_pb->mutable_restore_stage() = _restore_stage;
     }
     tablet_meta_pb->set_compaction_policy(compaction_policy());
     tablet_meta_pb->set_time_series_compaction_goal_size_mbytes(
@@ -1277,6 +1289,11 @@ bool operator==(const TabletMeta& a, const TabletMeta& b) {
     if (a._preferred_rowset_type != b._preferred_rowset_type) return false;
     if (a._storage_policy_id != b._storage_policy_id) return false;
     if (a._binlog_tablet_id != b._binlog_tablet_id) return false;
+    if (a._has_restore_stage != b._has_restore_stage) return false;
+    if (a._has_restore_stage &&
+        a._restore_stage.SerializeAsString() != b._restore_stage.SerializeAsString()) {
+        return false;
+    }
     if (a._compaction_policy != b._compaction_policy) return false;
     if (a._time_series_compaction_goal_size_mbytes != b._time_series_compaction_goal_size_mbytes)
         return false;

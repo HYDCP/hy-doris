@@ -67,6 +67,7 @@
 #include "service/http/action/reload_tablet_action.h"
 #include "service/http/action/report_action.h"
 #include "service/http/action/reset_rpc_channel_action.h"
+#include "service/http/action/restore_digest_action.h"
 #include "service/http/action/restore_tablet_action.h"
 #include "service/http/action/show_hotspot_action.h"
 #include "service/http/action/show_nested_index_file_action.h"
@@ -374,6 +375,12 @@ void HttpService::register_local_handler(StorageEngine& engine) {
                                       tablet_migration_action);
 
 #ifndef BE_TEST
+    // Register restore digest (R2 prototype, debug only)
+    RestoreDigestAction* restore_digest_action = _pool.add(new RestoreDigestAction(
+            _env, engine, TPrivilegeHier::GLOBAL, TPrivilegeType::ADMIN));
+    _ev_http_server->register_handler(HttpMethod::GET, "/api/_restore_digest",
+                                      restore_digest_action);
+
     // Register BE checksum action
     ChecksumAction* checksum_action = _pool.add(
             new ChecksumAction(_env, engine, TPrivilegeHier::GLOBAL, TPrivilegeType::ADMIN));

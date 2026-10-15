@@ -66,6 +66,10 @@ void SHA256Digest::reset(const void* data, size_t length) {
     SHA256_Update(&_sha256_ctx, data, length);
 }
 
+void SHA256Digest::update(const void* data, size_t length) {
+    SHA256_Update(&_sha256_ctx, data, length);
+}
+
 std::string_view SHA256Digest::digest() {
     unsigned char buf[SHA256_DIGEST_LENGTH];
     SHA256_Final(buf, &_sha256_ctx);

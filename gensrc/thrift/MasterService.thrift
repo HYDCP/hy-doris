@@ -56,6 +56,64 @@ struct TTabletInfo {
     1000: optional bool is_persistent
 }
 
+// Statistics of a download task, summed over all the tablets (replicas) of the task. The bytes and files
+// exclude the tablet meta files.
+struct TDownloadStats {
+    // reused by hard linking the local files of the rowsets with the same lineage (http snapshot only)
+    1: optional i64 linked_files
+    2: optional i64 linked_bytes
+    // already exist locally with the same name and size (and md5), not downloaded
+    3: optional i64 skipped_files
+    4: optional i64 skipped_bytes
+    5: optional i64 downloaded_files
+    6: optional i64 downloaded_bytes
+    // tablets whose data files are all / partially / not reused
+    7: optional i64 tablets_full_reuse
+    8: optional i64 tablets_partial_reuse
+    9: optional i64 tablets_no_reuse
+    // rowsets of the remote tablets which have no lineage match in the local tablets, and why
+    10: optional i64 unmatched_rowsets
+    11: optional i64 unmatched_no_source_rowset_id
+    12: optional i64 unmatched_source_not_in_snapshot
+    13: optional i64 unmatched_version_mismatch
+    // tablets restored incrementally (only the rowsets of the increment are downloaded), and the files and bytes
+    // downloaded for them, which are also counted in downloaded_files / downloaded_bytes
+    14: optional i64 tablets_incremental
+    15: optional i64 incremental_files
+    16: optional i64 incremental_bytes
+    // snapshot task with restore_local_source (atomic restore keeps the data of the table being replaced): the
+    // tablets made from the local tablet, and their files hard linked / copied (the other disk) from it
+    17: optional i64 local_source_tablets
+    18: optional i64 local_source_linked_files
+    19: optional i64 local_source_linked_bytes
+    20: optional i64 local_source_copied_files
+    21: optional i64 local_source_copied_bytes
+}
+
+// Result of the logical digest computation of a tablet, see TSnapshotRequest.compute_logical_digest and
+// TRestoreDigestReq. root is empty unless status_code is OK.
+struct TLogicalDigest {
+    1: optional i32 algo_version
+    2: optional string schema_sig
+    // hex of the root digest
+    3: optional string root
+    4: optional i64 rows
+    // OK / NOT_SUPPORTED / ERROR
+    5: optional string status_code
+    6: optional string status_msg
+    // snapshot task with compute_logical_digest: SHA-256 of the decomposed digest file (rdigest) written next
+    // to the manifest of the snapshot, from which the digest at any rowset boundary version of the snapshot
+    // can be composed. Unset if the file was not written, prefix_msg then says why (it is not an error:
+    // unique MoR and a few other models have no decomposed digest).
+    7: optional string prefix_root
+    8: optional string prefix_msg
+    9: optional i64 prefix_bytes
+    // restore digest task with prefix_source: OK if the digest of the tablet at the version equals the one composed
+    // from the decomposed digest file of the backup and the backup can be cut at the version; otherwise
+    // NOT_BOUNDARY / MISMATCH / SCHEMA_MISMATCH / ERROR (prefix_msg says why)
+    10: optional string prefix_verdict
+}
+
 struct TFinishTaskRequest {
     1: required Types.TBackend backend
     2: required Types.TTaskType task_type
@@ -78,6 +136,21 @@ struct TFinishTaskRequest {
     19: optional map<i64, map<i64, i64>> table_id_to_tablet_id_to_delta_num_rows
     // for Cloud mow table only, used by FE to check if the response is for the latest request
     20: optional list<AgentService.TCalcDeleteBitmapPartitionInfo> resp_partitions;
+    // upload task: SHA-256 of the manifest file uploaded next to the files of each tablet
+    21: optional map<Types.TTabletId, string> manifest_roots
+    // snapshot task: SHA-256 of the manifest file written next to the snapshot files
+    22: optional string manifest_root
+    // download task: the tablets whose downloaded snapshot has been checked against the manifest
+    23: optional list<Types.TTabletId> manifest_verified_tablets
+    // download task: whether the digests of the files of all manifest_verified_tablets are checked
+    24: optional bool manifest_digest_checked
+    // download task: how much of the data was reused locally instead of downloaded
+    25: optional TDownloadStats download_stats
+    // snapshot task (compute_logical_digest) and restore digest task: the logical digest of the tablet
+    26: optional TLogicalDigest logical_digest
+    // upload task: SHA-256 of the decomposed digest file (rdigest) uploaded next to the files of each tablet,
+    // only the tablets which have one
+    27: optional map<Types.TTabletId, string> prefix_digest_roots
 }
 
 struct TTablet {

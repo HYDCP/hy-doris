@@ -30,6 +30,7 @@
 
 namespace doris {
 class RowsetMetaPB;
+class RestoreStagePB;
 class TabletSchemaPB;
 class TSnapshotRequest;
 struct RowsetId;
@@ -85,6 +86,16 @@ private:
     std::string _snapshot_path;
 };
 
+// What a snapshot made from a local tablet of another table (TSnapshotRequest.restore_local_source, atomic restore)
+// took from it: the files of its rowsets, hard linked if the two tablets are on the same disk, otherwise copied.
+struct LocalSourceStats {
+    int64_t tablets = 0;
+    int64_t linked_files = 0;
+    int64_t linked_bytes = 0;
+    int64_t copied_files = 0;
+    int64_t copied_bytes = 0;
+};
+
 class SnapshotManager {
 public:
     SnapshotManager(StorageEngine& engine);
@@ -93,8 +104,10 @@ public:
     /// Create a snapshot
     /// snapshot_path: out param, the dir of snapshot
     /// allow_incremental_clone: out param, true if it is an incremental clone
+    /// local_source_stats: out param, only set by a request with restore_local_source, may be nullptr
     Status make_snapshot(const TSnapshotRequest& request, std::string* snapshot_path,
-                         bool* allow_incremental_clone);
+                         bool* allow_incremental_clone,
+                         LocalSourceStats* local_source_stats = nullptr);
 
     std::string static get_schema_hash_full_path(const TabletSharedPtr& ref_tablet,
                                                  const std::string& prefix);
@@ -103,11 +116,10 @@ public:
     // @param snapshot_path [in] 要被释放的snapshot的路径，只包含到ID
     Status release_snapshot(const std::string& snapshot_path);
 
-    Result<std::vector<PendingRowsetGuard>> convert_rowset_ids(const std::string& clone_dir,
-                                                               int64_t tablet_id,
-                                                               int64_t replica_id, int64_t table_id,
-                                                               int64_t partition_id,
-                                                               int32_t schema_hash);
+    Result<std::vector<PendingRowsetGuard>> convert_rowset_ids(
+            const std::string& clone_dir, int64_t tablet_id, int64_t replica_id, int64_t table_id,
+            int64_t partition_id, int32_t schema_hash, bool reset_restore_stage = false,
+            const RestoreStagePB* restore_stage = nullptr);
 
 private:
     Status _calc_snapshot_id_path(const TabletSharedPtr& tablet, int64_t timeout_s,
@@ -126,7 +138,8 @@ private:
     Status _create_snapshot_files(const TabletSharedPtr& ref_tablet,
                                   const TabletSharedPtr& target_tablet,
                                   const TSnapshotRequest& request, std::string* snapshot_path,
-                                  bool* allow_incremental_clone);
+                                  bool* allow_incremental_clone,
+                                  LocalSourceStats* local_source_stats);
 
     Status _prepare_snapshot_dir(const TabletSharedPtr& ref_tablet, std::string* snapshot_id_path);
 

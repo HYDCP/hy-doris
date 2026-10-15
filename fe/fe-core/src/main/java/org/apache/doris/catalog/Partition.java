@@ -98,6 +98,10 @@ public class Partition extends MetaObject {
     private DistributionInfo distributionInfo;
     @SerializedName(value = "tso")
     private long tso = -1;
+    // The lineage of the data written by the last RESTORE job on this partition, null if the partition
+    // was never restored. See RestoreLineage.
+    @SerializedName(value = "rl")
+    private RestoreLineage restoreLineage;
 
     private transient volatile String remoteMetaChecksum;
 
@@ -523,5 +527,13 @@ public class Partition extends MetaObject {
 
     public Long getTso() {
         return tso;
+    }
+
+    public RestoreLineage getRestoreLineage() {
+        return restoreLineage;
+    }
+
+    public void setRestoreLineage(RestoreLineage restoreLineage) {
+        this.restoreLineage = restoreLineage;
     }
 }

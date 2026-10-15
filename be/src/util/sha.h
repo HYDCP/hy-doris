@@ -46,6 +46,8 @@ private:
 class SHA256Digest {
 public:
     void reset(const void* data, size_t length);
+    // Feed more data after reset(), so that a large input can be digested piece by piece.
+    void update(const void* data, size_t length);
     std::string_view digest();
 
 private:

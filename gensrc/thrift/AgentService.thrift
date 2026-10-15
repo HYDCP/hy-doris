@@ -426,6 +426,14 @@ struct TUploadReq {
     6: optional string location // root path
 }
 
+// The versions (base_version, end_version] of a remote tablet snapshot to append to a local tablet whose
+// version is base_version (the incremental restore): only the rowsets of these versions are downloaded
+// (into an empty snapshot dir), and moved onto the local tablet instead of replacing it.
+struct TRestoreIncrementalRange {
+    1: required Types.TVersion base_version
+    2: required Types.TVersion end_version
+}
+
 struct TRemoteTabletSnapshot {
     1: optional i64 local_tablet_id
     2: optional string local_snapshot_path
@@ -434,6 +442,12 @@ struct TRemoteTabletSnapshot {
     5: optional Types.TNetworkAddress remote_be_addr
     6: optional string remote_snapshot_path
     7: optional string remote_token
+    // SHA-256 of the manifest file of the remote tablet snapshot, recorded at backup time. If set, the
+    // manifest is fetched from "<parent of remote_snapshot_path>/manifest", the files are downloaded by it
+    // and the downloaded tablet snapshot is checked against it.
+    8: optional string manifest_root
+    // download only this range of the remote tablet snapshot, see TRestoreIncrementalRange
+    9: optional TRestoreIncrementalRange incremental
 }
 
 struct TDownloadReq {
@@ -445,6 +459,14 @@ struct TDownloadReq {
     6: optional string location // root path
     7: optional list<TRemoteTabletSnapshot> remote_tablet_snapshots
     8: optional string vault_id // for cloud restore
+    // src path (same key as src_dest_map) -> SHA-256 of the manifest file of the tablet, recorded at backup
+    // time. If set, the manifest is fetched from "<parent of src path>/__manifest__<tablet id>.<first 32 hex
+    // chars of the SHA-256>", the files are downloaded by it and the downloaded tablet snapshot is checked
+    // against it.
+    9: optional map<string, string> manifest_roots
+    // src path (same key as src_dest_map) -> the range to download, see TRestoreIncrementalRange. Only for
+    // a repository, the range of a http path is in remote_tablet_snapshots.
+    10: optional map<string, TRestoreIncrementalRange> incremental_ranges
 }
 
 struct TSnapshotRequest {
@@ -464,6 +486,52 @@ struct TSnapshotRequest {
     12: optional Types.TVersion end_version
     13: optional bool is_copy_binlog
     14: optional Types.TTabletId ref_tablet_id
+    // record the SHA-256 of each snapshot file in the manifest file of the snapshot
+    15: optional bool compute_digest
+    // after the snapshot is made, compute the logical digest of the tablet over (0, version] and report it
+    16: optional bool compute_logical_digest
+    // restore only: make an empty snapshot dir, to download the increment of the incremental restore into
+    17: optional bool restore_incremental
+    // restore only (atomic restore, partition level reuse): the data source of the snapshot is the local tablet
+    // ref_tablet_id (the tablet of the table being replaced) at `version`, instead of the tablet itself. Its files are
+    // hard linked into the snapshot dir of the tablet, or copied if the two tablets are not on the same disk. With
+    // restore_incremental the snapshot is loaded into the tablet at once (as the move of the restore does), and an
+    // empty snapshot dir is made for the increment to be downloaded into.
+    18: optional bool restore_local_source
+    // restore only: the id of the restore job. With restore_local_source, the evidence that the local source is
+    // loaded into the tablet by this job is saved with the tablet meta, to tell a resent task from a tablet
+    // which was changed.
+    19: optional i64 job_id
+}
+
+// Where to read the decomposed digest file (rdigest) of the tablet of a backup, for the incremental restore
+struct TRestoreDigestPrefixSource {
+    // the backup is in a repository
+    1: optional Types.TNetworkAddress broker_addr
+    2: optional map<string, string> broker_prop
+    3: optional Types.TStorageBackendType storage_backend
+    4: optional string location
+    // the path of the tablet snapshot in the repository, the same as the src of the download
+    5: optional string remote_path
+    // the backup is kept on local: the remote tablet snapshot (the remote fields are used)
+    6: optional TRemoteTabletSnapshot remote_tablet_snapshot
+    7: required Types.TTabletId remote_tablet_id
+    // SHA-256 of the decomposed digest file, recorded in the job info
+    8: required string root
+    // the version of the backup (V_b): the end version of the last rowset of the decomposed digest
+    9: required Types.TVersion end_version
+}
+
+// compute the logical digest (order independent digest of the visible rows) of a tablet at a version
+struct TRestoreDigestReq {
+    1: required Types.TTabletId tablet_id
+    2: required Types.TSchemaHash schema_hash
+    3: required Types.TVersion version
+    // worker threads of the task, <= 0 means the BE config restore_digest_threads
+    4: optional i32 threads
+    // if set, also compare the digest of the tablet at `version` with the one composed from the decomposed digest
+    // file of the backup, and check that the backup can be cut at `version`, see TRestoreDigestPrefixSource
+    5: optional TRestoreDigestPrefixSource prefix_source
 }
 
 struct TReleaseSnapshotRequest {
@@ -485,12 +553,30 @@ struct TPartitionVersionInfo {
     4: optional i64 commit_tso = -1
 }
 
+// The logical digest of the tablet of a backup, as TLogicalDigest of MasterService.thrift (which can not be
+// included here), see there for the fields.
+struct TRestoreBackupDigest {
+    1: optional i32 algo_version
+    2: optional string schema_sig
+    3: optional string root
+    4: optional i64 rows
+    5: optional string status_code
+}
+
 struct TMoveDirReq {
     1: required Types.TTabletId tablet_id
     2: required Types.TSchemaHash schema_hash
     3: required string src
     4: required i64 job_id
     5: required bool overwrite
+    // append the downloaded rowsets of this range to the tablet, instead of replacing the tablet
+    6: optional TRestoreIncrementalRange incremental
+    // with incremental: the logical digest of the backup of the tablet at incremental.end_version, to tell whether
+    // the data of the tablet is already the backup when the evidence of the append is missing
+    7: optional TRestoreBackupDigest backup_logical_digest
+    // with incremental: the tablet was loaded from a local source by this (atomic) restore job, the backend judges
+    // the task by the evidence in the tablet meta. Unset / false (non atomic incremental restore): as without it.
+    8: optional bool local_source_loaded
 }
 
 enum TAgentServiceVersion {
@@ -639,6 +725,7 @@ struct TAgentTaskRequest {
     35: optional TVisibleVersionReq visible_version_req
     36: optional TCleanUDFCacheReq clean_udf_cache_req
     37: optional TPushIndexPolicyReq push_index_policy_req
+    38: optional TRestoreDigestReq restore_digest_req
 
     // For cloud
     1000: optional TCalcDeleteBitmapRequest calc_delete_bitmap_req

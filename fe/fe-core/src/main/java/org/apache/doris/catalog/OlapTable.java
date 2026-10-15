@@ -237,6 +237,11 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
     @SerializedName(value = "aIncg")
     private AutoIncrementGenerator autoIncrementGenerator;
 
+    // The source table of the last RESTORE job that wrote this table, null if the table was never restored.
+    // See RestoreSource.
+    @SerializedName(value = "rsrc")
+    private RestoreSource restoreSource;
+
     private volatile Statistics statistics = new Statistics();
 
     // Transient map to coordinate concurrent partition creation tasks per partition name.
@@ -4263,5 +4268,13 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
                     + "binlog.need_historical_value=true. Table " + getQualifiedName()
                     + " doesn't enable historical value in row binlog.");
         }
+    }
+
+    public RestoreSource getRestoreSource() {
+        return restoreSource;
+    }
+
+    public void setRestoreSource(RestoreSource restoreSource) {
+        this.restoreSource = restoreSource;
     }
 }

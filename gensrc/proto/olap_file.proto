@@ -715,6 +715,22 @@ message BinlogConfigPB {
 
 // ATTN: When adding or deleting fields, please update `message TabletMetaCloudPB`
 // simultaneously and modify the conversion function in the be/src/cloud/pb_convert.{h,cpp}.
+// Restore only (atomic restore, partition level reuse): the evidence that the data of a staging tablet was loaded
+// from a local source / the increment of the backup was appended by the restore job `job_id`. It is saved with the
+// tablet meta, so it survives compaction, storage migration and restart.
+message RestoreStagePB {
+    enum Stage {
+        LOCAL_LOADED = 1;
+        APPENDED = 2;
+    }
+    optional int64 job_id = 1;
+    optional Stage stage = 2;
+    // the version of the local source loaded into the tablet
+    optional int64 base_version = 3;
+    // the version of the backup, only for APPENDED
+    optional int64 end_version = 4;
+}
+
 message TabletMetaPB {
     optional int64 table_id = 1;    // ?
     optional int64 partition_id = 2;    // ?
@@ -762,6 +778,8 @@ message TabletMetaPB {
     optional TabletRolePB tablet_role = 36 [default = TABLET_ROLE_DATA];
     // Used by a base tablet to find its paired row-binlog tablet.
     optional int64 binlog_tablet_id = 37;
+    // The completion evidence of the restore job which loaded the data of this tablet.
+    optional RestoreStagePB restore_stage = 38;
 
     // For cloud
     optional int64 index_id = 1000;
@@ -826,6 +844,8 @@ message TabletMetaCloudPB {
     optional TabletRolePB tablet_role = 41 [default = TABLET_ROLE_DATA];
     // Used by a base tablet to find its paired row-binlog tablet.
     optional int64 binlog_tablet_id = 42;
+    // The completion evidence of the restore job which loaded the data of this tablet.
+    optional RestoreStagePB restore_stage = 43;
 
     // Use for selectdb-cloud
     optional string table_name = 101;

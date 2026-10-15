@@ -17,12 +17,16 @@
 
 package org.apache.doris.backup;
 
+import org.apache.doris.common.Pair;
+
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
 import com.google.gson.annotations.SerializedName;
 
+import java.util.Iterator;
 import java.util.Map;
+import java.util.Set;
 
 public class RestoreFileMapping {
 
@@ -137,6 +141,25 @@ public class RestoreFileMapping {
             return overwriteMap.get(tabletId);
         }
         return false;
+    }
+
+    /**
+     * Remove the mapping of all tablets of the given partitions, e.g. the partitions that keep their local data.
+     *
+     * @param partitions the (table id, partition id) of the partitions
+     */
+    public void removePartitions(Set<Pair<Long, Long>> partitions) {
+        if (partitions.isEmpty()) {
+            return;
+        }
+        Iterator<Map.Entry<IdChain, IdChain>> iter = mapping.entrySet().iterator();
+        while (iter.hasNext()) {
+            IdChain dest = iter.next().getKey();
+            if (partitions.contains(Pair.of(dest.getTblId(), dest.getPartId()))) {
+                iter.remove();
+                overwriteMap.remove(dest.getTabletId());
+            }
+        }
     }
 
     public void clear() {

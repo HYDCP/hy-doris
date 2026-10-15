@@ -50,6 +50,7 @@ import org.apache.doris.thrift.TPushIndexPolicyReq;
 import org.apache.doris.thrift.TPushReq;
 import org.apache.doris.thrift.TPushStoragePolicyReq;
 import org.apache.doris.thrift.TReleaseSnapshotRequest;
+import org.apache.doris.thrift.TRestoreDigestReq;
 import org.apache.doris.thrift.TSnapshotRequest;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TStorageMediumMigrateReq;
@@ -327,6 +328,15 @@ public class AgentBatchTask implements Runnable {
                     LOG.debug(request.toString());
                 }
                 tAgentTaskRequest.setSnapshotReq(request);
+                return tAgentTaskRequest;
+            }
+            case RESTORE_DIGEST: {
+                RestoreDigestTask restoreDigestTask = (RestoreDigestTask) task;
+                TRestoreDigestReq request = restoreDigestTask.toThrift();
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(request.toString());
+                }
+                tAgentTaskRequest.setRestoreDigestReq(request);
                 return tAgentTaskRequest;
             }
             case RELEASE_SNAPSHOT: {

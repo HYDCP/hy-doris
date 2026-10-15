@@ -181,6 +181,34 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         return localMetaInfoFilePath;
     }
 
+    // Whether to compute the SHA-256 of the snapshot files when making snapshots, for the manifest of a backup
+    // kept on local (the http download path). The files uploaded to a remote repository always have it.
+    public void setManifestDigest(boolean manifestDigest) {
+        properties.put(BackupCommand.PROP_MANIFEST_DIGEST, String.valueOf(manifestDigest));
+    }
+
+    public boolean isManifestDigest() {
+        return Boolean.parseBoolean(properties.get(BackupCommand.PROP_MANIFEST_DIGEST));
+    }
+
+    // Whether the backend computes the logical digest of each tablet in the snapshot task, and the job info records
+    // it per tablet. Local (non cloud) tablets only.
+    public void setLogicalDigest(boolean logicalDigest) {
+        properties.put(BackupCommand.PROP_LOGICAL_DIGEST, String.valueOf(logicalDigest));
+    }
+
+    public boolean isLogicalDigest() {
+        return Boolean.parseBoolean(properties.get(BackupCommand.PROP_LOGICAL_DIGEST));
+    }
+
+    private boolean computeLogicalDigestInSnapshot() {
+        return isLogicalDigest() && !Config.isCloudMode();
+    }
+
+    private boolean computeDigestInSnapshot() {
+        return repoId == Repository.KEEP_ON_LOCAL_REPO_ID && isManifestDigest();
+    }
+
     public BackupContent getContent() {
         if (properties.containsKey(BackupCommand.PROP_CONTENT)) {
             return BackupCommand.BackupContent.valueOf(properties.get(BackupCommand.PROP_CONTENT).toUpperCase());
@@ -229,6 +257,8 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                     task.getIndexId(), task.getTabletId(),
                     task.getVersion(),
                     task.getSchemaHash(), timeoutMs, false /* not restore task */);
+            newTask.setComputeDigest(computeDigestInSnapshot());
+            newTask.setComputeLogicalDigest(computeLogicalDigestInSnapshot());
             unfinishedTaskIds.put(signature, beId);
 
             //send task
@@ -327,6 +357,21 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                 task.getIndexId(), task.getTabletId(), task.getBackendId(),
                 task.getSchemaHash(), request.getSnapshotPath(),
                 request.getSnapshotFiles());
+        // the root of the manifest written with the snapshot. For a remote repository, it is replaced by the root
+        // of the manifest uploaded by the upload task.
+        if (request.isSetManifestRoot()) {
+            info.setManifestRoot(request.getManifestRoot());
+        }
+        // The logical digest never fails the snapshot: NOT_SUPPORTED and errors are recorded as the reason why
+        // the tablet has no digest.
+        if (task.isComputeLogicalDigest()) {
+            info.setLogicalDigest(LogicalDigestInfo.fromThrift(
+                    request.isSetLogicalDigest() ? request.getLogicalDigest() : null));
+            // the decomposed digest file is optional: a tablet without one (unique MoR, ...) just has no root
+            if (request.isSetLogicalDigest() && request.getLogicalDigest().isSetPrefixRoot()) {
+                info.setPrefixDigestRoot(request.getLogicalDigest().getPrefixRoot());
+            }
+        }
 
         snapshotInfos.put(task.getTabletId(), info);
         taskProgress.remove(task.getSignature());
@@ -386,6 +431,14 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
 
             // reset files in snapshot info with checksum filename
             info.setFiles(tabletFileMap.get(tabletId));
+            // the root of the manifest uploaded next to the files. Absent if the backend is an old version, then the
+            // job has no manifest.
+            info.setManifestRoot(request.isSetManifestRoots() ? request.getManifestRoots().get(tabletId) : null);
+            // the decomposed digest file uploaded next to the files, only a tablet which had one has a root.
+            if (info.getPrefixDigestRoot() != null) {
+                info.setPrefixDigestRoot(request.isSetPrefixDigestRoots()
+                        ? request.getPrefixDigestRoots().get(tabletId) : null);
+            }
         }
 
         taskProgress.remove(task.getSignature());
@@ -707,6 +760,8 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                             index.getId(), tablet.getId(),
                             visibleVersion,
                             schemaHash, timeoutMs, false /* not restore task */);
+                    task.setComputeDigest(computeDigestInSnapshot());
+                    task.setComputeLogicalDigest(computeLogicalDigestInSnapshot());
                     batchTask.addTask(task);
                     unfinishedTaskIds.put(signature, beId);
                 }
@@ -956,6 +1011,20 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
 
             jobInfo = BackupJobInfo.fromCatalog(createTime, label, dbName, dbId,
                     getContent(), backupMeta, filteredSnapshotInfos, tableCommitSeqMap);
+            // the files uploaded to a repository always have the digests, a backup kept on local has them only if
+            // required by the manifest_digest property.
+            String digestAlgorithm = repoId != Repository.KEEP_ON_LOCAL_REPO_ID || isManifestDigest()
+                    ? BackupJobInfo.DIGEST_SHA256 : BackupJobInfo.DIGEST_NONE;
+            boolean hasManifest = jobInfo.buildManifest(filteredSnapshotInfos, digestAlgorithm);
+            LOG.info("backup manifest: {}, digest algorithm: {}. {}", hasManifest, jobInfo.digestAlgorithm, this);
+            if (isLogicalDigest()) {
+                int withDigest = jobInfo.buildLogicalDigests(filteredSnapshotInfos);
+                LOG.info("backup logical digest: {} of {} tablets have a digest. {}", withDigest,
+                        filteredSnapshotInfos.size(), this);
+                int withPrefix = jobInfo.buildPrefixDigests(filteredSnapshotInfos);
+                LOG.info("backup decomposed digest: {} of {} tablets have a decomposed digest file. {}",
+                        withPrefix, filteredSnapshotInfos.size(), this);
+            }
             if (LOG.isDebugEnabled()) {
                 LOG.debug("job info: {}. {}", jobInfo, this);
             }

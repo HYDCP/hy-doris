@@ -54,6 +54,19 @@ public class SnapshotInfo implements Writable {
     // 10006.hdr
     @SerializedName("f")
     private List<String> files = Lists.newArrayList();
+    // The SHA-256 of the manifest file of the tablet snapshot, reported by the backend: the manifest written
+    // when making the snapshot (kept on local), or the one uploaded next to the files (repository).
+    // Null if not reported (e.g. an old backend).
+    @SerializedName("mr")
+    private String manifestRoot;
+    // The logical digest of the tablet snapshot reported by the backend, null if it was not asked for.
+    @SerializedName("ld")
+    private LogicalDigestInfo logicalDigest;
+    // The SHA-256 of the decomposed digest file (rdigest) of the tablet snapshot, from which the logical digest at
+    // any rowset boundary version can be composed. Reported by the backend, written next to the manifest (kept on
+    // local), or the one uploaded next to the files (repository). Null if the tablet has none.
+    @SerializedName("rd")
+    private String prefixDigestRoot;
 
     // for cloud
     @SerializedName("storageVaultId")
@@ -125,6 +138,30 @@ public class SnapshotInfo implements Writable {
 
     public void setFiles(List<String> files) {
         this.files = files;
+    }
+
+    public String getManifestRoot() {
+        return manifestRoot;
+    }
+
+    public void setManifestRoot(String manifestRoot) {
+        this.manifestRoot = manifestRoot;
+    }
+
+    public LogicalDigestInfo getLogicalDigest() {
+        return logicalDigest;
+    }
+
+    public void setLogicalDigest(LogicalDigestInfo logicalDigest) {
+        this.logicalDigest = logicalDigest;
+    }
+
+    public String getPrefixDigestRoot() {
+        return prefixDigestRoot;
+    }
+
+    public void setPrefixDigestRoot(String prefixDigestRoot) {
+        this.prefixDigestRoot = prefixDigestRoot;
     }
 
     public String getTabletPath() {
