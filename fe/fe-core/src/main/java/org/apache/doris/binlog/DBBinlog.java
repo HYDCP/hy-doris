@@ -220,14 +220,18 @@ public class DBBinlog {
         lock.readLock().lock();
         try {
             if (tableId >= 0) {
-                // Check if table is dropped first, before checking tableBinlogMap
-                if (isTableDropped(tableId)) {
-                    LOG.warn("table is dropped. tableId: {}", tableId);
+                TableBinlog tableBinlog = tableBinlogMap.get(tableId);
+                // A dropped table keeps serving the binlogs committed before its drop (e.g. the
+                // REPLACE_TABLE binlog of a non-swap replace, which consumers need to follow the
+                // new table), and reports BINLOG_NOT_FOUND_TABLE only once they are all consumed.
+                // A prevCommitSeq older than the gc point still gets BINLOG_TOO_OLD_COMMIT_SEQ, so
+                // that the consumer can recover by a full sync.
+                if (isTableDropped(tableId) && isDrained(tableBinlog, prevCommitSeq)) {
+                    LOG.warn("table is dropped. tableId: {}, prevCommitSeq: {}", tableId, prevCommitSeq);
                     status.setStatusCode(TStatusCode.BINLOG_NOT_FOUND_TABLE);
                     return Pair.of(status, null);
                 }
 
-                TableBinlog tableBinlog = tableBinlogMap.get(tableId);
                 if (tableBinlog == null) {
                     LOG.warn("table binlog not found. tableId: {}", tableId);
                     status.setStatusCode(TStatusCode.BINLOG_NOT_FOUND_TABLE);
@@ -277,14 +281,14 @@ public class DBBinlog {
         lock.readLock().lock();
         try {
             if (tableId >= 0) {
-                // Check if table is dropped first, before checking tableBinlogMap
-                if (isTableDropped(tableId)) {
-                    LOG.warn("table is dropped. tableId: {}", tableId);
+                TableBinlog tableBinlog = tableBinlogMap.get(tableId);
+                // Same as getBinlog: report the lag until the binlogs before the drop are consumed.
+                if (isTableDropped(tableId) && isDrained(tableBinlog, prevCommitSeq)) {
+                    LOG.warn("table is dropped. tableId: {}, prevCommitSeq: {}", tableId, prevCommitSeq);
                     status.setStatusCode(TStatusCode.BINLOG_NOT_FOUND_TABLE);
                     return Pair.of(status, null);
                 }
 
-                TableBinlog tableBinlog = tableBinlogMap.get(tableId);
                 if (tableBinlog == null) {
                     LOG.warn("table binlog not found. tableId: {}", tableId);
                     status.setStatusCode(TStatusCode.BINLOG_NOT_FOUND_TABLE);
@@ -307,12 +311,10 @@ public class DBBinlog {
                 return lockDbBinlog(jobUniqueId, lockCommitSeq);
             }
 
-            // Check if table is dropped first, before checking tableBinlogMap
-            if (isTableDropped(tableId)) {
-                LOG.warn("table is dropped. dbId: {}, tableId: {}", dbId, tableId);
-                return Pair.of(new TStatus(TStatusCode.BINLOG_NOT_FOUND_TABLE), -1L);
-            }
-
+            // A lock only records the consumed position to speed up gc, it does not read
+            // binlogs, so it is not affected by the dropped state: the latest position (-1)
+            // and the last consumed position of a dropped table are both valid. The dropped
+            // signal is reported by getBinlog and getBinlogLag.
             tableBinlog = tableBinlogMap.get(tableId);
         } finally {
             lock.writeLock().unlock();
@@ -669,6 +671,11 @@ public class DBBinlog {
     // Require: the lock is held by the caller.
     private boolean isTableDropped(long tableId) {
         return droppedTableIds.contains(tableId);
+    }
+
+    // Whether a consumer at prevCommitSeq has consumed all binlogs of the table binlog.
+    private static boolean isDrained(TableBinlog tableBinlog, long prevCommitSeq) {
+        return tableBinlog == null || tableBinlog.isDrained(prevCommitSeq);
     }
 
     public void getBinlogInfo(BaseProcResult result) {
