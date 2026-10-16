@@ -98,6 +98,36 @@ public class TableBinlogTest {
     }
 
     @Test
+    public void testGcWithConfigRecoveredFromDummy() {
+        new MockUp<BinlogUtils>() {
+            @Mock
+            public long getExpiredMs(long direct) {
+                return direct;
+            }
+        };
+
+        long expiredTime = baseNum + expiredBinlogNum;
+        Map<String, Long> ttlMap = Maps.newHashMap();
+        ttlMap.put(String.format("%d_%d", dbId, tableId), expiredTime);
+        MockBinlogConfigCache configuredCache = BinlogTestUtils.newMockBinlogConfigCache(ttlMap);
+
+        TBinlog originalBinlog = BinlogTestUtils.newBinlog(dbId, tableId, baseNum, baseNum);
+        TableBinlog original = new TableBinlog(configuredCache, originalBinlog, dbId, tableId);
+        Assert.assertTrue(original.getDummyBinlog().isSetData());
+
+        TableBinlog restored = new TableBinlog(new MockBinlogConfigCache(Maps.newHashMap()),
+                original.getDummyBinlog(), dbId, tableId);
+        TBinlog expiredBinlog = BinlogTestUtils.newBinlog(dbId, tableId, baseNum + 1, expiredTime);
+        restored.addBinlog(expiredBinlog);
+
+        BinlogTombstone tombstone = restored.gc();
+
+        Assert.assertNotNull(tombstone);
+        Assert.assertEquals(0, expiredBinlog.getTableRef());
+        Assert.assertEquals(expiredBinlog.getCommitSeq(), restored.getDummyBinlog().getCommitSeq());
+    }
+
+    @Test
     public void testCommitSeqGc() {
         // init base data
         BinlogConfigCache binlogConfigCache = BinlogTestUtils.newMockBinlogConfigCache(dbId, tableId, 0);

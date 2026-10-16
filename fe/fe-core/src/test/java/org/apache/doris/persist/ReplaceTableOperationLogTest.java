@@ -17,6 +17,8 @@
 
 package org.apache.doris.persist;
 
+import org.apache.doris.catalog.BinlogConfig;
+
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -29,30 +31,41 @@ import java.io.FileOutputStream;
 public class ReplaceTableOperationLogTest {
     @Test
     public void testSerialization() throws Exception {
-        // 1. Write objects to file
         File file = new File("./ReplaceTableOperationLogTest");
         file.createNewFile();
         DataOutputStream dos = new DataOutputStream(new FileOutputStream(file));
 
-        ReplaceTableOperationLog log = new ReplaceTableOperationLog(1, 2, "old", 3, "new", true);
+        BinlogConfig binlogConfig = new BinlogConfig(true, 3600L, 1024L, 10L);
+        ReplaceTableOperationLog log = new ReplaceTableOperationLog(1L, 2L, "origin", 3L, "replacement",
+                false, binlogConfig);
         log.write(dos);
 
         dos.flush();
         dos.close();
 
-        // 2. Read objects from file
         DataInputStream dis = new DataInputStream(new FileInputStream(file));
+        ReplaceTableOperationLog restored = ReplaceTableOperationLog.read(dis);
 
-        ReplaceTableOperationLog readLog = ReplaceTableOperationLog.read(dis);
-        Assert.assertTrue(readLog.getDbId() == log.getDbId());
-        Assert.assertTrue(readLog.getNewTblId() == log.getNewTblId());
-        Assert.assertTrue(readLog.getOrigTblId() == log.getOrigTblId());
-        Assert.assertTrue(readLog.isSwapTable() == log.isSwapTable());
-        Assert.assertTrue(readLog.getOrigTblName().equals(log.getOrigTblName()));
-        Assert.assertTrue(readLog.getNewTblName().equals(log.getNewTblName()));
+        Assert.assertEquals(log.getDbId(), restored.getDbId());
+        Assert.assertEquals(log.getNewTblId(), restored.getNewTblId());
+        Assert.assertEquals(log.getOrigTblId(), restored.getOrigTblId());
+        Assert.assertEquals(log.isSwapTable(), restored.isSwapTable());
+        Assert.assertEquals(log.getOrigTblName(), restored.getOrigTblName());
+        Assert.assertEquals(log.getNewTblName(), restored.getNewTblName());
+        Assert.assertEquals(binlogConfig, restored.getOrigTblBinlogConfig());
 
-        // 3. delete files
         dis.close();
         file.delete();
+    }
+
+    @Test
+    public void testOriginTableBinlogConfigIsPersistedInJson() {
+        BinlogConfig binlogConfig = new BinlogConfig(true, 3600L, 1024L, 10L);
+        ReplaceTableOperationLog log = new ReplaceTableOperationLog(1L, 2L, "origin", 3L, "replacement",
+                false, binlogConfig);
+
+        ReplaceTableOperationLog restored = ReplaceTableOperationLog.fromJson(log.toJson());
+
+        Assert.assertEquals(binlogConfig, restored.getOrigTblBinlogConfig());
     }
 }
