@@ -469,14 +469,28 @@ public class DbBinlogTest {
 
         addDropTableBinlog(dbBinlog, baseTableId, 3);
 
-        // after drop: all table level APIs return BINLOG_NOT_FOUND_TABLE immediately
-        Pair<TStatus, List<TBinlog>> binlogResult = dbBinlog.getBinlog(baseTableId, -1, 10);
+        // after drop: the binlogs committed before the drop are still served
+        Pair<TStatus, List<TBinlog>> binlogResult = dbBinlog.getBinlog(baseTableId, 1, 10);
+        Assert.assertEquals(TStatusCode.OK, binlogResult.first.getStatusCode());
+        Assert.assertEquals(2, binlogResult.second.get(0).getCommitSeq());
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.getBinlogLag(baseTableId, 1).first.getStatusCode());
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.lockBinlog(baseTableId, "job1", 1).first.getStatusCode());
+
+        // once they are consumed, getBinlog and getBinlogLag return BINLOG_NOT_FOUND_TABLE
+        binlogResult = dbBinlog.getBinlog(baseTableId, 2, 10);
         Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE, binlogResult.first.getStatusCode());
-        Pair<TStatus, BinlogLagInfo> lagResult = dbBinlog.getBinlogLag(baseTableId, -1);
+        Pair<TStatus, BinlogLagInfo> lagResult = dbBinlog.getBinlogLag(baseTableId, 2);
         Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE, lagResult.first.getStatusCode());
-        Pair<TStatus, Long> lockResult = dbBinlog.lockBinlog(baseTableId, "job1", -1);
-        Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE, lockResult.first.getStatusCode());
-        Assert.assertEquals(-1L, (long) lockResult.second);
+        // lockBinlog is not affected by the dropped state: locking the last consumed position
+        // and the latest position (-1) are both valid
+        Pair<TStatus, Long> lockResult = dbBinlog.lockBinlog(baseTableId, "job1", 2);
+        Assert.assertEquals(TStatusCode.OK, lockResult.first.getStatusCode());
+        Assert.assertEquals(2L, (long) lockResult.second);
+        lockResult = dbBinlog.lockBinlog(baseTableId, "job3", -1);
+        Assert.assertEquals(TStatusCode.OK, lockResult.first.getStatusCode());
+        Assert.assertEquals(2L, (long) lockResult.second);
 
         // db level binlog (tableId = -1) is not affected by dropped tables
         Assert.assertNotEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
@@ -492,7 +506,7 @@ public class DbBinlogTest {
         DBBinlog dbBinlog = newEnabledDbBinlog(baseTableId);
         addDropTableBinlog(dbBinlog, baseTableId, 3);
         Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
-                dbBinlog.getBinlog(baseTableId, -1, 10).first.getStatusCode());
+                dbBinlog.getBinlog(baseTableId, 2, 10).first.getStatusCode());
 
         // recover the table, the dropped signal should be cleared automatically
         TBinlog binlog = BinlogTestUtils.newBinlog(dbId, baseTableId, 4, 4);
@@ -519,7 +533,7 @@ public class DbBinlogTest {
 
         // the old id keeps reporting BINLOG_NOT_FOUND_TABLE, the new id works
         Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
-                dbBinlog.getBinlog(baseTableId, -1, 10).first.getStatusCode());
+                dbBinlog.getBinlog(baseTableId, 2, 10).first.getStatusCode());
         Assert.assertEquals(TStatusCode.OK,
                 dbBinlog.getBinlog(newTableId, -1, 10).first.getStatusCode());
     }
@@ -543,8 +557,77 @@ public class DbBinlogTest {
         ReplaceTableOperationLog replaceLog = ReplaceTableOperationLog.fromJson(
                 "{\"origTblId\":" + baseTableId + ",\"swapTable\":false}");
         dbBinlog.addBinlog(replaceBinlog, replaceLog);
+
+        // the consumer of the orig table must still get the REPLACE_TABLE binlog itself,
+        // otherwise a table sync job can never switch to the new table
+        Pair<TStatus, List<TBinlog>> binlogResult = dbBinlog.getBinlog(baseTableId, 3, 10);
+        Assert.assertEquals(TStatusCode.OK, binlogResult.first.getStatusCode());
+        Assert.assertEquals(1, binlogResult.second.size());
+        Assert.assertEquals(4, binlogResult.second.get(0).getCommitSeq());
+        Assert.assertEquals(TBinlogType.REPLACE_TABLE, binlogResult.second.get(0).getType());
+        Pair<TStatus, BinlogLagInfo> lagResult = dbBinlog.getBinlogLag(baseTableId, 3);
+        Assert.assertEquals(TStatusCode.OK, lagResult.first.getStatusCode());
+        Assert.assertEquals(1, lagResult.second.getLag());
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.lockBinlog(baseTableId, "job1", 3).first.getStatusCode());
+
+        // after the REPLACE_TABLE binlog is consumed, the orig table is reported as dropped
         Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
-                dbBinlog.getBinlog(baseTableId, -1, 10).first.getStatusCode());
+                dbBinlog.getBinlog(baseTableId, 4, 10).first.getStatusCode());
+        Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
+                dbBinlog.getBinlogLag(baseTableId, 4).first.getStatusCode());
+        // locking the REPLACE_TABLE position, or the latest position at the start of a full
+        // sync that still uses the orig table id, is valid
+        Pair<TStatus, Long> lockResult = dbBinlog.lockBinlog(baseTableId, "job1", 4);
+        Assert.assertEquals(TStatusCode.OK, lockResult.first.getStatusCode());
+        Assert.assertEquals(4L, (long) lockResult.second);
+        lockResult = dbBinlog.lockBinlog(baseTableId, "job2", -1);
+        Assert.assertEquals(TStatusCode.OK, lockResult.first.getStatusCode());
+        Assert.assertEquals(4L, (long) lockResult.second);
+    }
+
+    @Test
+    public void testReplaceTableTooOldAfterGc() {
+        // db binlog enabled, all binlogs with timestamp <= expiredTime will be gc'd
+        long expiredTime = 10;
+        Map<String, Long> ttlMap = Maps.newHashMap();
+        MockBinlogConfigCache binlogConfigCache = BinlogTestUtils.newMockBinlogConfigCache(ttlMap);
+        binlogConfigCache.addDbBinlogConfig(dbId, true, expiredTime);
+        binlogConfigCache.addTableBinlogConfig(dbId, baseTableId, true, expiredTime);
+
+        DBBinlog dbBinlog = new DBBinlog(binlogConfigCache,
+                BinlogTestUtils.newBinlog(dbId, baseTableId, 1, 1));
+        dbBinlog.addBinlog(BinlogTestUtils.newBinlog(dbId, baseTableId, 1, 1), null);
+        // non-swap replace at commitSeq 2, not expired
+        TBinlog replaceBinlog = BinlogTestUtils.newBinlog(dbId, baseTableId, 2, expiredTime + 10);
+        replaceBinlog.setType(TBinlogType.REPLACE_TABLE);
+        ReplaceTableOperationLog replaceLog = ReplaceTableOperationLog.fromJson(
+                "{\"origTblId\":" + baseTableId + ",\"swapTable\":false}");
+        dbBinlog.addBinlog(replaceBinlog, replaceLog);
+
+        // gc the binlog at commitSeq 1, the drop record at commitSeq 2 is kept
+        dbBinlog.gc();
+        Assert.assertEquals(1, dbBinlog.getDroppedTables().size());
+
+        // a consumer older than the gc point gets TOO_OLD with the dummy binlog, as for a
+        // live table, so that it can recover by a full sync instead of being told the
+        // table is not found
+        Pair<TStatus, List<TBinlog>> binlogResult = dbBinlog.getBinlog(baseTableId, 0, 10);
+        Assert.assertEquals(TStatusCode.BINLOG_TOO_OLD_COMMIT_SEQ, binlogResult.first.getStatusCode());
+        Assert.assertEquals(TBinlogType.DUMMY, binlogResult.second.get(0).getType());
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.getBinlogLag(baseTableId, 0).first.getStatusCode());
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.lockBinlog(baseTableId, "job1", 0).first.getStatusCode());
+
+        // the REPLACE_TABLE binlog itself is still served
+        binlogResult = dbBinlog.getBinlog(baseTableId, 1, 10);
+        Assert.assertEquals(TStatusCode.OK, binlogResult.first.getStatusCode());
+        Assert.assertEquals(TBinlogType.REPLACE_TABLE, binlogResult.second.get(0).getType());
+
+        // drained
+        Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
+                dbBinlog.getBinlog(baseTableId, 2, 10).first.getStatusCode());
     }
 
     @Test
@@ -564,7 +647,7 @@ public class DbBinlogTest {
         dbBinlog.addBinlog(BinlogTestUtils.newBinlog(dbId, baseTableId, 3, 3), null);
 
         Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
-                dbBinlog.getBinlog(baseTableId, -1, 10).first.getStatusCode());
+                dbBinlog.getBinlog(baseTableId, 3, 10).first.getStatusCode());
 
         // the drop record (commitSeq 2) is expired by gc, the signal is cleared
         dbBinlog.gc();

@@ -124,6 +124,23 @@ public class TableBinlog {
         }
     }
 
+    // Whether a consumer at prevCommitSeq has consumed all binlogs, i.e. getBinlog(prevCommitSeq)
+    // would return BINLOG_TOO_NEW_COMMIT_SEQ. A prevCommitSeq older than the first binlog is not
+    // drained, it is too old.
+    public boolean isDrained(long prevCommitSeq) {
+        lock.readLock().lock();
+        try {
+            if (binlogs.first().getCommitSeq() > prevCommitSeq) {
+                return false;
+            }
+            TBinlog guard = new TBinlog();
+            guard.setCommitSeq(prevCommitSeq);
+            return binlogs.higher(guard) == null;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
     public Pair<TStatus, BinlogLagInfo> getBinlogLag(long prevCommitSeq) {
         lock.readLock().lock();
         try {
