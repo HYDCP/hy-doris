@@ -168,12 +168,6 @@ DEFINE_GAUGE_METRIC_PROTOTYPE_2ARG(arrow_flight_work_max_threads, MetricUnit::NO
 
 static bvar::LatencyRecorder g_process_remote_fetch_rowsets_latency("process_remote_fetch_rowsets");
 
-bthread_key_t btls_key;
-
-static void thread_context_deleter(void* d) {
-    delete static_cast<ThreadContext*>(d);
-}
-
 template <typename T>
 class NewHttpClosure : public ::google::protobuf::Closure {
 public:
@@ -251,7 +245,6 @@ PInternalService::PInternalService(ExecEnv* exec_env)
 
     _exec_env->load_stream_mgr()->set_heavy_work_pool(&_heavy_work_pool);
 
-    CHECK_EQ(0, bthread_key_create(&btls_key, thread_context_deleter));
     CHECK_EQ(0, bthread_key_create(&AsyncIO::btls_io_ctx_key, AsyncIO::io_ctx_key_deleter));
 }
 
@@ -276,7 +269,6 @@ PInternalService::~PInternalService() {
     DEREGISTER_HOOK_METRIC(arrow_flight_work_pool_max_queue_size);
     DEREGISTER_HOOK_METRIC(arrow_flight_work_max_threads);
 
-    CHECK_EQ(0, bthread_key_delete(btls_key));
     CHECK_EQ(0, bthread_key_delete(AsyncIO::btls_io_ctx_key));
 }
 

@@ -17,6 +17,8 @@
 
 #include "runtime/thread_context.h"
 
+#include <mutex>
+
 #include "common/signal_handler.h"
 #include "runtime/query_context.h"
 #include "runtime/runtime_state.h"
@@ -24,6 +26,22 @@
 
 namespace doris {
 class MemTracker;
+
+bthread_key_t btls_key;
+
+namespace {
+
+void thread_context_deleter(void* data) {
+    delete static_cast<ThreadContext*>(data);
+}
+
+} // namespace
+
+void init_thread_context_btls_key() {
+    static std::once_flag btls_key_once;
+    std::call_once(btls_key_once,
+                   []() { CHECK_EQ(0, bthread_key_create(&btls_key, thread_context_deleter)); });
+}
 
 QueryThreadContext ThreadContext::query_thread_context() {
     DCHECK(doris::pthread_context_ptr_init);

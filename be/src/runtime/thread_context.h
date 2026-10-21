@@ -165,6 +165,10 @@ class WorkloadGroup;
 
 extern bthread_key_t btls_key;
 
+// Initialize btls_key exactly once before it is used by any thread context. The key has
+// process lifetime so an existing bthread context never becomes invalid while the BE is running.
+void init_thread_context_btls_key();
+
 // Is true after ThreadContext construction.
 inline thread_local bool pthread_context_ptr_init = false;
 inline thread_local constinit ThreadContext* thread_context_ptr = nullptr;
@@ -308,6 +312,7 @@ private:
 class ThreadLocalHandle {
 public:
     static void create_thread_local_if_not_exits() {
+        init_thread_context_btls_key();
         if (bthread_self() == 0) {
             if (!pthread_context_ptr_init) {
                 thread_context_ptr = new ThreadContext();
