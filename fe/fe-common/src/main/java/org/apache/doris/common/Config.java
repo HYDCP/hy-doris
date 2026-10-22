@@ -120,11 +120,10 @@ public class Config extends ConfigBase {
             "The threshold of slow query, in milliseconds. "
                     + "If the response time of a query exceeds this threshold, it will be recorded in audit log."})
     public static long qe_slow_log_ms = 5000;
-    @ConfField(mutable = true, description = {"sql_digest 生成的时间阈值，单位为毫秒。如果一个查询的响应时间超过这个阈值，"
-            + "则会为其生成 sql_digest。",
-            "The threshold of sql_digest generation, in milliseconds. "
-                    + "If the response time of a query exceeds this threshold, "
-                    + "sql_digest will be generated for it."})
+    @ConfField(mutable = true, description = {"成功查询生成 sql_digest 的时间阈值，单位为毫秒。"
+            + "失败查询已有非空结构摘要时，生成 sql_digest 不受此阈值限制。",
+            "The threshold of sql_digest generation for successful queries, in milliseconds. "
+                    + "Failed queries with a nonempty structural digest are not subject to this threshold."})
     public static long sql_digest_generation_threshold_ms = 5000;
     @ConfField(description = {"FE 审计日志文件的切分周期", "The split cycle of the FE audit log file"},
             options = {"DAY", "HOUR"})
