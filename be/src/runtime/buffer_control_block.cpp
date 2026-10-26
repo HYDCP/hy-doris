@@ -22,6 +22,8 @@
 #include <gen_cpp/internal_service.pb.h>
 #include <glog/logging.h>
 #include <google/protobuf/stubs/callback.h>
+
+#include "common/query_log_context.h"
 // IWYU pragma: no_include <bits/chrono.h>
 #include <chrono> // IWYU pragma: keep
 #include <limits>
@@ -149,6 +151,7 @@ void GetArrowResultBatchCtx::on_data(
 
 BufferControlBlock::BufferControlBlock(TUniqueId id, int buffer_size, RuntimeState* state)
         : _fragment_id(std::move(id)),
+          _query_id(state->query_id()),
           _is_close(false),
           _is_cancelled(false),
           _buffer_limit(buffer_size),
@@ -179,6 +182,8 @@ Status BufferControlBlock::init() {
 
 Status BufferControlBlock::add_batch(RuntimeState* state,
                                      std::unique_ptr<TFetchDataResult>& result) {
+    ScopedQueryLogContext query_log_scope {
+            QueryLogIdentity(_query_id, state->fragment_instance_id())};
     std::unique_lock<std::mutex> l(_lock);
 
     if (_is_cancelled) {
@@ -215,6 +220,8 @@ Status BufferControlBlock::add_batch(RuntimeState* state,
 
 Status BufferControlBlock::add_arrow_batch(RuntimeState* state,
                                            std::shared_ptr<vectorized::Block>& result) {
+    ScopedQueryLogContext query_log_scope {
+            QueryLogIdentity(_query_id, state->fragment_instance_id())};
     std::unique_lock<std::mutex> l(_lock);
 
     if (_is_cancelled) {
@@ -244,6 +251,7 @@ Status BufferControlBlock::add_arrow_batch(RuntimeState* state,
 }
 
 void BufferControlBlock::get_batch(GetResultBatchCtx* ctx) {
+    ScopedQueryLogContext query_log_scope {QueryLogIdentity(_query_id)};
     std::lock_guard<std::mutex> l(_lock);
     Defer defer {[&]() { _update_dependency(); }};
     if (!_status.ok()) {
@@ -277,6 +285,7 @@ void BufferControlBlock::get_batch(GetResultBatchCtx* ctx) {
 
 Status BufferControlBlock::get_arrow_batch(std::shared_ptr<vectorized::Block>* result,
                                            cctz::time_zone& timezone_obj) {
+    ScopedQueryLogContext query_log_scope {QueryLogIdentity(_query_id)};
     std::unique_lock<std::mutex> l(_lock);
     Defer defer {[&]() { _update_dependency(); }};
     if (!_status.ok()) {
@@ -329,6 +338,7 @@ Status BufferControlBlock::get_arrow_batch(std::shared_ptr<vectorized::Block>* r
 }
 
 void BufferControlBlock::get_arrow_batch(GetArrowResultBatchCtx* ctx) {
+    ScopedQueryLogContext query_log_scope {QueryLogIdentity(_query_id)};
     std::unique_lock<std::mutex> l(_lock);
     SCOPED_ATTACH_TASK(_mem_tracker);
     Defer defer {[&]() { _update_dependency(); }};
@@ -382,6 +392,7 @@ void BufferControlBlock::register_arrow_schema(const std::shared_ptr<arrow::Sche
 }
 
 Status BufferControlBlock::find_arrow_schema(std::shared_ptr<arrow::Schema>* arrow_schema) {
+    ScopedQueryLogContext query_log_scope {QueryLogIdentity(_query_id)};
     std::unique_lock<std::mutex> l(_lock);
     if (!_status.ok()) {
         return _status;
@@ -404,6 +415,7 @@ Status BufferControlBlock::find_arrow_schema(std::shared_ptr<arrow::Schema>* arr
 }
 
 Status BufferControlBlock::close(const TUniqueId& id, Status exec_status) {
+    ScopedQueryLogContext query_log_scope {QueryLogIdentity(_query_id)};
     std::unique_lock<std::mutex> l(_lock);
     // close will be called multiple times and error status needs to be collected.
     if (!exec_status.ok()) {
@@ -451,6 +463,7 @@ Status BufferControlBlock::close(const TUniqueId& id, Status exec_status) {
 }
 
 void BufferControlBlock::cancel() {
+    ScopedQueryLogContext query_log_scope {QueryLogIdentity(_query_id)};
     std::unique_lock<std::mutex> l(_lock);
     SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_mem_tracker);
     _is_cancelled = true;

@@ -55,6 +55,9 @@ void AttachTask::init(const QueryThreadContext& query_thread_context) {
     thread_context()->attach_task(query_thread_context.query_id,
                                   query_thread_context.query_mem_tracker,
                                   query_thread_context.wg_wptr);
+    if (query_thread_context.query_id != TUniqueId()) {
+        _query_log_scope.reset(QueryLogIdentity(query_thread_context.query_id));
+    }
 }
 
 AttachTask::AttachTask(const std::shared_ptr<MemTrackerLimiter>& mem_tracker) {
@@ -68,6 +71,8 @@ AttachTask::AttachTask(RuntimeState* runtime_state) {
                                                runtime_state->query_mem_tracker(),
                                                runtime_state->get_query_ctx()->workload_group()};
     init(query_thread_context);
+    _query_log_scope.reset(
+            QueryLogIdentity(runtime_state->query_id(), runtime_state->fragment_instance_id()));
 }
 
 AttachTask::AttachTask(const QueryThreadContext& query_thread_context) {
