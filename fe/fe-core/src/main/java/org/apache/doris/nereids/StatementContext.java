@@ -30,6 +30,7 @@ import org.apache.doris.common.FormatOptions;
 import org.apache.doris.common.Id;
 import org.apache.doris.common.IdGenerator;
 import org.apache.doris.common.Pair;
+import org.apache.doris.common.profile.PlanningDiagnostics;
 import org.apache.doris.datasource.ExternalTable;
 import org.apache.doris.datasource.mvcc.MvccSnapshot;
 import org.apache.doris.datasource.mvcc.MvccTable;
@@ -351,7 +352,9 @@ public class StatementContext implements Closeable {
             default:
                 throw new AnalysisException("Unknown table from " + tableFrom);
         }
-        return tables.computeIfAbsent(tableQualifier, k -> RelationUtil.getTable(k, connectContext.getEnv()));
+        return tables.computeIfAbsent(tableQualifier, k -> PlanningDiagnostics.operation(connectContext,
+                "resolve_table", () -> String.join(".", k), -1,
+                () -> RelationUtil.getTable(k, connectContext.getEnv())));
     }
 
     /**
@@ -649,15 +652,26 @@ public class StatementContext implements Closeable {
             if (!tableIf.needReadLockWhenPlan()) {
                 continue;
             }
-            if (!tableIf.tryReadLock(1, TimeUnit.MINUTES)) {
-                close();
-                throw new RuntimeException("Failed to get read lock on table:" + tableIf.getName());
-            }
             String fullTableName = tableIf.getNameWithFullQualifiers();
+            PlanningDiagnostics.operation(connectContext, "read_lock_wait", fullTableName,
+                    TimeUnit.MINUTES.toMillis(1), () -> {
+                        if (!tableIf.tryReadLock(1, TimeUnit.MINUTES)) {
+                            close();
+                            throw new RuntimeException("Failed to get read lock on table:" + tableIf.getName());
+                        }
+                        return null;
+                    });
+            PlanningDiagnostics diagnostics = PlanningDiagnostics.current(connectContext);
+            PlanningDiagnostics.LockHold hold = diagnostics == null ? null : diagnostics.acquiredLock(fullTableName);
             String resourceName = "tableReadLock(" + fullTableName + ")";
             plannerResources.push(new CloseableResource(
                     resourceName, Thread.currentThread().getName(),
-                    originStatement == null ? null : originStatement.originStmt, tableIf::readUnlock));
+                    originStatement == null ? null : originStatement.originStmt, () -> {
+                        tableIf.readUnlock();
+                        if (hold != null) {
+                            hold.close();
+                        }
+                    }));
         }
     }
 
@@ -736,6 +750,15 @@ public class StatementContext implements Closeable {
         if (!(tableIf instanceof MvccTable)) {
             return;
         }
+        PlanningDiagnostics.operation(connectContext, "load_snapshot", tableIf::getNameWithFullQualifiers,
+                -1, () -> {
+                    loadSnapshotInternal(tableIf, tableSnapshot, scanParams);
+                    return null;
+                });
+    }
+
+    private void loadSnapshotInternal(TableIf tableIf, Optional<TableSnapshot> tableSnapshot,
+            Optional<TableScanParams> scanParams) {
         MvccTableInfo mvccTableInfo = new MvccTableInfo(tableIf);
         // may be set by MTMV, we can not load again
         if (!snapshots.containsKey(mvccTableInfo)) {
