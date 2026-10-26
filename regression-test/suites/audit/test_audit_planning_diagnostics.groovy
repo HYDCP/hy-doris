@@ -53,7 +53,7 @@ suite("test_audit_planning_diagnostics", "nonConcurrent") {
                    plan_times_ms['planning_failed_passes'],
                    plan_times_ms['preload_external_metadata'] is not null,
                    plan_times_ms['pre_rewrite_mv'] is null,
-                   map_size(map_filter((k, v) -> k like 'planning_%', plan_times_ms))
+                   array_size(array_filter(k -> k like 'planning_%', map_keys(plan_times_ms)))
             from __internal_schema.audit_log where ${filter}
         """
     } finally {
