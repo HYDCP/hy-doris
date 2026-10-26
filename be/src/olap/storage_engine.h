@@ -43,6 +43,7 @@
 #include "gutil/ref_counted.h"
 #include "olap/calc_delete_bitmap_executor.h"
 #include "olap/compaction_permit_limiter.h"
+#include "olap/disk_health_check_watchdog.h"
 #include "olap/olap_common.h"
 #include "olap/options.h"
 #include "olap/rowset/pending_rowset_helper.h"
@@ -488,6 +489,7 @@ private:
     scoped_refptr<Thread> _garbage_sweeper_thread;
     // thread to monitor disk stat
     scoped_refptr<Thread> _disk_stat_monitor_thread;
+    DiskHealthCheckWatchdog _disk_health_check_watchdog;
     // thread to produce both base and cumulative compaction tasks
     scoped_refptr<Thread> _compaction_tasks_producer_thread;
     scoped_refptr<Thread> _update_replica_infos_thread;
