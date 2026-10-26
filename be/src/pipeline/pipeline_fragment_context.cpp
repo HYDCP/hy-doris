@@ -23,6 +23,9 @@
 #include <pthread.h>
 
 #include <cstdlib>
+
+#include "common/query_log_context.h"
+
 // IWYU pragma: no_include <bits/chrono.h>
 #include <fmt/format.h>
 
@@ -130,6 +133,7 @@ PipelineFragmentContext::PipelineFragmentContext(
 }
 
 PipelineFragmentContext::~PipelineFragmentContext() {
+    ScopedQueryLogContext query_log_scope {QueryLogIdentity(_query_id)};
     // The memory released by the query end is recorded in the query mem tracker.
     SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_query_ctx->query_mem_tracker);
     auto st = _query_ctx->exec_status();
@@ -168,8 +172,7 @@ bool PipelineFragmentContext::is_timeout(timespec now) const {
 // Method like exchange sink buffer will call query ctx cancel. If we add lock here
 // There maybe dead lock.
 void PipelineFragmentContext::cancel(const Status reason) {
-    LOG_INFO("PipelineFragmentContext::cancel")
-            .tag("query_id", print_id(_query_id))
+    LOG_INFO("PipelineFragmentContext::cancel{}", query_id_log_suffix(_query_id))
             .tag("fragment_id", _fragment_id)
             .tag("reason", reason.to_string());
     {
@@ -595,8 +598,7 @@ void PipelineFragmentContext::trigger_report_if_necessary() {
             return;
         }
         if (VLOG_FILE_IS_ON) {
-            VLOG_FILE << "Reporting "
-                      << "profile for query_id " << print_id(_query_id)
+            VLOG_FILE << "Reporting profile for query" << query_id_log_suffix(_query_id)
                       << ", fragment id: " << _fragment_id;
 
             std::stringstream ss;
@@ -606,8 +608,8 @@ void PipelineFragmentContext::trigger_report_if_necessary() {
                 _runtime_state->load_channel_profile()->pretty_print(&ss);
             }
 
-            VLOG_FILE << "Query " << print_id(get_query_id()) << " fragment " << get_fragment_id()
-                      << " profile:\n"
+            VLOG_FILE << "Query" << query_id_log_suffix(get_query_id()) << " fragment "
+                      << get_fragment_id() << " profile:\n"
                       << ss.str();
         }
         auto st = send_report(false);
@@ -1731,7 +1733,8 @@ void PipelineFragmentContext::_close_fragment_instance() {
             _runtime_state->load_channel_profile()->pretty_print(&ss);
         }
 
-        LOG_INFO("Query {} fragment {} profile:\n {}", print_id(_query_id), _fragment_id, ss.str());
+        LOG_INFO("Query{} fragment {} profile:\n {}", query_id_log_suffix(_query_id), _fragment_id,
+                 ss.str());
     }
 
     if (_query_ctx->enable_profile()) {
@@ -1779,6 +1782,7 @@ std::string PipelineFragmentContext::get_load_error_url() {
 }
 
 Status PipelineFragmentContext::send_report(bool done) {
+    ScopedQueryLogContext query_log_scope {QueryLogIdentity(_query_id)};
     Status exec_status = _query_ctx->exec_status();
     // If plan is done successfully, but _is_report_success is false,
     // no need to send report.

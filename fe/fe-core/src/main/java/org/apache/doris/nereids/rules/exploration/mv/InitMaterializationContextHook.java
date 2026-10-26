@@ -88,13 +88,13 @@ public class InitMaterializationContextHook implements PlannerHook {
      */
     protected void doInitMaterializationContext(CascadesContext cascadesContext) {
         if (cascadesContext.getConnectContext().getSessionVariable().isInDebugMode()) {
-            LOG.info("MaterializationContext init return because is in debug mode, current queryId is {}",
-                    cascadesContext.getConnectContext().getQueryIdentifier());
+            LOG.info("MaterializationContext init return because is in debug mode, statement {}",
+                    cascadesContext.getConnectContext().getQueryLogIdentifier());
             return;
         }
         if (cascadesContext.getStatementContext().isShortCircuitQuery()) {
-            LOG.debug("MaterializationContext init return because isShortCircuitQuery, current queryId is {}",
-                    cascadesContext.getConnectContext().getQueryIdentifier());
+            LOG.debug("MaterializationContext init return because isShortCircuitQuery, statement {}",
+                    cascadesContext.getConnectContext().getQueryLogIdentifier());
             return;
         }
         Set<TableIf> collectedTables = Sets.newHashSet(cascadesContext.getStatementContext().getTables().values());
@@ -170,8 +170,8 @@ public class InitMaterializationContextHook implements PlannerHook {
                         mtmvCache.getStructInfo().withTableBitSet(tableBitSetInCurrentCascadesContext,
                                 relationIdBitSetInCurrentCascadesContext)));
             } catch (Exception e) {
-                LOG.warn(String.format("MaterializationContext init mv cache generate fail, current queryId is %s",
-                        cascadesContext.getConnectContext().getQueryIdentifier()), e);
+                LOG.warn(String.format("MaterializationContext init mv cache generate fail, statement %s",
+                        cascadesContext.getConnectContext().getQueryLogIdentifier()), e);
             }
         }
         return asyncMaterializationContext;
