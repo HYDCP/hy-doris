@@ -25,6 +25,7 @@ import org.apache.doris.catalog.FsBroker;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.MarkedCountDownLatch;
 import org.apache.doris.common.Pair;
+import org.apache.doris.common.QueryLogContext;
 import org.apache.doris.common.Reference;
 import org.apache.doris.common.Status;
 import org.apache.doris.common.ThreadPoolManager;
@@ -573,8 +574,8 @@ public class Coordinator implements CoordInterface {
                             .append(backend.getProcessEpoch());
             }
             if (LOG.isDebugEnabled()) {
-                LOG.debug("query {}, backend size: {}, {}",
-                        DebugUtil.printId(queryId), backendNum, backendInfos.toString());
+                LOG.debug("query{}, backend size: {}, {}",
+                        QueryLogContext.queryIdSuffix(queryId), backendNum, backendInfos.toString());
             }
         }
     }
@@ -631,7 +632,7 @@ public class Coordinator implements CoordInterface {
         Env.getCurrentEnv().getLoadManager().initJobProgress(jobId, queryId, instanceIds,
                 relatedBackendIds);
         Env.getCurrentEnv().getProgressManager().addTotalScanNums(String.valueOf(jobId), scanRangeNum);
-        LOG.info("dispatch load job: {} to {}", DebugUtil.printId(queryId), addressToBackendID.keySet());
+        LOG.info("dispatch load job{} to {}", QueryLogContext.queryIdSuffix(queryId), addressToBackendID.keySet());
 
         Map<TNetworkAddress, TPipelineFragmentParams> tExecPlanFragmentParams
                 = ((FragmentExecParams) this.fragmentExecParamsMap.values().toArray()[0]).toThrift(0);
@@ -687,6 +688,12 @@ public class Coordinator implements CoordInterface {
 
     @Override
     public void close() {
+        try (QueryLogContext ignored = QueryLogContext.open(queryId)) {
+            closeQueryResources();
+        }
+    }
+
+    private void closeQueryResources() {
         // NOTE: all close method should be no exception
         if (queryQueue != null && queueToken != null) {
             try {
@@ -707,13 +714,13 @@ public class Coordinator implements CoordInterface {
 
     private void execInternal() throws Exception {
         if (LOG.isDebugEnabled() && !scanNodes.isEmpty()) {
-            LOG.debug("debug: in Coordinator::exec. query id: {}, planNode: {}",
-                    DebugUtil.printId(queryId), scanNodes.get(0).treeToThrift());
+            LOG.debug("debug: in Coordinator::exec. query{}, planNode: {}",
+                    QueryLogContext.queryIdSuffix(queryId), scanNodes.get(0).treeToThrift());
         }
 
         if (LOG.isDebugEnabled() && !fragments.isEmpty()) {
-            LOG.debug("debug: in Coordinator::exec. query id: {}, fragment: {}",
-                    DebugUtil.printId(queryId), fragments.get(0).toThrift());
+            LOG.debug("debug: in Coordinator::exec. query{}, fragment: {}",
+                    QueryLogContext.queryIdSuffix(queryId), fragments.get(0).toThrift());
         }
 
         processFragmentAssignmentAndParams();
@@ -758,7 +765,7 @@ public class Coordinator implements CoordInterface {
                 }
             }
 
-            LOG.info("dispatch result sink of query {} to {}", DebugUtil.printId(queryId),
+            LOG.info("dispatch result sink of query{} to {}", QueryLogContext.queryIdSuffix(queryId),
                     topParams.instanceExecParams.get(0).host);
 
             if (topDataSink instanceof ResultFileSink
@@ -779,7 +786,7 @@ public class Coordinator implements CoordInterface {
             Env.getCurrentEnv().getLoadManager().initJobProgress(jobId, queryId, instanceIds,
                     relatedBackendIds);
             Env.getCurrentEnv().getProgressManager().addTotalScanNums(String.valueOf(jobId), scanRangeNum);
-            LOG.info("dispatch load job: {} to {}", DebugUtil.printId(queryId), addressToBackendID.keySet());
+            LOG.info("dispatch load job{} to {}", QueryLogContext.queryIdSuffix(queryId), addressToBackendID.keySet());
         }
 
         updateProfileIfPresent(profile -> profile.setAssignFragmentTime());
@@ -956,12 +963,12 @@ public class Coordinator implements CoordInterface {
             String msg = String.format(
                     "timeout before waiting %s rpc, query timeout:%d, already elapsed:%d, left for this:%d",
                     operation, queryOptions.getExecutionTimeout(), elapsed, leftTimeMs);
-            LOG.warn("Query {} {}", DebugUtil.printId(queryId), msg);
+            LOG.warn("Query{} {}", QueryLogContext.queryIdSuffix(queryId), msg);
             if (!queryOptions.isSetExecutionTimeout() || !queryOptions.isSetQueryTimeout()) {
-                LOG.warn("Query {} does not set timeout info, execution timeout: is_set:{}, value:{}"
+                LOG.warn("Query{} does not set timeout info, execution timeout: is_set:{}, value:{}"
                                 + ", query timeout: is_set:{}, value: {}, "
                                 + "coordinator timeout deadline {}, cur time millis: {}",
-                        DebugUtil.printId(queryId),
+                        QueryLogContext.queryIdSuffix(queryId),
                         queryOptions.isSetExecutionTimeout(), queryOptions.getExecutionTimeout(),
                         queryOptions.isSetQueryTimeout(), queryOptions.getQueryTimeout(),
                         timeoutDeadline, currentTimeMillis);
@@ -1014,7 +1021,7 @@ public class Coordinator implements CoordInterface {
                 errMsg = String.format(
                     "timeout when waiting for %s rpc, query timeout:%d, left timeout for this operation:%d",
                                             operation, queryOptions.getExecutionTimeout(), timeoutMs / 1000);
-                LOG.warn("Query {} {}", DebugUtil.printId(queryId), errMsg);
+                LOG.warn("Query{} {}", QueryLogContext.queryIdSuffix(queryId), errMsg);
                 code = TStatusCode.TIMEOUT;
                 triple.getMiddle().removeProxy(triple.getLeft().brpcAddr);
             }
@@ -1169,8 +1176,8 @@ public class Coordinator implements CoordInterface {
         ResultReceiver receiver = receivers.get(receiverOffset);
         resultBatch = receiver.getNext(status);
         if (!status.ok()) {
-            LOG.warn("Query {} coordinator get next fail, {}, need cancel.",
-                    DebugUtil.printId(queryId), status.getErrorMsg());
+            LOG.warn("Query{} coordinator get next fail, {}, need cancel.",
+                    QueryLogContext.queryIdSuffix(queryId), status.getErrorMsg());
         }
 
         updateStatus(status);
@@ -1276,12 +1283,18 @@ public class Coordinator implements CoordInterface {
 
     @Override
     public void cancel(Status cancelReason) {
-        if (queueToken != null) {
-            queueToken.cancel();
+        try (QueryLogContext ignored = QueryLogContext.open(queryId)) {
+            if (queueToken != null) {
+                queueToken.cancel();
+            }
+            for (ScanNode scanNode : scanNodes) {
+                scanNode.stop();
+            }
+            cancelQuery(cancelReason);
         }
-        for (ScanNode scanNode : scanNodes) {
-            scanNode.stop();
-        }
+    }
+
+    private void cancelQuery(Status cancelReason) {
         if (cancelReason.ok()) {
             throw new RuntimeException("Should use correct cancel reason, but it is "
                     + cancelReason.toString());
@@ -1291,15 +1304,15 @@ public class Coordinator implements CoordInterface {
             if (!queryStatus.ok()) {
                 if (LOG.isDebugEnabled()) {
                     // Print an error stack here to know why send cancel again.
-                    LOG.debug("Query {} already in abnormal status {}, but received cancel again,"
+                    LOG.debug("Query{} already in abnormal status {}, but received cancel again,"
                             + "so that send cancel to BE again",
-                            DebugUtil.printId(queryId), queryStatus.toString(),
+                            QueryLogContext.queryIdSuffix(queryId), queryStatus.toString(),
                             new Exception("cancel failed"));
                 }
             } else {
                 queryStatus.updateStatus(cancelReason.getErrorCode(), cancelReason.getErrorMsg());
-                LOG.warn("Cancel execution of query {}, this is a outside invoke, cancelReason {}",
-                        DebugUtil.printId(queryId), cancelReason.toString());
+                LOG.warn("Cancel execution of query{}, this is a outside invoke, cancelReason {}",
+                        QueryLogContext.queryIdSuffix(queryId), cancelReason.toString());
             }
 
             cancelInternal(cancelReason);
@@ -1336,7 +1349,7 @@ public class Coordinator implements CoordInterface {
 
     private void cancelRemoteFragmentsAsync(Status cancelReason) {
         for (PipelineExecContexts ctx : beToPipelineExecCtxs.values()) {
-            LOG.debug("Cancel query {} on BE {}. Reason: {}", DebugUtil.printId(queryId), ctx.brpcAddr,
+            LOG.debug("Cancel query{} on BE {}. Reason: {}", QueryLogContext.queryIdSuffix(queryId), ctx.brpcAddr,
                     cancelReason.toString());
             ctx.cancelQuery(cancelReason);
         }
@@ -1350,8 +1363,8 @@ public class Coordinator implements CoordInterface {
         instanceIds.clear();
         for (FragmentExecParams params : fragmentExecParamsMap.values()) {
             if (LOG.isDebugEnabled()) {
-                LOG.debug("Query {} fragment {} has {} instances.",
-                        DebugUtil.printId(queryId), params.fragment.getFragmentId(),
+                LOG.debug("Query{} fragment {} has {} instances.",
+                        QueryLogContext.queryIdSuffix(queryId), params.fragment.getFragmentId(),
                         params.instanceExecParams.size());
             }
 
@@ -2153,8 +2166,8 @@ public class Coordinator implements CoordInterface {
                 }
                 sb.append("]");
 
-                LOG.info("log when get npe, query_id: {}, scanNode: {}, scanNode fid: {}, map: {}",
-                        DebugUtil.printId(queryId),
+                LOG.info("log when get npe, query{}, scanNode: {}, scanNode fid: {}, map: {}",
+                        QueryLogContext.queryIdSuffix(queryId),
                         scanNode.toString(),
                         scanNode.getFragmentId(),
                         sb);
@@ -2465,8 +2478,8 @@ public class Coordinator implements CoordInterface {
 
         if (ctx.done) {
             if (LOG.isDebugEnabled()) {
-                LOG.debug("Query {} fragment {} is marked done",
-                        DebugUtil.printId(queryId), ctx.fragmentId);
+                LOG.debug("Query{} fragment {} is marked done",
+                        QueryLogContext.queryIdSuffix(queryId), ctx.fragmentId);
             }
             fragmentsDoneLatch.markedCountDown(params.getFragmentId(), params.getBackendId());
         }
@@ -3066,19 +3079,21 @@ public class Coordinator implements CoordInterface {
         // logic in upper logic.
         private synchronized void cancelQuery(Status cancelReason) {
             if (LOG.isDebugEnabled()) {
-                LOG.debug("cancelRemoteFragments backend: {}, query={}, reason: {}",
-                         idToBackend.get(beId), DebugUtil.printId(queryId), cancelReason.toString());
+                LOG.debug("cancelRemoteFragments backend: {}, query{}, reason: {}",
+                         idToBackend.get(beId), QueryLogContext.queryIdSuffix(queryId), cancelReason.toString());
             }
 
             if (this.hasCancelled || this.cancelInProcess) {
                 return;
             }
 
+            // The coordinator can advance to another attempt before this RPC completes.
+            TUniqueId cancelledQueryId = queryId.deepCopy();
             try {
                 try {
                     ListenableFuture<InternalService.PCancelPlanFragmentResult> cancelResult =
-                            BackendServiceProxy.getInstance().cancelPipelineXPlanFragmentAsync(brpcAddr, queryId,
-                                    cancelReason);
+                            BackendServiceProxy.getInstance().cancelPipelineXPlanFragmentAsync(
+                                    brpcAddr, cancelledQueryId, cancelReason);
                     Futures.addCallback(cancelResult, new FutureCallback<InternalService.PCancelPlanFragmentResult>() {
                         public void onSuccess(InternalService.PCancelPlanFragmentResult result) {
                             cancelInProcess = false;
@@ -3087,18 +3102,20 @@ public class Coordinator implements CoordInterface {
                                 if (status.getErrorCode() == TStatusCode.OK) {
                                     hasCancelled = true;
                                 } else {
-                                    LOG.warn("Failed to cancel query {} backend: {}, reason: {}",
-                                            DebugUtil.printId(queryId), idToBackend.get(beId), status.toString());
+                                    LOG.warn("Failed to cancel query{} backend: {}, reason: {}",
+                                            QueryLogContext.queryIdSuffix(cancelledQueryId), idToBackend.get(beId),
+                                            status.toString());
                                 }
                             }
                         }
 
                         public void onFailure(Throwable t) {
                             cancelInProcess = false;
-                            LOG.warn("Failed to cancel query {} backend: {}, reason: {}",
-                                    DebugUtil.printId(queryId), idToBackend.get(beId),  cancelReason.toString(), t);
+                            LOG.warn("Failed to cancel query{} backend: {}, reason: {}",
+                                    QueryLogContext.queryIdSuffix(cancelledQueryId), idToBackend.get(beId),
+                                    cancelReason.toString(), t);
                         }
-                    }, backendRpcCallbackExecutor);
+                    }, QueryLogContext.executor(backendRpcCallbackExecutor, cancelledQueryId));
                     cancelInProcess = true;
                 } catch (RpcException e) {
                     LOG.warn("cancel plan fragment get a exception, address={}:{}", brpcAddr.getHostname(),

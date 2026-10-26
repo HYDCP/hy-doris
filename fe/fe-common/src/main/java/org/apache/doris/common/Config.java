@@ -20,6 +20,9 @@ package org.apache.doris.common;
 import java.io.File;
 
 public class Config extends ConfigBase {
+    @ConfField(description = "Include the current query ID in FE runtime log prefixes. Requires restart.")
+    public static boolean sys_log_enable_query_id = true;
+
 
     @ConfField(description = {"用户自定义配置文件的路径，用于存放 fe_custom.conf。该文件中的配置会覆盖 fe.conf 中的配置",
             "The path of the user-defined configuration file, used to store fe_custom.conf. "
@@ -120,6 +123,21 @@ public class Config extends ConfigBase {
             "The threshold of slow query, in milliseconds. "
                     + "If the response time of a query exceeds this threshold, it will be recorded in audit log."})
     public static long qe_slow_log_ms = 5000;
+
+    @ConfField(mutable = true, description = "Log slow Nereids planning passes after this many milliseconds. "
+            + "Non-positive values disable slow-pass logs; failed passes are still reported.")
+    public static volatile long nereids_planning_log_threshold_ms = 5000;
+
+    @ConfField(mutable = true, description = "Minimum interval in milliseconds between running-planner reports "
+            + "from the connection checker. Nested passes share the outermost pass's interval. "
+            + "Values below 1000 use 1000.")
+    public static volatile long nereids_planning_log_interval_ms = 30000;
+
+    @ConfField(mutable = true, description = "Slow planning lock wait/hold and external metadata operation threshold "
+            + "in milliseconds. Non-positive values disable slow-operation logs. At most 16 operations are logged "
+            + "per planning pass, after releasing planner resources; failures are reported regardless of threshold.")
+    public static volatile long nereids_planning_operation_log_threshold_ms = 1000;
+
     @ConfField(mutable = true, description = {"sql_digest 生成的时间阈值，单位为毫秒。如果一个查询的响应时间超过这个阈值，"
             + "则会为其生成 sql_digest。",
             "The threshold of sql_digest generation, in milliseconds. "

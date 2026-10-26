@@ -89,7 +89,7 @@ public abstract class BaseExternalTableInsertExecutor extends AbstractInsertExec
     @Override
     protected void onComplete() throws UserException {
         if (ctx.getState().getStateType() == QueryState.MysqlStateType.ERR) {
-            LOG.warn("errors when abort txn. {}", ctx.getQueryIdentifier());
+            LOG.warn("errors when abort txn. {}", ctx.getQueryLogIdentifier());
         } else {
             doBeforeCommit();
             summaryProfile.ifPresent(profile -> profile.setTransactionBeginTime(transactionType()));

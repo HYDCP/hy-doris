@@ -20,6 +20,7 @@
 
 package org.apache.doris.service.arrowflight;
 
+import org.apache.doris.common.QueryLogContext;
 import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.common.util.Util;
 import org.apache.doris.mysql.MysqlCommand;
@@ -135,9 +136,18 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
         String queryId = handleParts[1];
         // The tokens used for authentication between getStreamStatement and getFlightInfoStatement are different.
         ConnectContext connectContext = flightSessionsManager.getConnectContext(executedPeerIdentity);
+        final FlightSqlResultCacheEntry flightSqlResultCacheEntry =
+                connectContext.getFlightSqlChannel().getResult(queryId);
+        try (QueryLogContext ignored = QueryLogContext.open(
+                flightSqlResultCacheEntry == null ? null : flightSqlResultCacheEntry.getQueryId())) {
+            sendStreamResult(connectContext, queryId, flightSqlResultCacheEntry, listener);
+        }
+    }
+
+    private void sendStreamResult(ConnectContext connectContext, String queryId,
+            FlightSqlResultCacheEntry flightSqlResultCacheEntry, ServerStreamListener listener) {
         try {
-            final FlightSqlResultCacheEntry flightSqlResultCacheEntry = Objects.requireNonNull(
-                    connectContext.getFlightSqlChannel().getResult(queryId));
+            Objects.requireNonNull(flightSqlResultCacheEntry);
             final VectorSchemaRoot vectorSchemaRoot = flightSqlResultCacheEntry.getVectorSchemaRoot();
             listener.start(vectorSchemaRoot);
             listener.putNext();
@@ -168,7 +178,7 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
     @Override
     public void closePreparedStatement(final ActionClosePreparedStatementRequest request, final CallContext context,
             final StreamListener<Result> listener) {
-        executorService.submit(() -> {
+        executorService.submit(QueryLogContext.wrap(() -> {
             try {
                 String[] handleParts = request.getPreparedStatementHandle().toStringUtf8().split(":");
                 String executedPeerIdentity = handleParts[0];
@@ -179,13 +189,15 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
                 return;
             }
             listener.onCompleted();
-        });
+        }, (org.apache.doris.thrift.TUniqueId) null));
     }
 
     private FlightInfo executeQueryStatement(String peerIdentity, ConnectContext connectContext, String query,
             final FlightDescriptor descriptor) {
         try {
             Preconditions.checkState(null != connectContext);
+            // A new request has no query identity until statement execution assigns one.
+            connectContext.resetQueryId();
             Preconditions.checkState(!query.isEmpty());
             // After the previous query was executed, there was no getStreamStatement to take away the result.
             connectContext.getFlightSqlChannel().reset();
@@ -201,7 +213,7 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
                     if (connectContext.getFlightSqlChannel().resultNum() == 0) {
                         // a random query id and add empty results
                         String queryId = UUID.randomUUID().toString();
-                        connectContext.getFlightSqlChannel().addOKResult(queryId, query);
+                        connectContext.getFlightSqlChannel().addOKResult(queryId, query, connectContext.queryId());
 
                         final ByteString handle = ByteString.copyFromUtf8(peerIdentity + ":" + queryId);
                         TicketStatementQuery ticketStatement = TicketStatementQuery.newBuilder()
@@ -277,11 +289,15 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
                 }
             }
         } catch (Throwable e) {
-            String errMsg = "get flight info statement failed, " + e.getMessage() + ", " + Util.getRootCauseMessage(e)
-                    + ", error code: " + connectContext.getState().getErrorCode() + ", error msg: "
-                    + connectContext.getState().getErrorMessage();
-            LOG.error(errMsg, e);
-            throw CallStatus.INTERNAL.withDescription(errMsg).withCause(e).toRuntimeException();
+            try (QueryLogContext ignored = QueryLogContext.open(connectContext.queryId())) {
+                String errMsg = "get flight info statement failed, " + e.getMessage() + ", "
+                        + Util.getRootCauseMessage(e)
+                        + ", error code: " + connectContext.getState().getErrorCode()
+                        + ", error msg: "
+                        + connectContext.getState().getErrorMessage();
+                LOG.error(errMsg, e);
+                throw CallStatus.INTERNAL.withDescription(errMsg).withCause(e).toRuntimeException();
+            }
         } finally {
             connectContext.setCommand(MysqlCommand.COM_SLEEP);
         }
@@ -344,7 +360,7 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
         // For Python: the Python code will try to create a prepared statement (this is to fit DBAPI, IIRC) and
         // if the server raises any error except for NotImplemented it will fail. (If it gets NotImplemented,
         // it will ignore and execute without a prepared statement.) see: https://github.com/apache/arrow/issues/38786
-        executorService.submit(() -> {
+        executorService.submit(QueryLogContext.wrap(() -> {
             ConnectContext connectContext = flightSessionsManager.getConnectContext(context.peerIdentity());
             try {
                 connectContext.setCommand(MysqlCommand.COM_QUERY);
@@ -385,7 +401,7 @@ public class DorisFlightSqlProducer implements FlightSqlProducer, AutoCloseable 
                 connectContext.setCommand(MysqlCommand.COM_SLEEP);
             }
             listener.onCompleted();
-        });
+        }, (org.apache.doris.thrift.TUniqueId) null));
     }
 
     @Override

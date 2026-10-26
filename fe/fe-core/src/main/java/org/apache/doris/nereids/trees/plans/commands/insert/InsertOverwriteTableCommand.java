@@ -241,8 +241,8 @@ public class InsertOverwriteTableCommand extends Command implements ForwardWithS
                 InsertOverwriteUtil.replacePartition(targetTable, partitionNames, tempPartitionNames,
                         isForceDropPartition());
                 if (isCancelled.get()) {
-                    LOG.info("insert overwrite is cancelled before taskSuccess, do nothing, queryId: {}",
-                            ctx.getQueryIdentifier());
+                    LOG.info("insert overwrite is cancelled before taskSuccess, do nothing, statement: {}",
+                            ctx.getQueryLogIdentifier());
                 }
                 insertOverwriteManager.taskSuccess(taskId);
             }

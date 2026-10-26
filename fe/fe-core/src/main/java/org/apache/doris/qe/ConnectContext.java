@@ -42,8 +42,10 @@ import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
+import org.apache.doris.common.QueryLogContext;
 import org.apache.doris.common.Status;
 import org.apache.doris.common.UserException;
+import org.apache.doris.common.profile.PlanningDiagnostics;
 import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.common.util.Util;
@@ -103,7 +105,6 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.annotation.Nullable;
-
 
 // When one client connect in, we create a connect context for it.
 // We store session information here. Meanwhile ConnectScheduler all
@@ -339,6 +340,7 @@ public class ConnectContext {
 
     public static void remove() {
         threadLocalInfo.remove();
+        QueryLogContext.clear();
     }
 
     public void setIsSend(boolean isSend) {
@@ -546,6 +548,7 @@ public class ConnectContext {
 
     public void setThreadLocalInfo() {
         threadLocalInfo.set(this);
+        QueryLogContext.setQueryId(queryId);
     }
 
     public long getCurrentDbId() {
@@ -892,6 +895,7 @@ public class ConnectContext {
     public void cleanup() {
         closeChannel();
         threadLocalInfo.remove();
+        QueryLogContext.clear();
         returnRows = 0;
         deleteTempTable();
         Env.getCurrentEnv().unregisterSessionInfo(this.sessionId);
@@ -953,6 +957,7 @@ public class ConnectContext {
             this.lastQueryId = this.queryId.deepCopy();
         }
         this.queryId = queryId;
+        updateQueryLogContext();
         if (connectScheduler != null && !Strings.isNullOrEmpty(traceId)) {
             connectScheduler.getConnectPoolMgr().putTraceId2QueryId(traceId, queryId);
         }
@@ -963,6 +968,7 @@ public class ConnectContext {
             this.lastQueryId = this.queryId.deepCopy();
         }
         this.queryId = null;
+        updateQueryLogContext();
     }
 
     public void setTraceId(String traceId) {
@@ -971,6 +977,17 @@ public class ConnectContext {
 
     public String traceId() {
         return traceId;
+    }
+
+    private void updateQueryLogContext() {
+        // A connection can be inspected or cancelled from another query's thread.
+        if (get() == this) {
+            QueryLogContext.setQueryId(queryId);
+        }
+    }
+
+    public String getQueryLogIdentifier() {
+        return "stmt[" + stmtId + "]" + QueryLogContext.queryIdSuffix(queryId);
     }
 
     public TUniqueId queryId() {
@@ -1057,7 +1074,44 @@ public class ConnectContext {
         }
     }
 
+    // Published independently of StatementContext's monitor, which is held during table-lock acquisition.
+    private volatile PlanningDiagnostics planningDiagnostics;
+
+    public PlanningDiagnostics getPlanningDiagnostics() {
+        return planningDiagnostics;
+    }
+
+    public void setPlanningDiagnostics(PlanningDiagnostics diagnostics) {
+        planningDiagnostics = diagnostics;
+    }
+
     public void checkTimeout(long now) {
+        PlanningDiagnostics diagnostics = planningDiagnostics;
+        try {
+            checkTimeoutWithQueryLogContext(now);
+        } finally {
+            // Timeout handling takes precedence over diagnostic formatting and logging.
+            if (diagnostics != null) {
+                diagnostics.reportIfSlow();
+            }
+        }
+    }
+
+    private void checkTimeoutWithQueryLogContext(long now) {
+        // Idle connections and metadata commands can retain an ID from the preceding query.
+        boolean executingQuery = command == MysqlCommand.COM_QUERY || command == MysqlCommand.COM_STMT_PREPARE
+                || command == MysqlCommand.COM_STMT_EXECUTE;
+        TUniqueId currentQueryId = executingQuery ? queryId : null;
+        if (currentQueryId == null && QueryLogContext.isEmpty()) {
+            checkTimeoutInternal(now, null);
+            return;
+        }
+        try (QueryLogContext ignored = QueryLogContext.open(currentQueryId)) {
+            checkTimeoutInternal(now, currentQueryId);
+        }
+    }
+
+    private void checkTimeoutInternal(long now, TUniqueId currentQueryId) {
         if (startTime <= 0) {
             return;
         }
@@ -1080,8 +1134,8 @@ public class ConnectContext {
             // to ms
             long timeout = getExecTimeout() * 1000L;
             if (delta > timeout) {
-                LOG.warn("kill {} timeout, remote: {}, query timeout: {}, query id: {}",
-                        timeoutTag, getRemoteHostPortString(), timeout, queryId);
+                LOG.warn("kill {} timeout{}, remote: {}, query timeout: {}ms",
+                        timeoutTag, QueryLogContext.queryIdSuffix(currentQueryId), getRemoteHostPortString(), timeout);
                 killFlag = true;
             }
         }
