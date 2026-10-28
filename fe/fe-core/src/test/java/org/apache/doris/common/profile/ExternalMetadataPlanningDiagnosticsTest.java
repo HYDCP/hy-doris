@@ -259,7 +259,7 @@ public class ExternalMetadataPlanningDiagnosticsTest {
 
     @Test
     public void testHudiScanPreservesExplicitSnapshotAndPartitions() {
-        assertHudiScan(Optional.of(TableSnapshot.versionOf("20260102030405")));
+        assertHudiScan(Optional.of(TableSnapshot.timeOf("2026-01-02 03:04:05")));
     }
 
     @Test
