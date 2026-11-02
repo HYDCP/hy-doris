@@ -63,7 +63,14 @@ jobInfo 里每个 tablet 的数据（manifest root、逻辑摘要 root、是否�
 - 摘要缓存修复；
 - 提速第一批（见下文"提速"一节）：保留分区由快照任务装载到位、状态机合并空拍、任务完成即运行。
 
-**已知未修复**：原子恢复 + 增量补齐在多副本下，可能因副本修复竞争卡在 COMMITTING。根因和修复方案见 [stuck-append-analysis.md](./stuck-append-analysis.md) 和 [stuck-append-fix-plan.md](./stuck-append-fix-plan.md)，修复方案已审查、尚未实现。
+**已修复**：原子恢复 + 增量补齐在多副本下，曾因副本修复竞争卡在 COMMITTING。根因和修复方案见 [stuck-append-analysis.md](./stuck-append-analysis.md) 和 [stuck-append-fix-plan.md](./stuck-append-fix-plan.md)。修复要点：
+
+- 装载完成的证据写进 tablet meta（`restore_stage`），和作业绑定；
+- 运行中的作业登记了本地来源分区时，调度器不对这些分区做副本修复，与表的状态无关；
+- 提交时校正本地来源副本的版本；
+- 本地来源任务的失败按次数收敛，不可重试的错误带前缀 `[RESTORE_NOT_RETRYABLE]`，FE 收到后立即取消作业。
+
+3 万 tablet 规模的验证中，没有作业卡住。
 
 测试环境的实测结论：灾备来回切换演练中，下载量减少约 71%，错误复用为 0；在下载较慢的单机测试环境、数据量较大时，端到端耗时加速约 2～3 倍，数据量较小（约 2 GB）时因固定开销占大头只有约 1.2～1.6 倍。目标规模和万兆网络下的收益仍需复测。
 
