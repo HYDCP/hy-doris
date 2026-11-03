@@ -25,6 +25,7 @@
 
 // IWYU pragma: no_include <bits/chrono.h>
 #include <chrono> // IWYU pragma: keep
+#include <exception>
 #include <functional>
 #include <ostream>
 #include <string>
@@ -136,23 +137,27 @@ void TaskScheduler::_do_work(size_t index) {
 #else
         uint32_t core_id = sched_getcpu();
 #endif
-        ASSIGN_STATUS_IF_CATCH_EXCEPTION(
-                //TODO: use a better enclose to abstracting these
-                if (ExecEnv::GetInstance()->pipeline_tracer_context()->enabled()) {
-                    TUniqueId query_id = fragment_context->get_query_id();
-                    std::string task_name = task->task_name();
+        try {
+            ASSIGN_STATUS_IF_CATCH_EXCEPTION(
+                    //TODO: use a better enclose to abstracting these
+                    if (ExecEnv::GetInstance()->pipeline_tracer_context()->enabled()) {
+                        TUniqueId query_id = fragment_context->get_query_id();
+                        std::string task_name = task->task_name();
 
-                    std::thread::id tid = std::this_thread::get_id();
-                    uint64_t thread_id = *reinterpret_cast<uint64_t*>(&tid);
-                    uint64_t start_time = MonotonicMicros();
+                        std::thread::id tid = std::this_thread::get_id();
+                        uint64_t thread_id = *reinterpret_cast<uint64_t*>(&tid);
+                        uint64_t start_time = MonotonicMicros();
 
-                    status = task->execute(&eos);
+                        status = task->execute(&eos);
 
-                    uint64_t end_time = MonotonicMicros();
-                    ExecEnv::GetInstance()->pipeline_tracer_context()->record(
-                            {query_id, task_name, core_id, thread_id, start_time, end_time});
-                } else { status = task->execute(&eos); },
-                status);
+                        uint64_t end_time = MonotonicMicros();
+                        ExecEnv::GetInstance()->pipeline_tracer_context()->record(
+                                {query_id, task_name, core_id, thread_id, start_time, end_time});
+                    } else { status = task->execute(&eos); },
+                    status);
+        } catch (const std::exception& e) {
+            status = Status::InternalError("Catch std::exception: {}", e.what());
+        }
 
         task->set_previous_core_id(index);
 
