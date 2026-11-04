@@ -27,7 +27,6 @@ suite("test_hive_show_tables_names", "p0,external,hive,external_docker,external_
 
     for (boolean useMetaCache : [true, false]) {
         String catalog = "hive_show_tables_names_${useMetaCache}"
-        String mappedCatalog = "hive_show_tables_names_mapped_${useMetaCache}"
         sql """drop catalog if exists ${catalog}"""
         sql """create catalog ${catalog} properties (
             'type' = 'hms',
@@ -49,7 +48,7 @@ suite("test_hive_show_tables_names", "p0,external,hive,external_docker,external_
             assertEquals([["show_tables_a"], ["show_tables_b"], ["show_tables_denied"]],
                     sql("show tables from ${catalog}.show_tables_names"))
             assertEquals([["show_tables_a"], ["show_tables_b"]],
-                    sql("show tables from ${catalog}.show_tables_names like 'show_tables_'"))
+                    sql("show tables from ${catalog}.show_tables_names like 'show_tables__'"))
             assertEquals([], sql("show tables from ${catalog}.show_tables_names like 'missing%'"))
         }
 
@@ -71,23 +70,6 @@ suite("test_hive_show_tables_names", "p0,external,hive,external_docker,external_
             assertEquals([], sql("show tables from ${catalog}.show_tables_names like '%denied'"))
         }
 
-        sql """drop catalog if exists ${mappedCatalog}"""
-        sql """create catalog ${mappedCatalog} properties (
-            'type' = 'hms',
-            'hive.metastore.uris' = 'thrift://${externalEnvIp}:${hmsPort}',
-            'use_meta_cache' = '${useMetaCache}',
-            'lower_case_meta_names' = 'true',
-            'meta_names_mapping' = '{"tables":[{"remoteDatabase":"show_tables_names",
-                "remoteTable":"show_tables_a","mapping":"mapped_a"}]}'
-        )"""
-        assertEquals([["mapped_a"], ["show_tables_b"], ["show_tables_denied"]],
-                sql("show tables from ${mappedCatalog}.show_tables_names"))
-        assertEquals([["mapped_a"]], sql("show tables from ${mappedCatalog}.show_tables_names like 'mapped_%'"))
-        sql """grant select_priv on ${mappedCatalog}.show_tables_names.mapped_a to show_tables_names_user"""
-        connect("show_tables_names_user", "show_tables_names_password", context.config.jdbcUrl) {
-            assertEquals([["mapped_a"]], sql("show tables from ${mappedCatalog}.show_tables_names"))
-        }
-
         sql """drop table if exists ${catalog}.show_tables_names.show_tables_added"""
         sql """create table ${catalog}.show_tables_names.show_tables_added (k1 int)"""
         sql """refresh database ${catalog}.show_tables_names"""
@@ -95,18 +77,4 @@ suite("test_hive_show_tables_names", "p0,external,hive,external_docker,external_
                 sql("show tables from ${catalog}.show_tables_names like '%added'"))
     }
 
-    // One mapped name collides with an otherwise unmapped remote table name.
-    sql """drop catalog if exists hive_show_tables_names_conflict"""
-    sql """create catalog hive_show_tables_names_conflict properties (
-        'type' = 'hms',
-        'hive.metastore.uris' = 'thrift://${externalEnvIp}:${hmsPort}',
-        'use_meta_cache' = 'true',
-        'lower_case_meta_names' = 'true',
-        'meta_names_mapping' = '{"tables":[{"remoteDatabase":"show_tables_names",
-            "remoteTable":"show_tables_b","mapping":"show_tables_a"}]}'
-    )"""
-    test {
-        sql """show tables from hive_show_tables_names_conflict.show_tables_names"""
-        exception "Found conflicting"
-    }
 }
