@@ -83,7 +83,7 @@ public class OlapTableSinkMetadataTest {
     private List<Column> columns;
     private String savedDeployMode;
     private String savedCloudUniqueId;
-    private int savedMinLoadReplicaNum;
+    private short savedMinLoadReplicaNum;
     private ConnectContext savedContext;
 
     @Before
@@ -135,7 +135,7 @@ public class OlapTableSinkMetadataTest {
         table.setBaseIndexId(10L);
         materializedIndex = new MaterializedIndex(10L, MaterializedIndex.IndexState.NORMAL);
         partition = new Partition(30L, "p1", materializedIndex, distribution);
-        partition.setVisibleVersion(5L);
+        partition.updateVisibleVersion(5L);
         table.addPartition(partition);
     }
 
@@ -220,12 +220,12 @@ public class OlapTableSinkMetadataTest {
         List<TOlapTableLocationParam> normal = sink(false).createLocation(1L, table);
         Assert.assertEquals(2, normal.get(0).getTabletsSize());
         for (TTabletLocation location : normal.get(0).getTablets()) {
-            Assert.assertEquals(new HashSet<>(Arrays.asList(1L, 2L, 3L)), new HashSet<>(location.getBackendIds()));
+            Assert.assertEquals(new HashSet<>(Arrays.asList(1L, 2L, 3L)), new HashSet<>(location.getNodeIds()));
         }
         List<TOlapTableLocationParam> single = sink(true).createLocation(1L, table);
         for (int i = 0; i < 2; i++) {
-            List<Long> master = single.get(0).getTablets().get(i).getBackendIds();
-            List<Long> slaves = single.get(1).getTablets().get(i).getBackendIds();
+            List<Long> master = single.get(0).getTablets().get(i).getNodeIds();
+            List<Long> slaves = single.get(1).getTablets().get(i).getNodeIds();
             Assert.assertEquals(1, master.size());
             Assert.assertEquals(2, slaves.size());
             Assert.assertFalse(slaves.contains(master.get(0)));
@@ -299,7 +299,7 @@ public class OlapTableSinkMetadataTest {
 
     private void addTablet(Tablet tablet) {
         for (long backend = 1L; backend <= 3L; backend++) {
-            Replica replica = new Replica(tablet.getId() * 10 + backend, backend, 5L, Replica.ReplicaState.NORMAL);
+            Replica replica = new Replica(tablet.getId() * 10 + backend, backend, Replica.ReplicaState.NORMAL, 5L, 0);
             replica.setPathHash(1000L + backend);
             tablet.getReplicas().add(replica);
         }
