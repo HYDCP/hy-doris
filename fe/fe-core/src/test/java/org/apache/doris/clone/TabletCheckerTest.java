@@ -73,8 +73,10 @@ public class TabletCheckerTest {
             {
                 Env.getCurrentSystemInfo();
                 result = infoService;
+                minTimes = 0;
                 Env.getCurrentInvertedIndex();
                 result = invertedIndex;
+                minTimes = 0;
             }
         };
         for (long beId = 1; beId <= 3; beId++) {
