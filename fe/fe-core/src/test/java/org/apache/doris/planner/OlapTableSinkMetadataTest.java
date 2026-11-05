@@ -59,7 +59,9 @@ import org.apache.doris.thrift.TUniqueKeyUpdateMode;
 
 import com.google.common.collect.Multimap;
 import mockit.Expectations;
+import mockit.Mock;
 import mockit.Mocked;
+import mockit.MockUp;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -125,9 +127,12 @@ public class OlapTableSinkMetadataTest {
                 Env.getCurrentEnv();
                 result = env;
                 minTimes = 0;
-                env.getTabletScheduler();
-                result = scheduler;
-                minTimes = 0;
+            }
+        };
+        new MockUp<Env>() {
+            @Mock
+            public TabletScheduler getTabletScheduler() {
+                return scheduler;
             }
         };
         Column key = new Column("k1", PrimitiveType.INT);
