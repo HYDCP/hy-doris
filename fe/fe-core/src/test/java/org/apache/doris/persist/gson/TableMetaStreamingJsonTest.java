@@ -49,6 +49,7 @@ import org.apache.doris.thrift.TStorageType;
 import org.apache.doris.thrift.TTabletType;
 
 import com.google.common.collect.Lists;
+import com.google.gson.JsonParseException;
 import org.junit.Assert;
 import org.junit.Test;
 import org.mockito.Mockito;
@@ -256,6 +257,88 @@ public class TableMetaStreamingJsonTest {
         Assert.assertEquals(table.getName(), restored.getName());
         Assert.assertEquals(3, restored.getPartition("p1").getBaseIndex()
                 .getTablet(5L).getReplicas().size());
+    }
+
+    @Test
+    public void testOlapTableFramingAcrossAllModeCombinations() throws IOException {
+        boolean oldValue = Config.enable_table_meta_streaming_json;
+        try {
+            OlapTable table = createTable();
+            byte[] expected = null;
+            for (boolean writeStreaming : new boolean[] {false, true}) {
+                Config.enable_table_meta_streaming_json = writeStreaming;
+                ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                table.write(new DataOutputStream(bytes));
+                if (expected == null) {
+                    expected = bytes.toByteArray();
+                } else {
+                    Assert.assertArrayEquals(expected, bytes.toByteArray());
+                }
+                for (boolean readStreaming : new boolean[] {false, true}) {
+                    Config.enable_table_meta_streaming_json = readStreaming;
+                    DataInputStream input = new DataInputStream(new ByteArrayInputStream(bytes.toByteArray()));
+                    OlapTable restored = OlapTable.read(input);
+                    assertTableGraph(table, restored);
+                    Assert.assertEquals(-1, input.read());
+                }
+            }
+        } finally {
+            Config.enable_table_meta_streaming_json = oldValue;
+        }
+    }
+
+    @Test
+    public void testNestedLegacyMetadataAcrossReadModes() {
+        OlapTable table = createTable();
+        String json = toJsonWithStreaming(table, Table.class, false)
+                .replace("\"clazz\":\"Partition\",", "")
+                .replace("\"clazz\":\"Tablet\",", "")
+                .replace("\"clazz\":\"Replica\",", "");
+        for (boolean streaming : new boolean[] {false, true}) {
+            assertTableGraph(table, (OlapTable) fromJsonWithStreaming(json, Table.class, streaming));
+        }
+    }
+
+    @Test
+    public void testLateTableTypeFieldRemainsAnEnablementBoundary() {
+        OlapTable table = createTable();
+        String json = toJsonWithStreaming(table, Table.class, false);
+        String prefix = "{\"clazz\":\"OlapTable\",";
+        Assert.assertTrue(json.startsWith(prefix));
+        String reordered = "{" + json.substring(prefix.length(), json.length() - 1)
+                + ",\"clazz\":\"OlapTable\"}";
+        assertTableGraph(table, (OlapTable) fromJsonWithStreaming(reordered, Table.class, false));
+        JsonParseException error = Assert.assertThrows(JsonParseException.class,
+                () -> fromJsonWithStreaming(reordered, Table.class, true));
+        Assert.assertTrue(error.getMessage(), error.getMessage().contains("the first field is"));
+    }
+
+    private static void assertTableGraph(OlapTable expected, OlapTable actual) {
+        Assert.assertEquals(expected.getId(), actual.getId());
+        Assert.assertEquals(expected.getName(), actual.getName());
+        Assert.assertEquals(expected.getBaseIndexId(), actual.getBaseIndexId());
+        Partition expectedPartition = expected.getPartition("p1");
+        Partition actualPartition = actual.getPartition("p1");
+        Assert.assertNotNull(actualPartition);
+        Assert.assertEquals(expectedPartition.getId(), actualPartition.getId());
+        Assert.assertEquals(expectedPartition.getVisibleVersion(), actualPartition.getVisibleVersion());
+        MaterializedIndex expectedIndex = expectedPartition.getBaseIndex();
+        MaterializedIndex actualIndex = actualPartition.getBaseIndex();
+        Assert.assertEquals(expectedIndex.getId(), actualIndex.getId());
+        Assert.assertEquals(expectedIndex.getTablets().size(), actualIndex.getTablets().size());
+        Tablet expectedTablet = expectedIndex.getTablet(5L);
+        Tablet actualTablet = actualIndex.getTablet(5L);
+        Assert.assertNotNull(actualTablet);
+        Assert.assertEquals(expectedTablet.getReplicas().size(), actualTablet.getReplicas().size());
+        for (int i = 0; i < expectedTablet.getReplicas().size(); i++) {
+            Replica expectedReplica = expectedTablet.getReplicas().get(i);
+            Replica actualReplica = actualTablet.getReplicas().get(i);
+            Assert.assertEquals(expectedReplica.getId(), actualReplica.getId());
+            Assert.assertEquals(expectedReplica.getBackendIdWithoutException(),
+                    actualReplica.getBackendIdWithoutException());
+            Assert.assertEquals(expectedReplica.getVersion(), actualReplica.getVersion());
+            Assert.assertEquals(expectedReplica.getState(), actualReplica.getState());
+        }
     }
 
     @Test

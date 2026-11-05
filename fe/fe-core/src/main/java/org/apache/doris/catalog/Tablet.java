@@ -274,7 +274,7 @@ public class Tablet extends MetaObject {
 
     private Multimap<Long, Long> getNormalReplicaBackendPathMapImpl(String beEndpoint, BackendIdGetter idGetter)
             throws UserException {
-        Multimap<Long, Long> map = HashMultimap.create();
+        Multimap<Long, Long> map = HashMultimap.create(replicas.size(), 1);
         SystemInfoService infoService = Env.getCurrentSystemInfo();
         for (Replica replica : replicas) {
             long backendId = idGetter.get(replica, beEndpoint);
@@ -579,8 +579,9 @@ public class Tablet extends MetaObject {
     public TabletHealth getHealth(SystemInfoService systemInfoService,
             long visibleVersion, ReplicaAllocation replicaAlloc, List<Long> aliveBeIds) {
         Map<Tag, Short> allocMap = replicaAlloc.getAllocMap();
-        Map<Tag, Short> stableAllocMap = Maps.newHashMap();
-        Map<Tag, Short> stableVersionCompleteAllocMap = Maps.newHashMap();
+        int expectedTagCount = Math.min(allocMap.size(), replicas.size());
+        Map<Tag, Short> stableAllocMap = Maps.newHashMapWithExpectedSize(expectedTagCount);
+        Map<Tag, Short> stableVersionCompleteAllocMap = Maps.newHashMapWithExpectedSize(expectedTagCount);
 
         short replicationNum = replicaAlloc.getTotalReplicaNum();
         int alive = 0;
@@ -589,7 +590,7 @@ public class Tablet extends MetaObject {
 
         Replica needFurtherRepairReplica = null;
         boolean hasAliveAndVersionIncomplete = false;
-        Set<String> hosts = Sets.newHashSet();
+        Set<String> hosts = Sets.newHashSetWithExpectedSize(replicas.size());
         ArrayList<Long> versions = new ArrayList<>();
         for (Replica replica : replicas) {
             Backend backend = systemInfoService.getBackend(replica.getBackendIdWithoutException());
@@ -806,7 +807,7 @@ public class Tablet extends MetaObject {
         short replicationNum = replicaAlloc.getTotalReplicaNum();
         boolean hasAliveAndVersionIncomplete = false;
         int aliveAndVersionComplete = 0;
-        Set<String> hosts = Sets.newHashSet();
+        Set<String> hosts = Sets.newHashSetWithExpectedSize(replicas.size());
         for (Replica replica : replicas) {
             Backend backend = systemInfoService.getBackend(replica.getBackendIdWithoutException());
             if (!isReplicaAndBackendAlive(replica, backend, hosts)) {
