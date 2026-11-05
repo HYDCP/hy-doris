@@ -43,6 +43,7 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.Status;
 import org.apache.doris.common.UserException;
+import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.system.Backend;
 import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.thrift.TColumn;
@@ -83,9 +84,12 @@ public class OlapTableSinkMetadataTest {
     private String savedDeployMode;
     private String savedCloudUniqueId;
     private int savedMinLoadReplicaNum;
+    private ConnectContext savedContext;
 
     @Before
     public void setUp() throws Exception {
+        savedContext = ConnectContext.get();
+        ConnectContext.remove();
         savedDeployMode = Config.deploy_mode;
         savedCloudUniqueId = Config.cloud_unique_id;
         savedMinLoadReplicaNum = Config.min_load_replica_num;
@@ -140,6 +144,10 @@ public class OlapTableSinkMetadataTest {
         Config.deploy_mode = savedDeployMode;
         Config.cloud_unique_id = savedCloudUniqueId;
         Config.min_load_replica_num = savedMinLoadReplicaNum;
+        ConnectContext.remove();
+        if (savedContext != null) {
+            savedContext.setThreadLocalInfo();
+        }
     }
 
     @Test
