@@ -910,7 +910,7 @@ public class TabletInvertedIndex {
         long stamp = readLock();
         try {
             Preconditions.checkState(tabletMetaMap.containsKey(tabletId),
-                    "tablet " + tabletId + " not exists, backend " + backendId);
+                    "tablet %s not exists, backend %s", tabletId, backendId);
             if (Config.isCloudMode()) {
                 backendId = -1;
             }

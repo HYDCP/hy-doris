@@ -18,6 +18,8 @@
 package org.apache.doris.catalog;
 
 import org.apache.doris.catalog.Replica.ReplicaState;
+import org.apache.doris.clone.TabletSchedCtx.Priority;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.io.Text;
@@ -29,6 +31,7 @@ import org.apache.doris.thrift.TStorageMedium;
 import com.google.common.collect.Sets;
 import mockit.Expectations;
 import mockit.Mocked;
+import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -48,11 +51,18 @@ public class TabletTest {
     private TabletInvertedIndex invertedIndex;
     private SystemInfoService  infoService;
 
+    private boolean originalRepairSlowReplica;
+    private int originalMinVersionCount;
+    private double originalVersionCountRatio;
+
     @Mocked
     private Env env;
 
     @Before
     public void makeTablet() {
+        originalRepairSlowReplica = Config.repair_slow_replica;
+        originalMinVersionCount = Config.min_version_count_indicate_replica_compaction_too_slow;
+        originalVersionCountRatio = Config.valid_version_count_delta_ratio_between_replicas;
         invertedIndex = new TabletInvertedIndex();
         infoService = new SystemInfoService();
         for (long beId = 1L; beId <= 4L; beId++) {
@@ -89,6 +99,94 @@ public class TabletTest {
         tablet.addReplica(replica1);
         tablet.addReplica(replica2);
         tablet.addReplica(replica3);
+    }
+
+    @After
+    public void restoreSlowReplicaConfig() {
+        Config.repair_slow_replica = originalRepairSlowReplica;
+        Config.min_version_count_indicate_replica_compaction_too_slow = originalMinVersionCount;
+        Config.valid_version_count_delta_ratio_between_replicas = originalVersionCountRatio;
+    }
+
+    private void prepareHealthCheck() {
+        Config.repair_slow_replica = true;
+        Config.min_version_count_indicate_replica_compaction_too_slow = 200;
+        Config.valid_version_count_delta_ratio_between_replicas = 0.5;
+        for (Replica replica : tablet.getReplicas()) {
+            replica.updateLastFailedVersion(-1);
+        }
+    }
+
+    private void setVisibleVersionCounts(long first, long second, long third) {
+        replica1.setVisibleVersionCount(first);
+        replica2.setVisibleVersionCount(second);
+        replica3.setVisibleVersionCount(third);
+    }
+
+    private void assertHealth(short replicaNum, Tablet.TabletStatus status, Priority priority) {
+        Tablet.TabletHealth health = tablet.getHealth(infoService, 100L,
+                new ReplicaAllocation(replicaNum), infoService.getAllBackendIds(true));
+        Assert.assertEquals(status, health.status);
+        Assert.assertEquals(priority, health.priority);
+    }
+
+    @Test
+    public void testHealthVersionCountThresholds() {
+        prepareHealthCheck();
+
+        setVisibleVersionCounts(100, 150, 200);
+        assertHealth((short) 3, Tablet.TabletStatus.HEALTHY, Priority.NORMAL);
+        setVisibleVersionCounts(99, 150, 200);
+        assertHealth((short) 3, Tablet.TabletStatus.REPLICA_COMPACTION_TOO_SLOW, Priority.HIGH);
+        setVisibleVersionCounts(200, 99, 150);
+        assertHealth((short) 3, Tablet.TabletStatus.REPLICA_COMPACTION_TOO_SLOW, Priority.HIGH);
+        setVisibleVersionCounts(150, 200, 99);
+        assertHealth((short) 3, Tablet.TabletStatus.REPLICA_COMPACTION_TOO_SLOW, Priority.HIGH);
+
+        setVisibleVersionCounts(0, 100, 199);
+        assertHealth((short) 3, Tablet.TabletStatus.HEALTHY, Priority.NORMAL);
+        setVisibleVersionCounts(0, 100, 200);
+        assertHealth((short) 3, Tablet.TabletStatus.REPLICA_COMPACTION_TOO_SLOW, Priority.HIGH);
+
+        Config.repair_slow_replica = false;
+        assertHealth((short) 3, Tablet.TabletStatus.HEALTHY, Priority.NORMAL);
+    }
+
+    @Test
+    public void testHealthVersionCountEdgeCases() {
+        prepareHealthCheck();
+
+        setVisibleVersionCounts(200, 200, 200);
+        assertHealth((short) 3, Tablet.TabletStatus.HEALTHY, Priority.NORMAL);
+        setVisibleVersionCounts(0, 0, 0);
+        assertHealth((short) 3, Tablet.TabletStatus.HEALTHY, Priority.NORMAL);
+        setVisibleVersionCounts(-1, -1, -1);
+        assertHealth((short) 3, Tablet.TabletStatus.HEALTHY, Priority.NORMAL);
+        setVisibleVersionCounts(Long.MIN_VALUE, 0, Long.MAX_VALUE);
+        assertHealth((short) 3, Tablet.TabletStatus.HEALTHY, Priority.NORMAL);
+
+        tablet.deleteReplica(replica2);
+        tablet.deleteReplica(replica3);
+        assertHealth((short) 1, Tablet.TabletStatus.HEALTHY, Priority.NORMAL);
+        tablet.clearReplica();
+        assertHealth((short) 1, Tablet.TabletStatus.UNRECOVERABLE, Priority.NORMAL);
+    }
+
+    @Test
+    public void testHealthVersionCountDoesNotOverrideIncompleteOrUnavailableReplicas() {
+        prepareHealthCheck();
+        setVisibleVersionCounts(1, 2, 300);
+
+        replica3.updateVersionForRestore(99);
+        assertHealth((short) 3, Tablet.TabletStatus.VERSION_INCOMPLETE, Priority.VERY_HIGH);
+        replica3.updateVersionForRestore(100);
+
+        infoService.getBackend(3L).setDecommissioned(true);
+        assertHealth((short) 3, Tablet.TabletStatus.REPLICA_RELOCATING, Priority.LOW);
+        infoService.getBackend(3L).setDecommissioned(false);
+
+        infoService.getBackend(3L).setAlive(false);
+        assertHealth((short) 3, Tablet.TabletStatus.FORCE_REDUNDANT, Priority.VERY_HIGH);
     }
 
     @Test

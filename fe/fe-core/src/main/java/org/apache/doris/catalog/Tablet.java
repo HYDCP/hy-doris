@@ -46,7 +46,6 @@ import org.apache.logging.log4j.Logger;
 import java.io.DataInput;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
@@ -590,7 +589,8 @@ public class Tablet extends MetaObject {
         Replica needFurtherRepairReplica = null;
         boolean hasAliveAndVersionIncomplete = false;
         Set<String> hosts = Sets.newHashSet();
-        ArrayList<Long> versions = new ArrayList<>();
+        long minVersionCount = Long.MAX_VALUE;
+        long maxVersionCount = Long.MIN_VALUE;
         for (Replica replica : replicas) {
             Backend backend = systemInfoService.getBackend(replica.getBackendIdWithoutException());
             if (!isReplicaAndBackendAlive(replica, backend, hosts)) {
@@ -614,7 +614,9 @@ public class Tablet extends MetaObject {
 
                 if (versionCompleted) {
                     stable++;
-                    versions.add(replica.getVisibleVersionCount());
+                    long versionCount = replica.getVisibleVersionCount();
+                    minVersionCount = Math.min(minVersionCount, versionCount);
+                    maxVersionCount = Math.max(maxVersionCount, versionCount);
 
                     allocNum = stableVersionCompleteAllocMap.getOrDefault(backend.getLocationTag(), (short) 0);
                     stableVersionCompleteAllocMap.put(backend.getLocationTag(), (short) (allocNum + 1));
@@ -734,13 +736,10 @@ public class Tablet extends MetaObject {
         }
 
         // 5. find a replica's version count is much more than others, and drop it
-        if (Config.repair_slow_replica && versions.size() == replicas.size() && versions.size() > 1) {
-            // sort version
-            Collections.sort(versions);
-            // get the max version diff
-            long delta = versions.get(versions.size() - 1) - versions.get(0);
-            double ratio = (double) delta / versions.get(versions.size() - 1);
-            if (versions.get(versions.size() - 1) >= Config.min_version_count_indicate_replica_compaction_too_slow
+        if (Config.repair_slow_replica && stable == replicas.size() && stable > 1) {
+            long delta = maxVersionCount - minVersionCount;
+            double ratio = (double) delta / maxVersionCount;
+            if (maxVersionCount >= Config.min_version_count_indicate_replica_compaction_too_slow
                     && ratio > Config.valid_version_count_delta_ratio_between_replicas) {
                 tabletHealth.status = TabletStatus.REPLICA_COMPACTION_TOO_SLOW;
                 tabletHealth.priority = Priority.HIGH;
