@@ -149,7 +149,7 @@ public class Tag implements Writable {
 
     @Override
     public int hashCode() {
-        return Objects.hash(type, value);
+        return 31 * (31 + Objects.hashCode(type)) + Objects.hashCode(value);
     }
 
     @Override

@@ -20,12 +20,41 @@ package org.apache.doris.resource;
 import org.apache.doris.common.AnalysisException;
 
 import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 import org.junit.Assert;
 import org.junit.Test;
 
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 
 public class TagTest {
+
+    @Test
+    public void testHashCodeCompatibility() {
+        String[] values = {null, "", "location", "zone1", "Aa", "BB", "区域", "long_value_for_hash_overflow"};
+        for (String type : values) {
+            for (String value : values) {
+                Tag tag = Tag.createNotCheck(type, value);
+                Assert.assertEquals(Objects.hash(type, value), tag.hashCode());
+            }
+        }
+    }
+
+    @Test
+    public void testHashBasedLookup() throws AnalysisException {
+        Tag tag = Tag.create(Tag.TYPE_LOCATION, "zone1");
+        Tag sameTag = Tag.create(Tag.TYPE_LOCATION, "zone1");
+        Tag otherTag = Tag.create(Tag.TYPE_LOCATION, "zone2");
+        Map<Tag, Long> allocation = Maps.newHashMap();
+        allocation.put(tag, 3L);
+        Assert.assertEquals(Long.valueOf(3L), allocation.get(sameTag));
+        Assert.assertNull(allocation.get(otherTag));
+
+        Set<Tag> tags = Sets.newHashSet(tag, sameTag, otherTag);
+        Assert.assertEquals(2, tags.size());
+        Assert.assertTrue(tags.contains(Tag.create(Tag.TYPE_LOCATION, "zone2")));
+    }
 
     @Test(expected = AnalysisException.class)
     public void testTagName1() throws AnalysisException {
