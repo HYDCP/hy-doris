@@ -29,6 +29,7 @@
 
 #include "common/exception.h"
 #include "common/logging.h"
+#include "common/query_log_context.h"
 #include "gutil/macros.h"
 #include "runtime/exec_env.h"
 #include "runtime/memory/mem_tracker_limiter.h"
@@ -466,6 +467,9 @@ public:
     void init(const QueryThreadContext& query_thread_context);
 
     ~AttachTask();
+
+private:
+    ScopedQueryLogContext _query_log_scope;
 };
 
 class SwitchThreadMemTrackerLimiter {

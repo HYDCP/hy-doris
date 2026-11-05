@@ -209,7 +209,7 @@ public class OlapInsertExecutor extends AbstractInsertExecutor {
                         database.getId(), txnId,
                         (errMsg == null ? "unknown reason" : errMsg));
             } catch (Exception abortTxnException) {
-                LOG.warn("errors when abort txn. {}", ctx.getQueryIdentifier(), abortTxnException);
+                LOG.warn("errors when abort txn. {}", ctx.getQueryLogIdentifier(), abortTxnException);
             }
         } else if (Env.getCurrentGlobalTransactionMgr().commitAndPublishTransaction(
                 database, Lists.newArrayList((Table) table),

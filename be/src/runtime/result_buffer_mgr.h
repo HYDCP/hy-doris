@@ -85,11 +85,12 @@ public:
     // cancel one query at a future time.
     void cancel_at_time(time_t cancel_time, const TUniqueId& query_id);
 
+    // Used by RPC entry points to retain the query identity after buffer operations return.
+    std::shared_ptr<BufferControlBlock> find_control_block(const TUniqueId& query_id);
+
 private:
     using BufferMap = std::unordered_map<TUniqueId, std::shared_ptr<BufferControlBlock>>;
     using TimeoutMap = std::map<time_t, std::vector<TUniqueId>>;
-
-    std::shared_ptr<BufferControlBlock> find_control_block(const TUniqueId& query_id);
 
     // used to erase the buffer that fe not clears
     // when fe crush, this thread clear the buffer avoid memory leak in this backend

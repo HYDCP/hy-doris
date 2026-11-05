@@ -22,6 +22,7 @@
 #include <atomic>
 #include <utility>
 
+#include "common/query_log_context.h"
 #include "runtime/query_context.h"
 #include "runtime/thread_context.h"
 #include "service/brpc.h"
@@ -83,7 +84,10 @@ class AutoReleaseClosure : public google::protobuf::Closure {
 public:
     AutoReleaseClosure(std::shared_ptr<Request> req, std::shared_ptr<Callback> callback,
                        std::weak_ptr<QueryContext> context = {})
-            : request_(req), callback_(callback), context_(std::move(context)) {
+            : request_(req),
+              callback_(callback),
+              context_(std::move(context)),
+              query_log_identity_(current_query_log_identity()) {
         this->cntl_ = callback->cntl_;
         this->response_ = callback->response_;
     }
@@ -92,6 +96,7 @@ public:
 
     //  Will delete itself
     void Run() override {
+        ScopedQueryLogContext query_log_scope {query_log_identity_};
         Defer defer {[&]() { delete this; }};
         // If lock failed, it means the callback object is deconstructed, then no need
         // to deal with the callback any more.
@@ -150,6 +155,7 @@ private:
     // thread is freed.
     Weak callback_;
     std::weak_ptr<QueryContext> context_;
+    QueryLogIdentity query_log_identity_;
 };
 
 } // namespace doris

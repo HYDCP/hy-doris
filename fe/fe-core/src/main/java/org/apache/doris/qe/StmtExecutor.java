@@ -108,6 +108,7 @@ import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.FormatOptions;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.NereidsException;
+import org.apache.doris.common.QueryLogContext;
 import org.apache.doris.common.Status;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.Version;
@@ -636,6 +637,13 @@ public class StmtExecutor {
     }
 
     public void execute(TUniqueId queryId) throws Exception {
+        context.setQueryId(queryId);
+        try (QueryLogContext ignored = QueryLogContext.open(queryId)) {
+            executeWithQueryLogContext(queryId);
+        }
+    }
+
+    private void executeWithQueryLogContext(TUniqueId queryId) throws Exception {
         SessionVariable sessionVariable = context.getSessionVariable();
         if (context.getConnectType() == ConnectType.ARROW_FLIGHT_SQL) {
             context.setReturnResultFromLocal(true);
@@ -725,7 +733,6 @@ public class StmtExecutor {
         if (LOG.isDebugEnabled()) {
             LOG.debug("Nereids start to execute query:\n {}", originStmt.originStmt);
         }
-        context.setQueryId(queryId);
         context.setStartTime();
 
         profile.getSummaryProfile().setQueryBeginTime(TimeUtils.getStartTimeMs());
@@ -1031,7 +1038,7 @@ public class StmtExecutor {
                 if (context.isReturnResultFromLocal()) {
                     finalizeQuery();
                 }
-                LOG.debug("Finalize query {}", DebugUtil.printId(context.queryId()));
+                LOG.debug("Finalize query{}", QueryLogContext.queryIdSuffix(context.queryId()));
             }
         }
     }
@@ -3050,7 +3057,8 @@ public class StmtExecutor {
         } else if (context.getConnectType().equals(ConnectType.ARROW_FLIGHT_SQL)) {
             context.updateReturnRows(resultSet.getResultRows().size());
             context.getFlightSqlChannel()
-                    .addResult(DebugUtil.printId(context.queryId()), context.getRunningQuery(), resultSet);
+                    .addResult(DebugUtil.printId(context.queryId()), context.getRunningQuery(),
+                            resultSet, context.queryId());
             context.getState().setEof();
         } else {
             LOG.error("sendResultSet error connect type");
@@ -3207,7 +3215,8 @@ public class StmtExecutor {
             }
         } else if (context.getConnectType() == ConnectType.ARROW_FLIGHT_SQL) {
             context.getFlightSqlChannel()
-                    .addResult(DebugUtil.printId(context.queryId()), context.getRunningQuery(), metaData, result);
+                    .addResult(DebugUtil.printId(context.queryId()), context.getRunningQuery(),
+                            metaData, result, context.queryId());
             context.setReturnResultFromLocal(true);
         }
         context.getState().setEof();
@@ -3229,7 +3238,8 @@ public class StmtExecutor {
             }
         } else if (context.getConnectType() == ConnectType.ARROW_FLIGHT_SQL) {
             context.getFlightSqlChannel()
-                    .addResult(DebugUtil.printId(context.queryId()), context.getRunningQuery(), metaData, result);
+                    .addResult(DebugUtil.printId(context.queryId()), context.getRunningQuery(),
+                            metaData, result, context.queryId());
             context.setReturnResultFromLocal(true);
         }
         context.getState().setEof();
@@ -3664,7 +3674,8 @@ public class StmtExecutor {
                     batch = coord.getNext();
                     Preconditions.checkNotNull(batch, "Batch is Null.");
                     if (batch.isEos()) {
-                        LOG.info("Result rows for query {} is {}", DebugUtil.printId(queryId), resultRows.size());
+                        LOG.info("Result rows for query{} is {}",
+                                QueryLogContext.queryIdSuffix(queryId), resultRows.size());
                         return resultRows;
                     } else {
                         // For null and not EOS batch, continue to get the next batch.
@@ -3737,7 +3748,7 @@ public class StmtExecutor {
     }
 
     private HttpStreamParams generateHttpStreamNereidsPlan(TUniqueId queryId) {
-        LOG.info("TUniqueId: {} generate stream load plan", DebugUtil.printId(queryId));
+        LOG.info("generate stream load plan{}", QueryLogContext.queryIdSuffix(queryId));
         context.setQueryId(queryId);
         context.setStmtId(STMT_ID_GENERATOR.incrementAndGet());
 
@@ -3837,7 +3848,7 @@ public class StmtExecutor {
                             originStmt.originStmt, e.getMessage(), e);
                 }
                 if (e instanceof NereidsException) {
-                    LOG.warn("Analyze failed. {}", context.getQueryIdentifier(), e);
+                    LOG.warn("Analyze failed. {}", context.getQueryLogIdentifier(), e);
                 }
                 throw e;
             } catch (Exception e) {

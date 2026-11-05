@@ -21,6 +21,7 @@ import org.apache.doris.catalog.Column;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.qe.ResultSet;
 import org.apache.doris.qe.ResultSetMetaData;
+import org.apache.doris.thrift.TUniqueId;
 
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
@@ -62,7 +63,7 @@ public class FlightSqlChannel {
         return "0.0.0.0:0";
     }
 
-    public void addResult(String queryId, String runningQuery, ResultSet resultSet) {
+    public void addResult(String queryId, String runningQuery, ResultSet resultSet, TUniqueId logQueryId) {
         List<Field> schemaFields = new ArrayList<>();
         List<FieldVector> dataFields = new ArrayList<>();
         List<List<String>> resultData = resultSet.getResultRows();
@@ -90,11 +91,12 @@ public class FlightSqlChannel {
         }
         VectorSchemaRoot vectorSchemaRoot = new VectorSchemaRoot(schemaFields, dataFields);
         final FlightSqlResultCacheEntry flightSqlResultCacheEntry = new FlightSqlResultCacheEntry(vectorSchemaRoot,
-                runningQuery);
+                runningQuery, logQueryId);
         resultCache.put(queryId, flightSqlResultCacheEntry);
     }
 
-    public void addResult(String queryId, String runningQuery, ResultSetMetaData metaData, String result) {
+    public void addResult(String queryId, String runningQuery, ResultSetMetaData metaData, String result,
+            TUniqueId logQueryId) {
         List<Field> schemaFields = new ArrayList<>();
         List<FieldVector> dataFields = new ArrayList<>();
 
@@ -118,7 +120,7 @@ public class FlightSqlChannel {
         }
         VectorSchemaRoot vectorSchemaRoot = new VectorSchemaRoot(schemaFields, dataFields);
         final FlightSqlResultCacheEntry flightSqlResultCacheEntry = new FlightSqlResultCacheEntry(vectorSchemaRoot,
-                runningQuery);
+                runningQuery, logQueryId);
         resultCache.put(queryId, flightSqlResultCacheEntry);
     }
 
@@ -138,9 +140,9 @@ public class FlightSqlChannel {
         return new VectorSchemaRoot(schemaFields, dataFields);
     }
 
-    public void addOKResult(String queryId, String query) {
+    public void addOKResult(String queryId, String query, TUniqueId logQueryId) {
         final FlightSqlResultCacheEntry flightSqlResultCacheEntry = new FlightSqlResultCacheEntry(
-                createOneOneSchemaRoot("StatusResult", "0"), query);
+                createOneOneSchemaRoot("StatusResult", "0"), query, logQueryId);
         resultCache.put(queryId, flightSqlResultCacheEntry);
     }
 
