@@ -22,16 +22,25 @@
 #include <gtest/gtest-message.h>
 #include <gtest/gtest-test-part.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
+#include <chrono>
+#include <csignal>
 #include <filesystem>
+#include <fstream>
 #include <memory>
+#include <mutex>
 
 #include "common/status.h"
+#include "cpp/sync_point.h"
 #include "gtest/gtest_pred_impl.h"
 #include "io/fs/local_file_system.h"
 #include "olap/data_dir.h"
 #include "olap/data_dir_sweep_policy.h"
 #include "olap/tablet_manager.h"
+#include "util/countdown_latch.h"
+#include "util/defer_op.h"
+#include "util/thread.h"
 #include "util/threadpool.h"
 
 namespace doris {
@@ -138,8 +147,217 @@ TEST_F(StorageEngineTest, GcTabletPathUsesExplicitMode) {
     EXPECT_TRUE(status.ok()) << status;
 }
 
+#if !defined(THREAD_SANITIZER)
+
+class StorageEngineWatchdogDeathTest : public testing::Test {
+protected:
+    void SetUp() override {
+        _saved_style = ::testing::FLAGS_gtest_death_test_style;
+        ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+        _engine_data_path = std::string("./be/test/olap/test_data/watchdog/") +
+                            ::testing::UnitTest::GetInstance()->current_test_info()->name();
+    }
+
+    void TearDown() override {
+        ::testing::FLAGS_gtest_death_test_style = _saved_style;
+        EXPECT_TRUE(io::global_local_filesystem()->delete_directory(_engine_data_path).ok());
+    }
+
+    // Called inside the re-executed child, so no StorageEngine or RocksDB state
+    // is inherited from a multithreaded parent process.
+    std::unique_ptr<StorageEngine> create_engine(
+            bool with_data_dir = true, std::chrono::seconds timeout = std::chrono::seconds(1)) {
+        signal(SIGALRM, SIG_DFL);
+        alarm(10);
+        EngineOptions options;
+        options.backend_uid = UniqueId::gen_uid();
+        auto engine = std::make_unique<StorageEngine>(options);
+        if (with_data_dir) {
+            auto fs = io::global_local_filesystem();
+            if (!fs->create_directory(_engine_data_path).ok()) {
+                _exit(2);
+            }
+            auto data_dir = std::make_unique<DataDir>(*engine, _engine_data_path, 100000000);
+            // A health probe does not require a RocksDB metadata database.
+            if (!data_dir->init(false).ok()) {
+                _exit(2);
+            }
+            engine->_store_map.emplace(_engine_data_path, std::move(data_dir));
+        }
+        if (!engine->_disk_health_check_watchdog.start(timeout).ok()) {
+            _exit(2);
+        }
+        return engine;
+    }
+
+    std::string _engine_data_path;
+
+private:
+    std::string _saved_style;
+};
+
+TEST_F(StorageEngineWatchdogDeathTest, ExitsWhenRuntimeProbeHangs) {
+    ASSERT_EXIT(
+            {
+                auto engine = create_engine();
+                auto* sync_point = SyncPoint::get_instance();
+                sync_point->set_call_back("LocalFileSystem::create_file_impl", [](auto&&) {
+                    while (true) {
+                        pause();
+                    }
+                });
+                sync_point->enable_processing();
+                engine->_disk_stat_monitor_thread_callback();
+                _exit(3);
+            },
+            ::testing::ExitedWithCode(DiskHealthCheckWatchdog::kTimeoutExitCode), "");
+}
+
+TEST_F(StorageEngineWatchdogDeathTest, ExitsWhenBrokenPathPersistenceHangs) {
+    ASSERT_EXIT(
+            {
+                auto engine = create_engine();
+                config::custom_config_dir = _engine_data_path;
+                auto* sync_point = SyncPoint::get_instance();
+                bool inject_error = true;
+                sync_point->set_call_back(
+                        "LocalFileSystem::create_file_impl", [&inject_error](auto&& args) {
+                            if (inject_error) {
+                                inject_error = false;
+                                auto* ret = try_any_cast_ret<Status>(args);
+                                ret->first = Status::IOError("injected health probe failure");
+                                ret->second = true;
+                                return;
+                            }
+                            // The probe already returned EIO. Its error handler is
+                            // now creating be_custom.conf.tmp to persist the bad path.
+                            constexpr char marker[] = "persisting broken disk path\n";
+                            static_cast<void>(write(STDERR_FILENO, marker, sizeof(marker) - 1));
+                            while (true) {
+                                pause();
+                            }
+                        });
+                sync_point->enable_processing();
+                engine->_disk_stat_monitor_thread_callback();
+                _exit(3);
+            },
+            ::testing::ExitedWithCode(DiskHealthCheckWatchdog::kTimeoutExitCode),
+            "persisting broken disk path");
+}
+
+TEST_F(StorageEngineWatchdogDeathTest, StopKeepsBlockedProbeSupervised) {
+    ASSERT_EXIT(
+            {
+                auto engine = create_engine();
+                CountDownLatch probe_entered(1);
+                auto* sync_point = SyncPoint::get_instance();
+                sync_point->set_call_back("LocalFileSystem::create_file_impl", [&](auto&&) {
+                    probe_entered.count_down();
+                    engine->_stop_background_threads_latch.wait();
+                    // Require evidence that stop() reached its join phase before
+                    // the timeout, rather than merely timing out a running probe.
+                    constexpr char marker[] = "stop waiting for disk probe\n";
+                    static_cast<void>(write(STDERR_FILENO, marker, sizeof(marker) - 1));
+                    while (true) {
+                        pause();
+                    }
+                });
+                sync_point->enable_processing();
+                if (!Thread::create(
+                             "StorageEngineTest", "disk_stat_monitor_thread",
+                             [&] { engine->_disk_stat_monitor_thread_callback(); },
+                             &engine->_disk_stat_monitor_thread)
+                             .ok()) {
+                    _exit(2);
+                }
+                probe_entered.wait();
+                engine->stop();
+                _exit(3);
+            },
+            ::testing::ExitedWithCode(DiskHealthCheckWatchdog::kTimeoutExitCode),
+            "stop waiting for disk probe");
+}
+
+TEST_F(StorageEngineWatchdogDeathTest, ExitsWhenMonitorWaitsForStoreLock) {
+    ASSERT_EXIT(
+            {
+                auto engine = create_engine(false);
+                std::lock_guard<std::mutex> lock(engine->_store_lock);
+                if (!Thread::create(
+                             "StorageEngineTest", "disk_stat_monitor_thread",
+                             [&] { engine->_start_disk_stat_monitor(); },
+                             &engine->_disk_stat_monitor_thread)
+                             .ok()) {
+                    _exit(2);
+                }
+                engine->_disk_stat_monitor_thread->join();
+                _exit(3);
+            },
+            ::testing::ExitedWithCode(DiskHealthCheckWatchdog::kTimeoutExitCode), "");
+}
+
+TEST_F(StorageEngineWatchdogDeathTest, PreservesHealthyAndIoErrorResults) {
+    ASSERT_EXIT(
+            {
+                auto engine = create_engine(true, std::chrono::seconds(30));
+                config::custom_config_dir = _engine_data_path;
+                config::max_percentage_of_error_disk = 100;
+                auto* data_dir = engine->_store_map.at(_engine_data_path).get();
+                engine->_start_disk_stat_monitor();
+                if (!data_dir->is_used() || !engine->get_broken_paths().empty()) {
+                    _exit(3);
+                }
+                auto* sync_point = SyncPoint::get_instance();
+                bool inject_error = true;
+                sync_point->set_call_back(
+                        "LocalFileSystem::create_file_impl", [&inject_error](auto&& args) {
+                            // Fail the probe only; the subsequent config write must succeed.
+                            if (inject_error) {
+                                inject_error = false;
+                                auto* ret = try_any_cast_ret<Status>(args);
+                                ret->first = Status::IOError("injected health probe failure");
+                                ret->second = true;
+                            }
+                        });
+                sync_point->enable_processing();
+                engine->_start_disk_stat_monitor();
+                if (data_dir->is_used() ||
+                    !engine->get_broken_paths().contains(_engine_data_path)) {
+                    _exit(3);
+                }
+                sync_point->disable_processing();
+                if (config::broken_storage_path != _engine_data_path + ";") {
+                    _exit(3);
+                }
+                std::ifstream persisted_config(_engine_data_path + "/be_custom.conf");
+                std::string line;
+                bool persisted_path = false;
+                while (std::getline(persisted_config, line)) {
+                    if (line.find("broken_storage_path") != std::string::npos &&
+                        line.find(_engine_data_path + ";") != std::string::npos) {
+                        persisted_path = true;
+                    }
+                }
+                if (!persisted_path) {
+                    _exit(3);
+                }
+                engine->stop();
+                _exit(0);
+            },
+            ::testing::ExitedWithCode(0), "");
+}
+
+#endif
+
 TEST_F(StorageEngineTest, TestBrokenDisk) {
-    DEFINE_mString(broken_storage_path, "");
+    const auto saved_broken_paths = config::broken_storage_path;
+    const auto saved_config_dir = config::custom_config_dir;
+    Defer restore_config {[&] {
+        const auto status = config::set_config("broken_storage_path", saved_broken_paths);
+        EXPECT_TRUE(status.ok()) << status;
+        config::custom_config_dir = saved_config_dir;
+    }};
+    config::custom_config_dir = _engine_data_path;
     std::string path = config::custom_config_dir + "/be_custom.conf";
 
     std::error_code ec;
@@ -147,7 +365,7 @@ TEST_F(StorageEngineTest, TestBrokenDisk) {
         _storage_engine->add_broken_path("broken_path1");
         EXPECT_EQ(std::filesystem::exists(path, ec), true);
         EXPECT_EQ(_storage_engine->get_broken_paths().count("broken_path1"), 1);
-        EXPECT_EQ(broken_storage_path, "broken_path1;");
+        EXPECT_EQ(config::broken_storage_path, "broken_path1;");
     }
 
     {
@@ -155,7 +373,7 @@ TEST_F(StorageEngineTest, TestBrokenDisk) {
         EXPECT_EQ(std::filesystem::exists(path, ec), true);
         EXPECT_EQ(_storage_engine->get_broken_paths().count("broken_path1"), 1);
         EXPECT_EQ(_storage_engine->get_broken_paths().count("broken_path2"), 1);
-        EXPECT_EQ(broken_storage_path, "broken_path1;broken_path2;");
+        EXPECT_EQ(config::broken_storage_path, "broken_path1;broken_path2;");
     }
 
     {
@@ -163,7 +381,7 @@ TEST_F(StorageEngineTest, TestBrokenDisk) {
         EXPECT_EQ(std::filesystem::exists(path, ec), true);
         EXPECT_EQ(_storage_engine->get_broken_paths().count("broken_path1"), 1);
         EXPECT_EQ(_storage_engine->get_broken_paths().count("broken_path2"), 1);
-        EXPECT_EQ(broken_storage_path, "broken_path1;broken_path2;");
+        EXPECT_EQ(config::broken_storage_path, "broken_path1;broken_path2;");
     }
 
     {
@@ -171,7 +389,7 @@ TEST_F(StorageEngineTest, TestBrokenDisk) {
         EXPECT_EQ(std::filesystem::exists(path, ec), true);
         EXPECT_EQ(_storage_engine->get_broken_paths().count("broken_path1"), 1);
         EXPECT_EQ(_storage_engine->get_broken_paths().count("broken_path2"), 0);
-        EXPECT_EQ(broken_storage_path, "broken_path1;");
+        EXPECT_EQ(config::broken_storage_path, "broken_path1;");
     }
 }
 
