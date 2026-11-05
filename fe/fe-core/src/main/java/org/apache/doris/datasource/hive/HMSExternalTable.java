@@ -32,6 +32,7 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.UserException;
+import org.apache.doris.common.profile.PlanningDiagnostics;
 import org.apache.doris.datasource.ExternalSchemaCache;
 import org.apache.doris.datasource.ExternalSchemaCache.SchemaCacheKey;
 import org.apache.doris.datasource.ExternalTable;
@@ -58,6 +59,7 @@ import org.apache.doris.nereids.exceptions.NotSupportedException;
 import org.apache.doris.nereids.rules.expression.rules.SortedPartitionRanges;
 import org.apache.doris.nereids.trees.plans.algebra.CatalogRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFileScan.SelectedPartitions;
+import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.GlobalVariable;
 import org.apache.doris.statistics.AnalysisInfo;
 import org.apache.doris.statistics.BaseAnalysisTask;
@@ -316,6 +318,11 @@ public class HMSExternalTable extends ExternalTable implements MTMVRelatedTableI
 
     @Override
     public List<Column> getFullSchema() {
+        return PlanningDiagnostics.operation(ConnectContext.get(), "load_schema", this,
+                this::getNameWithFullQualifiers, -1, this::getFullSchemaInternal);
+    }
+
+    private List<Column> getFullSchemaInternal() {
         makeSureInitialized();
         ExternalSchemaCache cache = Env.getCurrentEnv().getExtMetaCacheMgr().getSchemaCache(catalog);
         if (getDlaType() == DLAType.HUDI) {
@@ -389,6 +396,11 @@ public class HMSExternalTable extends ExternalTable implements MTMVRelatedTableI
     }
 
     public SelectedPartitions initHudiSelectedPartitions(Optional<TableSnapshot> tableSnapshot) {
+        return PlanningDiagnostics.operation(ConnectContext.get(), "load_partitions", this,
+                this::getNameWithFullQualifiers, -1, () -> initHudiSelectedPartitionsInternal(tableSnapshot));
+    }
+
+    private SelectedPartitions initHudiSelectedPartitionsInternal(Optional<TableSnapshot> tableSnapshot) {
         if (getDlaType() != DLAType.HUDI) {
             return SelectedPartitions.NOT_PRUNED;
         }
