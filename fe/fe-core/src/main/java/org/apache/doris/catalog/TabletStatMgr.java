@@ -243,9 +243,11 @@ public class TabletStatMgr extends MasterDaemon {
                             } // end for tablets
                             index.setRowCountReported(indexReported);
                             index.setRowCount(indexRowCount);
-                            LOG.debug("Table {} index {} all tablets reported[{}], row count {}",
-                                    olapTable.getName(), olapTable.getIndexNameById(index.getId()),
-                                    indexReported, indexRowCount);
+                            if (LOG.isDebugEnabled()) {
+                                LOG.debug("Table {} index {} all tablets reported[{}], row count {}",
+                                        olapTable.getName(), olapTable.getIndexNameById(index.getId()),
+                                        indexReported, indexRowCount);
+                            }
                         } // end for indices
                         if (maxPartitionSize.second <= partitionDataSize) {
                             maxPartitionSize = Pair.of("" + partition.getId(), partitionDataSize);
