@@ -35,7 +35,9 @@ import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.SinglePartitionInfo;
 import org.apache.doris.catalog.Tablet;
+import org.apache.doris.catalog.TabletInvertedIndex;
 import org.apache.doris.clone.TabletScheduler;
+import org.apache.doris.clone.TabletSchedulerStat;
 import org.apache.doris.cloud.qe.ComputeGroupException;
 import org.apache.doris.cloud.qe.ComputeGroupException.FailedTypeEnum;
 import org.apache.doris.common.AnalysisException;
@@ -58,7 +60,6 @@ import org.apache.doris.thrift.TUniqueKeyUpdateMode;
 import com.google.common.collect.Multimap;
 import mockit.Expectations;
 import mockit.Mocked;
-import mockit.Verifications;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -73,8 +74,8 @@ import java.util.Set;
 public class OlapTableSinkMetadataTest {
     @Mocked
     private Env env;
-    @Mocked
     private TabletScheduler scheduler;
+    private int repairRequests;
 
     private SystemInfoService infoService;
     private OlapTable table;
@@ -102,6 +103,20 @@ public class OlapTableSinkMetadataTest {
             backend.setAlive(true);
             infoService.addBackend(backend);
         }
+        scheduler = new TabletScheduler(env, infoService, new TabletInvertedIndex(),
+                new TabletSchedulerStat(), "") {
+            @Override
+            public void tryAddRepairTablet(Tablet tablet, long dbId, OlapTable repairTable,
+                    Partition repairPartition, MaterializedIndex index, int finishedCounter) {
+                Assert.assertEquals(100L, tablet.getId());
+                Assert.assertEquals(1L, dbId);
+                Assert.assertSame(table, repairTable);
+                Assert.assertSame(partition, repairPartition);
+                Assert.assertSame(materializedIndex, index);
+                Assert.assertEquals(0, finishedCounter);
+                repairRequests++;
+            }
+        };
         new Expectations() {
             {
                 Env.getCurrentSystemInfo();
@@ -250,12 +265,7 @@ public class OlapTableSinkMetadataTest {
         long firstFailure = tablet.getLastLoadFailedTime();
         Assert.assertTrue(firstFailure > 0);
         Assert.assertThrows(UserException.class, () -> sink.createLocation(1L, table));
-        new Verifications() {
-            {
-                scheduler.tryAddRepairTablet(tablet, 1L, table, partition, materializedIndex, 0);
-                times = 1;
-            }
-        };
+        Assert.assertEquals(1, repairRequests);
     }
 
     @Test
