@@ -19,12 +19,21 @@ package org.apache.doris.catalog;
 
 import org.apache.doris.catalog.Replica.ReplicaState;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.thrift.TStorageMedium;
 
+import com.google.common.collect.ArrayListMultimap;
+import com.google.common.collect.HashMultimap;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+
+import java.util.AbstractMap;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
 
 public class TabletInvertedIndexTest {
     private String savedDeployMode;
@@ -80,5 +89,46 @@ public class TabletInvertedIndexTest {
         IllegalStateException exception = Assert.assertThrows(IllegalStateException.class,
                 () -> index.getReplica(tabletId + 1, 20002L));
         Assert.assertEquals("tablet 10002 not exists, backend 20002", exception.getMessage());
+    }
+
+    @Test
+    public void testReplicaCountsByBackendAndStorageMedium() {
+        TabletInvertedIndex index = new TabletInvertedIndex();
+        long backendId = 20001L;
+        for (long tabletId = 10001L; tabletId <= 10003L; tabletId++) {
+            TStorageMedium medium = tabletId == 10003L ? TStorageMedium.SSD : TStorageMedium.HDD;
+            index.addTablet(tabletId, new TabletMeta(1, 2, 3, 4, 5, medium));
+            index.addReplica(tabletId, new Replica(30000L + tabletId, backendId, 5, ReplicaState.NORMAL));
+        }
+        index.addReplica(10003L, new Replica(40001L, backendId + 1, 5, ReplicaState.NORMAL));
+
+        assertReplicaCounts(index, backendId, 2, 1);
+        assertReplicaCounts(index, backendId + 1, 0, 1);
+        assertReplicaCounts(index, backendId + 2, 0, 0);
+        index.deleteTablet(10003L);
+        assertReplicaCounts(index, backendId, 2, 0);
+        assertReplicaCounts(index, backendId + 1, 0, 0);
+    }
+
+    private void assertReplicaCounts(TabletInvertedIndex index, long backendId, long hdd, long ssd) {
+        Map<TStorageMedium, Long> counts = index.getReplicaNumByBeIdAndStorageMedium(backendId);
+        Assert.assertEquals(2, counts.size());
+        Assert.assertEquals(Long.valueOf(hdd), counts.get(TStorageMedium.HDD));
+        Assert.assertEquals(Long.valueOf(ssd), counts.get(TStorageMedium.SSD));
+    }
+
+    @Test
+    public void testReportMissingTabletMessage() {
+        TabletInvertedIndex index = new TabletInvertedIndex();
+        Map.Entry<Long, Replica> entry = new AbstractMap.SimpleImmutableEntry<>(Long.MAX_VALUE,
+                new Replica(30001L, Long.MIN_VALUE, 5, ReplicaState.NORMAL));
+        IllegalStateException exception = Assert.assertThrows(IllegalStateException.class,
+                () -> Deencapsulation.invoke(index, "processTabletEntry", Long.MIN_VALUE,
+                        new HashMap<>(), new HashMap<>(), ArrayListMultimap.create(),
+                        ArrayListMultimap.create(), new HashSet<>(), ArrayListMultimap.create(),
+                        new HashMap<>(), HashMultimap.create(), ArrayListMultimap.create(),
+                        new ArrayList<>(), new ArrayList<>(), entry));
+        Assert.assertEquals("tablet 9223372036854775807 not exists, backend -9223372036854775808",
+                exception.getMessage());
     }
 }
