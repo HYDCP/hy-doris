@@ -40,6 +40,7 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 public class TabletTest {
 
@@ -124,10 +125,19 @@ public class TabletTest {
     }
 
     private void assertHealth(short replicaNum, Tablet.TabletStatus status, Priority priority) {
+        ReplicaAllocation replicaAlloc = new ReplicaAllocation(replicaNum);
+        List<Long> aliveBeIds = infoService.getAllBackendIds(true);
         Tablet.TabletHealth health = tablet.getHealth(infoService, 100L,
-                new ReplicaAllocation(replicaNum), infoService.getAllBackendIds(true));
+                replicaAlloc, aliveBeIds);
         Assert.assertEquals(status, health.status);
         Assert.assertEquals(priority, health.priority);
+        Tablet.TabletHealth partitionHealth = tablet.getHealth(infoService, 100L,
+                replicaAlloc, replicaNum, aliveBeIds);
+        Assert.assertEquals(status, partitionHealth.status);
+        Assert.assertEquals(priority, partitionHealth.priority);
+        Assert.assertEquals(health.aliveAndVersionCompleteNum, partitionHealth.aliveAndVersionCompleteNum);
+        Assert.assertEquals(health.hasAliveAndVersionIncomplete, partitionHealth.hasAliveAndVersionIncomplete);
+        Assert.assertEquals(health.needFurtherRepairReplicaId, partitionHealth.needFurtherRepairReplicaId);
     }
 
     @Test
