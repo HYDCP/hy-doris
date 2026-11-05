@@ -22,6 +22,7 @@ import org.apache.doris.catalog.Replica.ReplicaState;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.system.SystemInfoService;
+import org.apache.doris.thrift.TStorageType;
 
 import com.google.common.collect.ImmutableMap;
 import mockit.Expectations;
@@ -32,6 +33,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.util.Collections;
+import java.util.List;
 
 public class TabletStatMgrTest {
     @Mocked
@@ -50,12 +52,17 @@ public class TabletStatMgrTest {
     public void setUp() throws Exception {
         savedMetricInit = MetricRepo.isInit;
         MetricRepo.isInit = false;
-        table = new OlapTable();
-        table.setId(2L);
-        table.setName("tablet_stat_test");
+        Column key = new Column("k1", PrimitiveType.INT);
+        key.setIsKey(true);
+        List<Column> columns = Collections.singletonList(key);
+        HashDistributionInfo distribution = new HashDistributionInfo(1, columns);
+        table = new OlapTable(2L, "tablet_stat_test", columns, KeysType.DUP_KEYS,
+                new SinglePartitionInfo(), distribution);
+        table.setIndexMeta(3L, table.getName(), columns, 0, 0, (short) 1,
+                TStorageType.COLUMN, KeysType.DUP_KEYS);
         table.setBaseIndexId(3L);
         index = new MaterializedIndex(3L, IndexState.NORMAL);
-        partition = new Partition(4L, "p1", index, null);
+        partition = new Partition(4L, "p1", index, distribution);
         partition.setVisibleVersion(5L);
         table.addPartition(partition);
         Database db = new Database(1L, "tablet_stat_db");
