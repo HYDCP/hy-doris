@@ -22,7 +22,6 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ClientPool;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.MarkedCountDownLatch;
-import org.apache.doris.common.Pair;
 import org.apache.doris.common.Status;
 import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.common.util.MasterDaemon;
@@ -119,12 +118,24 @@ public class TabletStatMgr extends MasterDaemon {
 
         // after update replica in all backends, update index row num
         start = System.currentTimeMillis();
-        Pair<String, Long> maxTabletSize = Pair.of(/* tablet id= */null, /* byte size= */0L);
-        Pair<String, Long> maxPartitionSize = Pair.of(/* partition id= */null, /* byte size= */0L);
-        Pair<String, Long> maxTableSize = Pair.of(/* table id= */null, /* byte size= */0L);
-        Pair<String, Long> minTabletSize = Pair.of(/* tablet id= */null, /* byte size= */Long.MAX_VALUE);
-        Pair<String, Long> minPartitionSize = Pair.of(/* partition id= */null, /* byte size= */Long.MAX_VALUE);
-        Pair<String, Long> minTableSize = Pair.of(/* tablet id= */null, /* byte size= */Long.MAX_VALUE);
+        long maxTabletSize = 0L;
+        long maxTabletId = 0L;
+        boolean maxTabletSelected = false;
+        long maxPartitionSize = 0L;
+        long maxPartitionId = 0L;
+        boolean maxPartitionSelected = false;
+        long maxTableSize = 0L;
+        long maxTableId = 0L;
+        boolean maxTableSelected = false;
+        long minTabletSize = Long.MAX_VALUE;
+        long minTabletId = 0L;
+        boolean minTabletSelected = false;
+        long minPartitionSize = Long.MAX_VALUE;
+        long minPartitionId = 0L;
+        boolean minPartitionSelected = false;
+        long minTableSize = Long.MAX_VALUE;
+        long minTableId = 0L;
+        boolean minTableSelected = false;
         long totalTableSize = 0L;
         long tabletCount = 0L;
         long partitionCount = 0L;
@@ -225,11 +236,15 @@ public class TabletStatMgr extends MasterDaemon {
                                 tableDataSize += tabletDataSize;
                                 partitionDataSize += tabletDataSize;
                                 tableRemoteDataSize += tabletRemoteDataSize;
-                                if (maxTabletSize.second <= tabletDataSize) {
-                                    maxTabletSize = Pair.of("" + tablet.getId(), tabletDataSize);
+                                if (maxTabletSize <= tabletDataSize) {
+                                    maxTabletSize = tabletDataSize;
+                                    maxTabletId = tablet.getId();
+                                    maxTabletSelected = true;
                                 }
-                                if (minTabletSize.second >= tabletDataSize) {
-                                    minTabletSize = Pair.of("" + tablet.getId(), tabletDataSize);
+                                if (minTabletSize >= tabletDataSize) {
+                                    minTabletSize = tabletDataSize;
+                                    minTabletId = tablet.getId();
+                                    minTabletSelected = true;
                                 }
 
                                 // When all BEs are down, avoid set Long.MAX_VALUE to index and table row count. Use 0.
@@ -249,18 +264,26 @@ public class TabletStatMgr extends MasterDaemon {
                                         indexReported, indexRowCount);
                             }
                         } // end for indices
-                        if (maxPartitionSize.second <= partitionDataSize) {
-                            maxPartitionSize = Pair.of("" + partition.getId(), partitionDataSize);
+                        if (maxPartitionSize <= partitionDataSize) {
+                            maxPartitionSize = partitionDataSize;
+                            maxPartitionId = partition.getId();
+                            maxPartitionSelected = true;
                         }
-                        if (minPartitionSize.second >= partitionDataSize) {
-                            minPartitionSize = Pair.of("" + partition.getId(), partitionDataSize);
+                        if (minPartitionSize >= partitionDataSize) {
+                            minPartitionSize = partitionDataSize;
+                            minPartitionId = partition.getId();
+                            minPartitionSelected = true;
                         }
                     } // end for partitions
-                    if (maxTableSize.second <= tableDataSize) {
-                        maxTableSize = Pair.of("" + table.getId(), tableDataSize);
+                    if (maxTableSize <= tableDataSize) {
+                        maxTableSize = tableDataSize;
+                        maxTableId = table.getId();
+                        maxTableSelected = true;
                     }
-                    if (minTableSize.second >= tableDataSize) {
-                        minTableSize = Pair.of("" + table.getId(), tableDataSize);
+                    if (minTableSize >= tableDataSize) {
+                        minTableSize = tableDataSize;
+                        minTableId = table.getId();
+                        minTableSelected = true;
                     }
 
                     // this is only one thread to update table statistics, readLock is enough
@@ -282,14 +305,14 @@ public class TabletStatMgr extends MasterDaemon {
         }
 
         if (MetricRepo.isInit) {
-            MetricRepo.GAUGE_MAX_TABLE_SIZE_BYTES.setValue(maxTableSize.second);
-            MetricRepo.GAUGE_MAX_PARTITION_SIZE_BYTES.setValue(maxPartitionSize.second);
-            MetricRepo.GAUGE_MAX_TABLET_SIZE_BYTES.setValue(maxTabletSize.second);
-            long minTableSizeTmp = minTableSize.second == Long.MAX_VALUE ? 0 : minTableSize.second;
+            MetricRepo.GAUGE_MAX_TABLE_SIZE_BYTES.setValue(maxTableSize);
+            MetricRepo.GAUGE_MAX_PARTITION_SIZE_BYTES.setValue(maxPartitionSize);
+            MetricRepo.GAUGE_MAX_TABLET_SIZE_BYTES.setValue(maxTabletSize);
+            long minTableSizeTmp = minTableSize == Long.MAX_VALUE ? 0 : minTableSize;
             MetricRepo.GAUGE_MIN_TABLE_SIZE_BYTES.setValue(minTableSizeTmp);
-            long minPartitionSizeTmp = minPartitionSize.second == Long.MAX_VALUE ? 0 : minPartitionSize.second;
+            long minPartitionSizeTmp = minPartitionSize == Long.MAX_VALUE ? 0 : minPartitionSize;
             MetricRepo.GAUGE_MIN_PARTITION_SIZE_BYTES.setValue(minPartitionSizeTmp);
-            long minTabletSizeTmp = minTabletSize.second == Long.MAX_VALUE ? 0 : minTabletSize.second;
+            long minTabletSizeTmp = minTabletSize == Long.MAX_VALUE ? 0 : minTabletSize;
             MetricRepo.GAUGE_MIN_TABLET_SIZE_BYTES.setValue(minTabletSizeTmp);
             // avoid ArithmeticException: / by zero
             long avgTableSize = totalTableSize / Math.max(1, tableCount);
@@ -303,18 +326,20 @@ public class TabletStatMgr extends MasterDaemon {
 
             LOG.info("OlapTable num=" + tableCount
                     + ", partition num=" + partitionCount + ", tablet num=" + tabletCount
-                    + ", max tablet byte size=" + maxTabletSize.second
-                    + "(tablet_id=" + maxTabletSize.first + ")"
+                    + ", max tablet byte size=" + maxTabletSize
+                    + "(tablet_id=" + (maxTabletSelected ? Long.toString(maxTabletId) : null) + ")"
                     + ", min tablet byte size=" + minTabletSizeTmp
-                    + "(tablet_id=" + minTabletSize.first + ")"
+                    + "(tablet_id=" + (minTabletSelected ? Long.toString(minTabletId) : null) + ")"
                     + ", avg tablet byte size=" + avgTabletSize
-                    + ", max partition byte size=" + maxPartitionSize.second
-                    + "(partition_id=" + maxPartitionSize.first + ")"
+                    + ", max partition byte size=" + maxPartitionSize
+                    + "(partition_id=" + (maxPartitionSelected ? Long.toString(maxPartitionId) : null) + ")"
                     + ", min partition byte size=" + minPartitionSizeTmp
-                    + "(partition_id=" + minPartitionSize.first + ")"
+                    + "(partition_id=" + (minPartitionSelected ? Long.toString(minPartitionId) : null) + ")"
                     + ", avg partition byte size=" + avgPartitionSize
-                    + ", max table byte size=" + maxTableSize.second + "(table_id=" + maxTableSize.first + ")"
-                    + ", min table byte size=" + minTableSizeTmp + "(table_id=" + minTableSize.first + ")"
+                    + ", max table byte size=" + maxTableSize
+                    + "(table_id=" + (maxTableSelected ? Long.toString(maxTableId) : null) + ")"
+                    + ", min table byte size=" + minTableSizeTmp
+                    + "(table_id=" + (minTableSelected ? Long.toString(minTableId) : null) + ")"
                     + ", avg table byte size=" + avgTableSize);
         }
 
