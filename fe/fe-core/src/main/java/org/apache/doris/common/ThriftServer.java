@@ -25,6 +25,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.thrift.TConfiguration;
 import org.apache.thrift.TProcessor;
+import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.server.TServer;
 import org.apache.thrift.server.TSimpleServer;
 import org.apache.thrift.server.TThreadPoolServer;
@@ -110,7 +111,7 @@ public class ThriftServer {
         }
 
         TServer.Args args = new TServer.Args(new ImprovedTServerSocket(socketTransportArgs)).protocolFactory(
-                new CachedTBinaryProtocol.Factory()).processor(processor);
+                new TBinaryProtocol.Factory()).processor(processor);
         server = new TSimpleServer(args);
     }
 
@@ -131,7 +132,7 @@ public class ThriftServer {
 
         TThreadedSelectorServer.Args args = new TThreadedSelectorServer.Args(
                 new ImprovedTNonblockingServerSocket(socketTransportArgs))
-                .protocolFactory(new CachedTBinaryProtocol.Factory())
+                .protocolFactory(new TBinaryProtocol.Factory())
                 .processor(processor);
         ThreadPoolExecutor threadPoolExecutor = ThreadPoolManager.newDaemonCacheThreadPool(
                 Config.thrift_server_max_worker_threads, "thrift-server-pool", true);

@@ -327,15 +327,15 @@ public class GenericPoolTest {
     }
 
     @Test
-    public void testCachedAndStandardBinaryProtocolInteroperability() throws Exception {
+    public void testStandardClientWithCachedAndStandardServers() throws Exception {
         TNetworkAddress address = new TNetworkAddress(ip, port);
-        BackendService.Client cached = backendService.borrowObject(address, 5000);
+        BackendService.Client pooled = backendService.borrowObject(address, 5000);
         try {
-            Assert.assertTrue(cached.getInputProtocol() instanceof CachedTBinaryProtocol);
-            Assert.assertEquals(0L, cached.getTrashUsedCapacity());
-            Assert.assertEquals(0L, cached.getTrashUsedCapacity());
+            Assert.assertEquals(TBinaryProtocol.class, pooled.getInputProtocol().getClass());
+            Assert.assertEquals(0L, pooled.getTrashUsedCapacity());
+            Assert.assertEquals(0L, pooled.getTrashUsedCapacity());
         } finally {
-            backendService.returnObject(address, cached);
+            backendService.returnObject(address, pooled);
         }
 
         try (TSocket socket = new TSocket(ip, port, 5000)) {
@@ -356,7 +356,7 @@ public class GenericPoolTest {
                 TNetworkAddress standardAddress = new TNetworkAddress(ip, socket.getLocalPort());
                 BackendService.Client client = backendService.borrowObject(standardAddress, 5000);
                 try {
-                    Assert.assertTrue(client.getInputProtocol() instanceof CachedTBinaryProtocol);
+                    Assert.assertEquals(TBinaryProtocol.class, client.getInputProtocol().getClass());
                     Assert.assertEquals(0L, client.getTrashUsedCapacity());
                     Assert.assertEquals(0L, client.getTrashUsedCapacity());
                 } finally {

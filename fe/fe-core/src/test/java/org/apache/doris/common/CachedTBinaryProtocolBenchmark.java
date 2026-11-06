@@ -29,10 +29,17 @@ import com.sun.management.ThreadMXBean;
 import org.apache.thrift.TBase;
 import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.protocol.TProtocol;
+import org.apache.thrift.transport.TIOStreamTransport;
 import org.apache.thrift.transport.TMemoryBuffer;
 import org.apache.thrift.transport.TMemoryInputTransport;
+import org.apache.thrift.transport.TTransport;
+import org.apache.thrift.transport.TTransportException;
 
+import java.io.ByteArrayInputStream;
+import java.lang.management.CompilationMXBean;
+import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
+import java.lang.management.RuntimeMXBean;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -43,12 +50,18 @@ import java.util.Map;
 
 /**
  * Manual allocation and decode-time comparison using generated Thrift classes.
- * Run baseline/cached with report/stat-map/stat-list in separate JVMs, in reversed orders.
+ * Arguments: baseline|cached report|stat-map|stat-list memory|stream.
+ * Run each combination in separate JVMs, in reversed orders, with the intended JVM options.
+ * Properties: probe.warmup (minimum decoded messages), probe.operations (messages per batch),
+ * probe.samples, and probe.tablets (tablets per message, default 512).
+ * Warmup and measurement use the same batch size and decode call site.
+ * Check compilation logs for convergence; a fixed warmup count cannot guarantee it on every JVM.
+ * Stream mode exercises TIOStreamTransport over an in-memory stream, not network throughput.
  * This is not a performance assertion in the unit test suite.
  */
 public class CachedTBinaryProtocolBenchmark {
     private static volatile Object blackhole;
-    private static final int TABLETS = 512;
+    private static final int TABLETS = Integer.getInteger("probe.tablets", 512);
 
     private static TBase<?, ?> fixture(String scenario) {
         if (scenario.equals("report")) {
@@ -104,52 +117,189 @@ public class CachedTBinaryProtocolBenchmark {
     }
 
     public static void main(String[] args) throws Exception {
+        if (args.length != 3) {
+            throw new IllegalArgumentException(
+                    "Expected: baseline|cached report|stat-map|stat-list memory|stream");
+        }
         String variant = args[0];
         String scenario = args[1];
+        String transportName = args[2];
+        if (!(variant.equals("baseline") || variant.equals("cached"))
+                || !(scenario.equals("report") || scenario.equals("stat-map") || scenario.equals("stat-list"))
+                || !(transportName.equals("memory") || transportName.equals("stream"))) {
+            throw new IllegalArgumentException("Unsupported variant, scenario, or transport");
+        }
+        int warmup = Integer.getInteger("probe.warmup", 262144);
+        int operations = Integer.getInteger("probe.operations", 1024);
+        int samples = Integer.getInteger("probe.samples", 12);
+        if (warmup <= 0 || operations <= 0 || samples <= 0 || TABLETS <= 0) {
+            throw new IllegalArgumentException("Warmup, operations, samples, and tablets must be positive");
+        }
+        int warmupBatches = (warmup - 1) / operations + 1;
         TBase<?, ?> expected = fixture(scenario);
         TMemoryBuffer encoded = new TMemoryBuffer(1024);
         expected.write(new TBinaryProtocol(encoded));
         byte[] payload = Arrays.copyOf(encoded.getArray(), encoded.length());
-        TMemoryInputTransport input = new TMemoryInputTransport(payload);
+        ResettableInput input = transportName.equals("memory")
+                ? new ResettableMemoryInput(payload) : new ResettableStreamTransport(payload);
+        TTransport transport = input.transport();
         TProtocol protocol = variant.equals("baseline")
-                ? new TBinaryProtocol(input) : new CachedTBinaryProtocol(input);
+                ? new TBinaryProtocol(transport) : new CachedTBinaryProtocol(transport);
         TBase<?, ?> check = empty(scenario);
         check.read(protocol);
-        if (!expected.equals(check) || input.getBytesRemainingInBuffer() != 0) {
+        if (!expected.equals(check) || input.remaining() != 0) {
             throw new AssertionError("decoded fixture differs");
         }
         ThreadMXBean allocation = (ThreadMXBean) ManagementFactory.getThreadMXBean();
+        if (!allocation.isThreadAllocatedMemorySupported() || !allocation.isCurrentThreadCpuTimeSupported()) {
+            throw new IllegalStateException("Thread allocation and CPU metrics are required");
+        }
         if (!allocation.isThreadAllocatedMemoryEnabled()) {
             allocation.setThreadAllocatedMemoryEnabled(true);
         }
-        int warmup = Integer.getInteger("probe.warmup", 4096);
-        int operations = Integer.getInteger("probe.operations", 128);
-        for (int i = 0; i < warmup; i++) {
-            input.reset(payload);
+        if (!allocation.isThreadCpuTimeEnabled()) {
+            allocation.setThreadCpuTimeEnabled(true);
+        }
+        long threadId = Thread.currentThread().getId();
+        CompilationMXBean compiler = ManagementFactory.getCompilationMXBean();
+        RuntimeMXBean runtime = ManagementFactory.getRuntimeMXBean();
+        List<GarbageCollectorMXBean> collectors = ManagementFactory.getGarbageCollectorMXBeans();
+        Sample[] records = new Sample[samples];
+        for (int i = 0; i < samples; i++) {
+            records[i] = new Sample();
+        }
+        for (int batch = 0; batch < warmupBatches; batch++) {
+            decodeBatch(protocol, input, scenario, operations);
+        }
+        for (Sample record : records) {
+            long compileBefore = compiler.getTotalCompilationTime();
+            long gcBefore = gcTime(collectors);
+            record.startMillis = runtime.getUptime();
+            long bytesBefore = allocation.getThreadAllocatedBytes(threadId);
+            long cpuBefore = allocation.getCurrentThreadCpuTime();
+            long timeBefore = System.nanoTime();
+            record.checksum = decodeBatch(protocol, input, scenario, operations);
+            record.elapsedNanos = System.nanoTime() - timeBefore;
+            record.cpuNanos = allocation.getCurrentThreadCpuTime() - cpuBefore;
+            record.allocatedBytes = allocation.getThreadAllocatedBytes(threadId) - bytesBefore;
+            record.endMillis = runtime.getUptime();
+            record.compileMillis = compiler.getTotalCompilationTime() - compileBefore;
+            record.gcMillis = gcTime(collectors) - gcBefore;
+        }
+        // Print after all measurements to keep formatting and console I/O out of the samples.
+        System.out.printf(Locale.ROOT,
+                "SETUP variant=%s scenario=%s transport=%s tablets=%d payload=%d warmup=%d warmup_batches=%d jdk=%s%n",
+                variant, scenario, transportName, TABLETS, payload.length, (long) warmupBatches * operations,
+                warmupBatches, System.getProperty("java.runtime.version"));
+        for (int sample = 0; sample < records.length; sample++) {
+            Sample record = records[sample];
+            System.out.printf(Locale.ROOT,
+                    "SAMPLE variant=%s scenario=%s transport=%s sample=%d operations=%d bytes=%d"
+                            + " B_per_decode=%.3f ns_per_decode=%.3f cpu_ns=%.3f compile_ms=%d gc_ms=%d"
+                            + " checksum=%d start_ms=%d end_ms=%d%n",
+                    variant, scenario, transportName, sample, operations, record.allocatedBytes,
+                    (double) record.allocatedBytes / operations, (double) record.elapsedNanos / operations,
+                    (double) record.cpuNanos / operations, record.compileMillis, record.gcMillis,
+                    record.checksum, record.startMillis, record.endMillis);
+        }
+        blackhole = null;
+    }
+
+    private static long decodeBatch(TProtocol protocol, ResettableInput input, String scenario, int operations)
+            throws Exception {
+        long sum = 0;
+        for (int i = 0; i < operations; i++) {
+            input.resetMessage();
             TBase<?, ?> decoded = empty(scenario);
             decoded.read(protocol);
             blackhole = decoded;
+            sum += checksum(decoded);
         }
-        System.out.printf(Locale.ROOT, "SETUP variant=%s scenario=%s tablets=%d payload=%d warmup=%d jdk=%s%n",
-                variant, scenario, TABLETS, payload.length, warmup, System.getProperty("java.runtime.version"));
-        for (int sample = 0; sample < 8; sample++) {
-            long bytesBefore = allocation.getThreadAllocatedBytes(Thread.currentThread().getId());
-            long timeBefore = System.nanoTime();
-            long sum = 0;
-            for (int i = 0; i < operations; i++) {
-                input.reset(payload);
-                TBase<?, ?> decoded = empty(scenario);
-                decoded.read(protocol);
-                blackhole = decoded;
-                sum += checksum(decoded);
-            }
-            long elapsed = System.nanoTime() - timeBefore;
-            long bytes = allocation.getThreadAllocatedBytes(Thread.currentThread().getId()) - bytesBefore;
-            System.out.printf(Locale.ROOT,
-                    "SAMPLE variant=%s scenario=%s sample=%d operations=%d bytes=%d B_per_decode=%.3f ns_per_decode=%.3f checksum=%d%n",
-                    variant, scenario, sample, operations, bytes, (double) bytes / operations,
-                    (double) elapsed / operations, sum);
+        return sum;
+    }
+
+    private static long gcTime(List<GarbageCollectorMXBean> collectors) {
+        long total = 0;
+        for (GarbageCollectorMXBean collector : collectors) {
+            total += collector.getCollectionTime();
         }
-        blackhole = null;
+        return total;
+    }
+
+    private static class Sample {
+        private long allocatedBytes;
+        private long elapsedNanos;
+        private long cpuNanos;
+        private long compileMillis;
+        private long gcMillis;
+        private long checksum;
+        private long startMillis;
+        private long endMillis;
+    }
+
+    private interface ResettableInput {
+        TTransport transport();
+
+        void resetMessage() throws TTransportException;
+
+        int remaining();
+    }
+
+    private static class ResettableMemoryInput implements ResettableInput {
+        private final byte[] payload;
+        private final TMemoryInputTransport transport;
+
+        private ResettableMemoryInput(byte[] payload) throws TTransportException {
+            this.payload = payload;
+            this.transport = new TMemoryInputTransport(payload);
+        }
+
+        @Override
+        public TTransport transport() {
+            return transport;
+        }
+
+        @Override
+        public void resetMessage() {
+            transport.reset(payload);
+        }
+
+        @Override
+        public int remaining() {
+            return transport.getBytesRemainingInBuffer();
+        }
+    }
+
+    private static class ResettableStreamTransport extends TIOStreamTransport implements ResettableInput {
+        private final ByteArrayInputStream source;
+        private final int messageSize;
+
+        private ResettableStreamTransport(byte[] payload) throws TTransportException {
+            this(new ByteArrayInputStream(payload), payload.length);
+        }
+
+        private ResettableStreamTransport(ByteArrayInputStream source, int messageSize) throws TTransportException {
+            super(source);
+            this.source = source;
+            this.messageSize = messageSize;
+            resetMessage();
+        }
+
+        @Override
+        public TTransport transport() {
+            return this;
+        }
+
+        @Override
+        public void resetMessage() throws TTransportException {
+            source.reset();
+            // Reset each independent message against the transport's configured maximum.
+            resetConsumedMessageSize(messageSize);
+        }
+
+        @Override
+        public int remaining() {
+            return source.available();
+        }
     }
 }

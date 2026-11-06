@@ -106,6 +106,24 @@ public class CachedTBinaryProtocolTest {
     }
 
     @Test
+    public void testStopOnStreamLeavesNextFieldIntact() throws Exception {
+        byte[] bytes = {TType.STOP, TType.I64, 0, 1, TType.STOP};
+        ByteArrayInputStream input = new ByteArrayInputStream(bytes);
+        TProtocol protocol = new CachedTBinaryProtocol(new TIOStreamTransport(input));
+        TField firstStop = protocol.readFieldBegin();
+        Assert.assertEquals(TType.STOP, firstStop.type);
+        Assert.assertEquals(0, firstStop.id);
+        Assert.assertEquals("", firstStop.name);
+        Assert.assertEquals(bytes.length - 1, input.available());
+        TField next = protocol.readFieldBegin();
+        Assert.assertEquals(TType.I64, next.type);
+        Assert.assertEquals(1, next.id);
+        Assert.assertEquals(1, input.available());
+        Assert.assertSame(firstStop, protocol.readFieldBegin());
+        Assert.assertEquals(0, input.available());
+    }
+
+    @Test
     public void testTruncatedHeadersPreserveExceptionsAndConsumption() throws Exception {
         for (byte[] bytes : new byte[][] {new byte[0], {TType.I32}, {TType.I32, 1}}) {
             TMemoryInputTransport originalInput = new TMemoryInputTransport(bytes);

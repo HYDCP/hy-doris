@@ -27,6 +27,7 @@ import org.apache.thrift.transport.TTransport;
 /** Binary protocol with bounded reuse of immutable field descriptors on the read path. */
 public final class CachedTBinaryProtocol extends TBinaryProtocol {
     private static final int CACHED_FIELD_ID_COUNT = 64;
+    private static final TField STOP_FIELD = new TField("", TType.STOP, (short) 0);
     private static final TField[] CACHED_FIELDS = createCachedFields();
 
     public CachedTBinaryProtocol(TTransport transport) {
@@ -40,7 +41,8 @@ public final class CachedTBinaryProtocol extends TBinaryProtocol {
 
     private static TField[] createCachedFields() {
         TField[] fields = new TField[(TType.ENUM + 1) * CACHED_FIELD_ID_COUNT];
-        for (byte type = TType.STOP; type <= TType.ENUM; type++) {
+        // STOP is handled separately and never indexes the table.
+        for (byte type = TType.VOID; type <= TType.ENUM; type++) {
             for (short id = 0; id < CACHED_FIELD_ID_COUNT; id++) {
                 fields[type * CACHED_FIELD_ID_COUNT + id] = new TField("", type, id);
             }
@@ -52,7 +54,10 @@ public final class CachedTBinaryProtocol extends TBinaryProtocol {
     public TField readFieldBegin() throws TException {
         byte type = readByte();
         // STOP has no field ID on the wire, as in Thrift 0.16.0's TBinaryProtocol.
-        short id = type == TType.STOP ? 0 : readI16();
+        if (type == TType.STOP) {
+            return STOP_FIELD;
+        }
+        short id = readI16();
         if (type >= TType.STOP && type <= TType.ENUM && id >= 0 && id < CACHED_FIELD_ID_COUNT) {
             return CACHED_FIELDS[type * CACHED_FIELD_ID_COUNT + id];
         }

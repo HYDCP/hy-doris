@@ -17,8 +17,7 @@
 
 package org.apache.doris.rpc;
 
-import org.apache.doris.common.CachedTBinaryProtocol;
-
+import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.protocol.TProtocol;
 import org.apache.thrift.protocol.TType;
 import org.apache.thrift.transport.TMemoryInputTransport;
@@ -30,7 +29,7 @@ public class TCustomProtocolFactoryTest {
     public void testMessageLimitAndTransportArePreserved() throws Exception {
         TMemoryInputTransport input = new TMemoryInputTransport(new byte[] {TType.I32, 0, 1, 0, 0, 0, 42});
         TProtocol protocol = new TCustomProtocolFactory(123456).getProtocol(input);
-        Assert.assertTrue(protocol instanceof CachedTBinaryProtocol);
+        Assert.assertEquals(TBinaryProtocol.class, protocol.getClass());
         Assert.assertSame(input, protocol.getTransport());
         Assert.assertEquals(123456, input.getConfiguration().getMaxMessageSize());
         Assert.assertEquals(1, protocol.readFieldBegin().id);
