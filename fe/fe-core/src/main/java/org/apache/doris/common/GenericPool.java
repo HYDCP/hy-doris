@@ -26,7 +26,6 @@ import org.apache.commons.pool2.impl.GenericKeyedObjectPool;
 import org.apache.commons.pool2.impl.GenericKeyedObjectPoolConfig;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.protocol.TProtocol;
 import org.apache.thrift.transport.TSocket;
 import org.apache.thrift.transport.TTransport;
@@ -141,7 +140,7 @@ public class GenericPool<VALUE extends org.apache.thrift.TServiceClient>  {
                     ? new TFramedTransport(new TSocket(key.hostname, key.port, timeoutMs))
                     : new TSocket(key.hostname, key.port, timeoutMs);
             transport.open();
-            TProtocol protocol = new TBinaryProtocol(transport);
+            TProtocol protocol = new CachedTBinaryProtocol(transport);
             VALUE client = (VALUE) newInstance(className, protocol);
             return client;
         }

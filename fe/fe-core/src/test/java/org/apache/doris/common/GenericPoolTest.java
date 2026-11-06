@@ -67,12 +67,19 @@ import org.apache.doris.utframe.UtFrameUtils;
 import org.apache.commons.pool2.impl.GenericKeyedObjectPoolConfig;
 import org.apache.thrift.TException;
 import org.apache.thrift.TProcessor;
+import org.apache.thrift.protocol.TBinaryProtocol;
+import org.apache.thrift.server.TServer;
+import org.apache.thrift.server.TThreadPoolServer;
+import org.apache.thrift.transport.TServerSocket;
+import org.apache.thrift.transport.TSocket;
 import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.ServerSocket;
 import java.util.List;
 
 public class GenericPoolTest {
@@ -317,6 +324,50 @@ public class GenericPoolTest {
 
         backendService.returnObject(address, object2);
         backendService.returnObject(address, object3);
+    }
+
+    @Test
+    public void testCachedAndStandardBinaryProtocolInteroperability() throws Exception {
+        TNetworkAddress address = new TNetworkAddress(ip, port);
+        BackendService.Client cached = backendService.borrowObject(address, 5000);
+        try {
+            Assert.assertTrue(cached.getInputProtocol() instanceof CachedTBinaryProtocol);
+            Assert.assertEquals(0L, cached.getTrashUsedCapacity());
+            Assert.assertEquals(0L, cached.getTrashUsedCapacity());
+        } finally {
+            backendService.returnObject(address, cached);
+        }
+
+        try (TSocket socket = new TSocket(ip, port, 5000)) {
+            socket.open();
+            BackendService.Client standard = new BackendService.Client(new TBinaryProtocol(socket));
+            Assert.assertEquals(0L, standard.getTrashUsedCapacity());
+            Assert.assertEquals(0L, standard.getTrashUsedCapacity());
+        }
+
+        try (ServerSocket socket = new ServerSocket(0, 50, InetAddress.getByName(ip))) {
+            TServer standardServer = new TThreadPoolServer(new TThreadPoolServer.Args(new TServerSocket(socket))
+                    .protocolFactory(new TBinaryProtocol.Factory())
+                    .processor(new BackendService.Processor<>(new InternalProcessor())));
+            Thread thread = new Thread(standardServer::serve, "standard-binary-protocol-test");
+            thread.setDaemon(true);
+            thread.start();
+            try {
+                TNetworkAddress standardAddress = new TNetworkAddress(ip, socket.getLocalPort());
+                BackendService.Client client = backendService.borrowObject(standardAddress, 5000);
+                try {
+                    Assert.assertTrue(client.getInputProtocol() instanceof CachedTBinaryProtocol);
+                    Assert.assertEquals(0L, client.getTrashUsedCapacity());
+                    Assert.assertEquals(0L, client.getTrashUsedCapacity());
+                } finally {
+                    backendService.invalidateObject(standardAddress, client);
+                }
+            } finally {
+                standardServer.stop();
+                thread.join(10000);
+                Assert.assertFalse(thread.isAlive());
+            }
+        }
     }
 
     @Test

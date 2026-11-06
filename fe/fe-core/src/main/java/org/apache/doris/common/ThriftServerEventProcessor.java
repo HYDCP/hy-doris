@@ -54,7 +54,7 @@ public class ThriftServerEventProcessor implements TServerEventHandler {
 
     @Override
     public ServerContext createContext(TProtocol input, TProtocol output) {
-        // param input is class org.apache.thrift.protocol.TBinaryProtocol
+        // The transport determines how to obtain the peer address.
         TSocket tSocket = null;
         TTransport transport = input.getTransport();
         switch (thriftServer.getType()) { // CHECKSTYLE IGNORE THIS LINE: missing switch default

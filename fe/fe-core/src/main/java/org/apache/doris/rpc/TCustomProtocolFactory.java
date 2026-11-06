@@ -17,7 +17,8 @@
 
 package org.apache.doris.rpc;
 
-import org.apache.thrift.protocol.TBinaryProtocol;
+import org.apache.doris.common.CachedTBinaryProtocol;
+
 import org.apache.thrift.protocol.TProtocol;
 import org.apache.thrift.protocol.TProtocolFactory;
 import org.apache.thrift.transport.TTransport;
@@ -32,7 +33,7 @@ public class TCustomProtocolFactory implements TProtocolFactory {
     @Override
     public TProtocol getProtocol(TTransport tTransport) {
         tTransport.getConfiguration().setMaxMessageSize(maxMessageSize);
-        return new TBinaryProtocol(tTransport);
+        return new CachedTBinaryProtocol(tTransport);
     }
 
     public TCustomProtocolFactory(int maxMessageSize) {
