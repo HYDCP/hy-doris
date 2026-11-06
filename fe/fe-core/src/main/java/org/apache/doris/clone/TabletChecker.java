@@ -28,7 +28,6 @@ import org.apache.doris.catalog.MysqlCompatibleDatabase;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Partition.PartitionState;
-import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.catalog.Tablet.TabletHealth;
@@ -364,10 +363,6 @@ public class TabletChecker extends MasterDaemon {
         }
         boolean prioPartIsHealthy = true;
         boolean isUniqKeyMergeOnWrite = tbl.isUniqKeyMergeOnWrite();
-        // Initialize on the first checked tablet, so empty or already scheduled partitions stay cheap.
-        // Both checker paths hold the table read lock for the entire partition scan.
-        ReplicaAllocation replicaAlloc = null;
-        short replicationNum = 0;
         /*
          * Tablet in SHADOW index can not be repaired of balanced
          */
@@ -380,12 +375,8 @@ public class TabletChecker extends MasterDaemon {
                     continue;
                 }
 
-                if (replicaAlloc == null) {
-                    replicaAlloc = tbl.getPartitionInfo().getReplicaAllocation(partition.getId());
-                    replicationNum = replicaAlloc.getTotalReplicaNum();
-                }
                 TabletHealth tabletHealth = tablet.getHealth(infoService, partition.getVisibleVersion(),
-                        replicaAlloc, replicationNum, aliveBeIds);
+                        tbl.getPartitionInfo().getReplicaAllocation(partition.getId()), aliveBeIds);
 
                 if (tabletHealth.status == TabletStatus.HEALTHY) {
                     // Only set last status check time when status is healthy.
@@ -410,7 +401,7 @@ public class TabletChecker extends MasterDaemon {
                         TabletSchedCtx.Type.REPAIR,
                         db.getId(), tbl.getId(),
                         partition.getId(), idx.getId(), tablet.getId(),
-                        replicaAlloc,
+                        tbl.getPartitionInfo().getReplicaAllocation(partition.getId()),
                         System.currentTimeMillis());
                 // the tablet status will be set again when being scheduled
                 tabletCtx.setTabletHealth(tabletHealth);

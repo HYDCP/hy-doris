@@ -577,17 +577,11 @@ public class Tablet extends MetaObject {
      */
     public TabletHealth getHealth(SystemInfoService systemInfoService,
             long visibleVersion, ReplicaAllocation replicaAlloc, List<Long> aliveBeIds) {
-        return getHealth(systemInfoService, visibleVersion, replicaAlloc,
-                replicaAlloc.getTotalReplicaNum(), aliveBeIds);
-    }
-
-    // The caller can reuse the count for a partition while holding the table read lock.
-    public TabletHealth getHealth(SystemInfoService systemInfoService,
-            long visibleVersion, ReplicaAllocation replicaAlloc, short replicationNum, List<Long> aliveBeIds) {
         Map<Tag, Short> allocMap = replicaAlloc.getAllocMap();
         Map<Tag, Short> stableAllocMap = Maps.newHashMap();
         Map<Tag, Short> stableVersionCompleteAllocMap = Maps.newHashMap();
 
+        short replicationNum = replicaAlloc.getTotalReplicaNum();
         int alive = 0;
         int aliveAndVersionComplete = 0;
         int stable = 0;
