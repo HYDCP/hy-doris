@@ -263,19 +263,20 @@ public class TabletInvertedIndex {
                                      List<TTabletMetaInfo> tabletToUpdate,
                                      List<Pair<TabletMeta, TTabletInfo>> cooldownTablets,
                                      Map.Entry<Long, Replica> entry) {
-        long tabletId = entry.getKey();
+        Long tabletKey = entry.getKey();
+        long tabletId = tabletKey;
         Replica replica = entry.getValue();
 
-        Preconditions.checkState(tabletMetaMap.containsKey(tabletId),
-                "tablet " + tabletId + " not exists, backend " + backendId);
-        TabletMeta tabletMeta = tabletMetaMap.get(tabletId);
+        Preconditions.checkState(tabletMetaMap.containsKey(tabletKey),
+                "tablet %s not exists, backend %s", tabletId, backendId);
+        TabletMeta tabletMeta = tabletMetaMap.get(tabletKey);
 
-        if (backendTablets.containsKey(tabletId)) {
+        if (backendTablets.containsKey(tabletKey)) {
             // Tablet exists in both FE and BE
-            TTablet backendTablet = backendTablets.get(tabletId);
+            TTablet backendTablet = backendTablets.get(tabletKey);
             TTabletInfo backendTabletInfo = backendTablet.getTabletInfos().get(0);
 
-            tabletFoundInMeta.add(tabletId);
+            tabletFoundInMeta.add(tabletKey);
 
             processExistingTablet(backendId, tabletId, replica, tabletMeta, backendTabletInfo,
                     storageMediumMap, tabletSyncMap, tabletMigrationMap, transactionsToPublish,
@@ -1005,7 +1006,7 @@ public class TabletInvertedIndex {
         try {
             Map<Long, Replica> replicaMetaWithBackend = backingReplicaMetaTable.row(backendId);
             if (replicaMetaWithBackend != null) {
-                for (long tabletId : replicaMetaWithBackend.keySet()) {
+                for (Long tabletId : replicaMetaWithBackend.keySet()) {
                     if (tabletMetaMap.get(tabletId).getStorageMedium() == TStorageMedium.HDD) {
                         hddNum++;
                     } else {
