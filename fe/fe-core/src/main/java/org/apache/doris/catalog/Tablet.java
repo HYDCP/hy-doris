@@ -578,8 +578,9 @@ public class Tablet extends MetaObject {
     public TabletHealth getHealth(SystemInfoService systemInfoService,
             long visibleVersion, ReplicaAllocation replicaAlloc, List<Long> aliveBeIds) {
         Map<Tag, Short> allocMap = replicaAlloc.getAllocMap();
-        Map<Tag, Short> stableAllocMap = Maps.newHashMap();
-        Map<Tag, Short> stableVersionCompleteAllocMap = Maps.newHashMap();
+        int expectedTagCount = Math.min(allocMap.size(), replicas.size());
+        Map<Tag, Short> stableAllocMap = Maps.newHashMapWithExpectedSize(expectedTagCount);
+        Map<Tag, Short> stableVersionCompleteAllocMap = Maps.newHashMapWithExpectedSize(expectedTagCount);
 
         short replicationNum = replicaAlloc.getTotalReplicaNum();
         int alive = 0;
@@ -588,7 +589,7 @@ public class Tablet extends MetaObject {
 
         Replica needFurtherRepairReplica = null;
         boolean hasAliveAndVersionIncomplete = false;
-        Set<String> hosts = Sets.newHashSet();
+        Set<String> hosts = Sets.newHashSetWithExpectedSize(replicas.size());
         long minVersionCount = Long.MAX_VALUE;
         long maxVersionCount = Long.MIN_VALUE;
         for (Replica replica : replicas) {
@@ -805,7 +806,7 @@ public class Tablet extends MetaObject {
         short replicationNum = replicaAlloc.getTotalReplicaNum();
         boolean hasAliveAndVersionIncomplete = false;
         int aliveAndVersionComplete = 0;
-        Set<String> hosts = Sets.newHashSet();
+        Set<String> hosts = Sets.newHashSetWithExpectedSize(replicas.size());
         for (Replica replica : replicas) {
             Backend backend = systemInfoService.getBackend(replica.getBackendIdWithoutException());
             if (!isReplicaAndBackendAlive(replica, backend, hosts)) {
