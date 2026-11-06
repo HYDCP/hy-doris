@@ -4544,7 +4544,61 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         return Status.OK;
     }
 
+    /**
+     * Lock the origin tables that have a local decision (db lock first, then the tables by ascending id), and check
+     * all of them, before any table is replaced: either all of them are at the version they were proved at, or none
+     * is touched. The caller holds the write lock of the database, and unlocks the tables added to the locked list.
+     */
+    private Status lockAndCheckAtomicOriginTables(Database db, List<OlapTable> locked) {
+        Map<Long, OlapTable> origins = Maps.newTreeMap();
+        for (String tableName : jobInfo.backupOlapTableObjects.keySet()) {
+            String originName = jobInfo.getAliasByOriginNameIfSet(tableName);
+            if (GlobalVariable.isStoredTableNamesLowerCase()) {
+                originName = originName.toLowerCase();
+            }
+            Table originTbl = db.getTableNullable(originName);
+            if (originTbl instanceof OlapTable && hasAtomicLocalDecision(originTbl.getId())) {
+                origins.put(originTbl.getId(), (OlapTable) originTbl);
+            }
+        }
+        for (OlapTable originTbl : origins.values()) {
+            originTbl.writeLock();
+            locked.add(originTbl);
+        }
+        for (OlapTable originTbl : origins.values()) {
+            Status st = checkAtomicLocalVersions(originTbl);
+            if (!st.ok()) {
+                return st;
+            }
+        }
+        return Status.OK;
+    }
+
     private Status atomicReplaceOlapTables(Database db, boolean isReplay) {
+        // The database lock is held until all the tables are replaced (it is reentrant), and so are the write locks
+        // of the origin tables that keep local data: no write is allowed to be in between the check of their
+        // versions and the replace.
+        if (!db.writeLockIfExist()) {
+            return Status.OK;
+        }
+        List<OlapTable> lockedOrigins = Lists.newArrayList();
+        try {
+            if (!isReplay) {
+                Status st = lockAndCheckAtomicOriginTables(db, lockedOrigins);
+                if (!st.ok()) {
+                    return st;
+                }
+            }
+            return replaceOlapTablesAndViews(db, isReplay);
+        } finally {
+            for (int i = lockedOrigins.size() - 1; i >= 0; i--) {
+                lockedOrigins.get(i).writeUnlock();
+            }
+            db.writeUnlock();
+        }
+    }
+
+    private Status replaceOlapTablesAndViews(Database db, boolean isReplay) {
         for (String tableName : jobInfo.backupOlapTableObjects.keySet()) {
             String originName = jobInfo.getAliasByOriginNameIfSet(tableName);
             if (GlobalVariable.isStoredTableNamesLowerCase()) {
@@ -4586,20 +4640,6 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     originOlapTbl = (OlapTable) originTbl; // save the origin olap table, then drop it.
                 }
 
-                // The partitions made from the local tablets of the origin table must be at the version they were
-                // proved at, until the table is replaced: no write is allowed to be in between (the check and the
-                // replace are under the same lock of the origin table). The origin table is not touched if not.
-                boolean originLocked = false;
-                if (!isReplay && originOlapTbl != null && hasAtomicLocalDecision(originOlapTbl.getId())) {
-                    originOlapTbl.writeLock();
-                    originLocked = true;
-                    Status st = checkAtomicLocalVersions(originOlapTbl);
-                    if (!st.ok()) {
-                        originOlapTbl.writeUnlock();
-                        return st;
-                    }
-                }
-
                 // replace the table.
                 OlapTable newOlapTbl = (OlapTable) newTbl;
                 newOlapTbl.writeLock();
@@ -4620,9 +4660,6 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 } catch (DdlException e) {
                     LOG.warn("restore with replace table {} name from {} to {}, isAtomicRestore: {}",
                             newOlapTbl.getId(), aliasName, originName, isAtomicRestore, e);
-                    if (originLocked) {
-                        originOlapTbl.writeUnlock();
-                    }
                     return new Status(ErrCode.COMMON_ERROR, "replace table from " + aliasName + " to " + originName
                             + " failed, reason=" + e.getMessage());
                 } finally {
@@ -4639,9 +4676,6 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     } finally {
                         originOlapTbl.writeUnlock();
                     }
-                }
-                if (originLocked) {
-                    originOlapTbl.writeUnlock();
                 }
             } finally {
                 db.writeUnlock();
