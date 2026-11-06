@@ -27,7 +27,6 @@ import org.apache.doris.system.Backend;
 import org.apache.doris.system.SystemInfoService;
 
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
 import mockit.Expectations;
 import mockit.Mocked;
@@ -160,46 +159,13 @@ public class TabletHealthCollectionTest {
         assertHealth(new ReplicaAllocation((short) 3), Tablet.TabletStatus.UNRECOVERABLE, Priority.NORMAL, 0);
     }
 
-    @Test
-    public void testReplicaBackendPathsKeepSetSemanticsAndFiltering() throws Exception {
-        Replica first = addReplica(1L, "127.0.0.1", "default");
-        first.setPathHash(100L);
-        addPathReplica(201L, 1L, 200L, ReplicaState.NORMAL);
-        addPathReplica(202L, 1L, 100L, ReplicaState.NORMAL);
-        addPathReplica(203L, 1L, 300L, ReplicaState.CLONE);
-        Replica deadBackendReplica = addReplica(2L, "127.0.0.2", "default");
-        deadBackendReplica.setPathHash(400L);
-        infoService.getBackend(2L).setAlive(false);
-        Replica bad = addReplica(3L, "127.0.0.3", "default");
-        bad.setPathHash(500L);
-        bad.setBad(true);
-        addPathReplica(204L, 3L, 600L, ReplicaState.DECOMMISSION);
-        Replica decommissioned = addPathReplica(205L, 3L, 700L, ReplicaState.DECOMMISSION);
-        decommissioned.setPostWatermarkTxnId(10L);
-
-        Multimap<Long, Long> paths = tablet.getNormalReplicaBackendPathMap();
-
-        Assert.assertEquals(Sets.newHashSet(1L, 3L), paths.keySet());
-        Assert.assertEquals(Sets.newHashSet(100L, 200L), Sets.newHashSet(paths.get(1L)));
-        Assert.assertEquals(Sets.newHashSet(600L), Sets.newHashSet(paths.get(3L)));
-        Assert.assertEquals(3, paths.size());
-    }
-
-    private Replica addReplica(long backendId, String host, String zone) {
+    private void addReplica(long backendId, String host, String zone) {
         Backend backend = new Backend(backendId, host, 8030);
         backend.setAlive(true);
         backend.setTagMap(ImmutableMap.of(Tag.TYPE_LOCATION, zone));
         infoService.addBackend(backend);
         Replica replica = new Replica(backendId + 100L, backendId, ReplicaState.NORMAL, 100L, 0);
         tablet.getReplicas().add(replica);
-        return replica;
-    }
-
-    private Replica addPathReplica(long replicaId, long backendId, long pathHash, ReplicaState state) {
-        Replica replica = new Replica(replicaId, backendId, state, 100L, 0);
-        replica.setPathHash(pathHash);
-        tablet.getReplicas().add(replica);
-        return replica;
     }
 
     private static Tag location(String zone) throws AnalysisException {

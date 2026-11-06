@@ -1234,10 +1234,7 @@ public class Column implements GsonPostProcessable {
     }
 
     public void setIndexFlag(TColumn tColumn, OlapTable olapTable) {
-        setIndexFlag(tColumn, olapTable.getIndexes(), olapTable.getCopiedBfColumns());
-    }
-
-    public void setIndexFlag(TColumn tColumn, List<Index> indexes, Set<String> bfColumns) {
+        List<Index> indexes = olapTable.getIndexes();
         for (Index index : indexes) {
             if (index.getIndexType() == IndexDef.IndexType.BITMAP) {
                 List<String> columns = index.getColumns();
@@ -1246,6 +1243,7 @@ public class Column implements GsonPostProcessable {
                 }
             }
         }
+        Set<String> bfColumns = olapTable.getCopiedBfColumns();
         if (bfColumns != null && bfColumns.contains(tColumn.getColumnName())) {
             tColumn.setIsBloomFilterColumn(true);
         }

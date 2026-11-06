@@ -51,12 +51,13 @@ import org.apache.doris.thrift.TStatusCode;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import org.apache.commons.io.output.UnsynchronizedByteArrayOutputStream;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.thrift.TException;
 import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.transport.TMemoryBuffer;
+import org.apache.thrift.transport.TIOStreamTransport;
 import org.apache.thrift.transport.TMemoryInputTransport;
 
 import java.io.DataInputStream;
@@ -68,6 +69,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class BinlogManager {
     private static final int BUFFER_SIZE = 16 * 1024;
+    private static final int MAX_REUSABLE_BINLOG_SIZE = 1024 * 1024;
     private static final ImmutableList<String> TITLE_NAMES = new ImmutableList.Builder<String>().add("Name")
             .add("Type").add("Id").add("Dropped").add("BinlogLength").add("BinlogSize").add("FirstBinlogCommittedTime")
             .add("ReadableFirstBinlogCommittedTime").add("LastBinlogCommittedTime")
@@ -694,15 +696,29 @@ public class BinlogManager {
         }
     }
 
-    private static void writeTBinlogToStream(DataOutputStream dos, TBinlog binlog) throws TException, IOException {
-        TMemoryBuffer buffer = new TMemoryBuffer(BUFFER_SIZE);
-        TBinaryProtocol protocol = new TBinaryProtocol(buffer);
-        binlog.write(protocol);
-        // TMemoryBuffer.getArray() returns the whole expanded backing array (at least BUFFER_SIZE),
-        // only the first length() bytes are valid serialized data.
-        int length = buffer.length();
-        dos.writeInt(length);
-        dos.write(buffer.getArray(), 0, length);
+    // A checkpoint owns its writer; an oversized record must not retain its buffers for later records.
+    static final class BinlogWriter {
+        private UnsynchronizedByteArrayOutputStream buffer;
+        private TBinaryProtocol protocol;
+
+        BinlogWriter() throws TException {
+            createBuffer();
+        }
+
+        private void createBuffer() throws TException {
+            buffer = UnsynchronizedByteArrayOutputStream.builder().setBufferSize(BUFFER_SIZE).get();
+            protocol = new TBinaryProtocol(new TIOStreamTransport(buffer));
+        }
+
+        void write(DataOutputStream dos, TBinlog binlog) throws TException, IOException {
+            buffer.reset();
+            binlog.write(protocol);
+            dos.writeInt(buffer.size());
+            buffer.writeTo(dos);
+            if (buffer.size() > MAX_REUSABLE_BINLOG_SIZE) {
+                createBuffer();
+            }
+        }
     }
 
     // not thread safety, do this without lock
@@ -723,11 +739,14 @@ public class BinlogManager {
 
         // Step 3: write all binlogs to dos
         // binlog is a thrift type TBinlog
-        for (TBinlog binlog : binlogs) {
+        if (!binlogs.isEmpty()) {
             try {
-                writeTBinlogToStream(dos, binlog);
+                BinlogWriter writer = new BinlogWriter();
+                for (TBinlog binlog : binlogs) {
+                    writer.write(dos, binlog);
+                }
             } catch (TException e) {
-                throw new IOException("failed to write binlog to TMemoryBuffer");
+                throw new IOException("failed to serialize binlog", e);
             }
         }
 

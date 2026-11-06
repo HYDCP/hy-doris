@@ -84,6 +84,7 @@ import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Range;
+import com.google.common.collect.Sets;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -96,7 +97,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
-import java.util.Set;
 import java.util.stream.Collectors;
 
 public class OlapTableSink extends DataSink {
@@ -322,16 +322,13 @@ public class OlapTableSink extends DataSink {
             schemaParam.addToSlotDescs(slotDesc.toThrift());
         }
 
-        List<Index> tableIndexes = table.getIndexes();
-        Set<String> bfColumns = table.getCopiedBfColumns();
-        List<Column> baseSchema = null;
         for (Map.Entry<Long, MaterializedIndexMeta> pair : table.getIndexIdToMeta().entrySet()) {
             MaterializedIndexMeta indexMeta = pair.getValue();
-            List<Column> indexColumns = indexMeta.getSchema();
-            List<String> columns = new ArrayList<>(indexColumns.size());
-            List<TColumn> columnsDesc = new ArrayList<>(indexColumns.size());
-            for (Column column : indexColumns) {
-                columns.add(column.getNonShadowName());
+            List<String> columns = Lists.newArrayList();
+            List<TColumn> columnsDesc = Lists.newArrayList();
+            List<TOlapTableIndex> indexDesc = Lists.newArrayList();
+            columns.addAll(indexMeta.getSchema().stream().map(Column::getNonShadowName).collect(Collectors.toList()));
+            for (Column column : indexMeta.getSchema()) {
                 TColumn tColumn = column.toThrift();
                 // When schema change is doing, some modified column has prefix in name. Columns here
                 // is for the schema in rowset meta, which should be no column with shadow prefix.
@@ -339,21 +336,17 @@ public class OlapTableSink extends DataSink {
                 if (column.getName().startsWith(SchemaChangeHandler.SHADOW_NAME_PREFIX)) {
                     tColumn.setColumnName(column.getNonShadowName());
                 }
-                column.setIndexFlag(tColumn, tableIndexes, bfColumns);
+                column.setIndexFlag(tColumn, table);
                 columnsDesc.add(tColumn);
             }
             List<Index> indexes = indexMeta.getIndexes();
             if (indexes.size() == 0 && pair.getKey() == table.getBaseIndexId()) {
                 // for compatible with old version befor 2.0-beta
                 // if indexMeta.getIndexes() is empty, use table.getIndexes()
-                indexes = tableIndexes;
-            }
-            List<TOlapTableIndex> indexDesc = new ArrayList<>(indexes.size());
-            if (!indexes.isEmpty() && baseSchema == null) {
-                baseSchema = table.getBaseSchema();
+                indexes = table.getIndexes();
             }
             for (Index index : indexes) {
-                TOlapTableIndex tIndex = index.toThrift(index.getColumnUniqueIds(baseSchema));
+                TOlapTableIndex tIndex = index.toThrift(index.getColumnUniqueIds(table.getBaseSchema()));
                 indexDesc.add(tIndex);
             }
             TOlapTableIndexSchema indexSchema = new TOlapTableIndexSchema(pair.getKey(), columns,
@@ -701,7 +694,6 @@ public class OlapTableSink extends DataSink {
         TOlapTableLocationParam slaveLocationParam = new TOlapTableLocationParam();
         // BE id -> path hash
         Multimap<Long, Long> allBePathsMap = HashMultimap.create();
-        Random random = null;
         for (long partitionId : partitionIds) {
             Partition partition = table.getPartition(partitionId);
             int loadRequiredReplicaNum = table.getLoadRequiredReplicaNum(partition.getId());
@@ -709,11 +701,11 @@ public class OlapTableSink extends DataSink {
                 // we should ensure the replica backend is alive
                 // otherwise, there will be a 'unknown node id, id=xxx' error for stream load
                 for (Tablet tablet : index.getTablets()) {
-                    Multimap<Long, Long> bePathsMap;
+                    StringBuilder errMsgBuilder = new StringBuilder();
+                    Multimap<Long, Long> bePathsMap = HashMultimap.create();
                     try {
                         bePathsMap = tablet.getNormalReplicaBackendPathMap();
                         if (bePathsMap.keySet().size() < loadRequiredReplicaNum) {
-                            StringBuilder errMsgBuilder = new StringBuilder();
                             errMsgBuilder.append("tablet ").append(tablet.getId())
                                     .append(" alive replica num ").append(bePathsMap.keySet().size())
                                     .append(" < load required replica num ").append(loadRequiredReplicaNum)
@@ -737,7 +729,8 @@ public class OlapTableSink extends DataSink {
                         }
                     } catch (ComputeGroupException e) {
                         LOG.warn("failed to get replica backend path for tablet " + tablet.getId(), e);
-                        throw new UserException(InternalErrorCode.INTERNAL_ERR, ", " + e.toString());
+                        errMsgBuilder.append(", ").append(e.toString());
+                        throw new UserException(InternalErrorCode.INTERNAL_ERR, errMsgBuilder.toString());
                     }
                     if (!Config.isCloudMode()) {
                         debugWriteRandomChooseSink(tablet, partition.getVisibleVersion(), bePathsMap);
@@ -749,15 +742,12 @@ public class OlapTableSink extends DataSink {
 
                     if (singleReplicaLoad) {
                         Long[] nodes = bePathsMap.keySet().toArray(new Long[0]);
-                        if (random == null) {
-                            random = new SecureRandom();
-                        }
+                        Random random = new SecureRandom();
                         Long masterNode = nodes[random.nextInt(nodes.length)];
                         Multimap<Long, Long> slaveBePathsMap = bePathsMap;
                         slaveBePathsMap.removeAll(masterNode);
-                        List<Long> masterNodes = new ArrayList<>(1);
-                        masterNodes.add(masterNode);
-                        locationParam.addToTablets(new TTabletLocation(tablet.getId(), masterNodes));
+                        locationParam.addToTablets(new TTabletLocation(tablet.getId(),
+                                Lists.newArrayList(Sets.newHashSet(masterNode))));
                         slaveLocationParam.addToTablets(new TTabletLocation(tablet.getId(),
                                 Lists.newArrayList(slaveBePathsMap.keySet())));
                     } else {

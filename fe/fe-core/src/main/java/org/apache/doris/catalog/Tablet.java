@@ -273,7 +273,7 @@ public class Tablet extends MetaObject {
 
     private Multimap<Long, Long> getNormalReplicaBackendPathMapImpl(String beEndpoint, BackendIdGetter idGetter)
             throws UserException {
-        Multimap<Long, Long> map = HashMultimap.create(replicas.size(), 1);
+        Multimap<Long, Long> map = HashMultimap.create();
         SystemInfoService infoService = Env.getCurrentSystemInfo();
         for (Replica replica : replicas) {
             long backendId = idGetter.get(replica, beEndpoint);
