@@ -23,6 +23,8 @@
 #include <libdivide.h>
 #include <string.h>
 
+#include <limits>
+
 #include "vec/columns/column_vector.h"
 #include "vec/core/types.h"
 #include "vec/data_types/number_traits.h"
@@ -33,6 +35,17 @@ template <typename A, typename B>
 struct DivideIntegralImpl {
     using ResultType = typename NumberTraits::ResultOfIntegerDivision<A, B>::Type;
     using Traits = NumberTraits::BinaryOperatorTraits<A, B>;
+    static constexpr bool is_signed_integer =
+            !std::is_floating_point_v<A> && (std::is_signed_v<A> || std::is_same_v<A, Int128>);
+
+    // the minimal signed number divided by minus one overflows and raises SIGFPE
+    static bool division_leads_to_fpe(A a, B b) {
+        if constexpr (is_signed_integer) {
+            return b == -1 && a == std::numeric_limits<A>::min();
+        } else {
+            return false;
+        }
+    }
 
     template <typename Result = ResultType>
     static void apply(const typename Traits::ArrayA& a, B b,
@@ -43,6 +56,19 @@ struct DivideIntegralImpl {
         memset(null_map.data(), is_null, size);
 
         if (!is_null) {
+            if constexpr (is_signed_integer) {
+                if (b == -1) {
+                    for (size_t i = 0; i < size; i++) {
+                        null_map[i] = division_leads_to_fpe(a[i], b);
+                        if (!null_map[i]) {
+                            c[i] = Result(a[i] / b);
+                        } else {
+                            c[i] = {};
+                        }
+                    }
+                    return;
+                }
+            }
             if constexpr (!std::is_floating_point_v<A> && !std::is_same_v<A, Int128> &&
                           !std::is_same_v<A, Int8> && !std::is_same_v<A, UInt8>) {
                 const auto divider = libdivide::divider<A>(A(b));
@@ -59,8 +85,11 @@ struct DivideIntegralImpl {
 
     template <typename Result = ResultType>
     static inline Result apply(A a, B b, UInt8& is_null) {
-        is_null = b == 0;
-        return Result(a / (b + is_null));
+        is_null = b == 0 || division_leads_to_fpe(a, b);
+        if (is_null) {
+            return {};
+        }
+        return Result(a / b);
     }
 };
 
