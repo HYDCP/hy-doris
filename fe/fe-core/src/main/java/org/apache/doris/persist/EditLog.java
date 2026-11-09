@@ -45,6 +45,7 @@ import org.apache.doris.cloud.persist.UpdateCloudReplicaInfo;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.MetaNotFoundException;
+import org.apache.doris.common.io.DataOutputBuffer;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.DebugPointUtil;
@@ -106,6 +107,7 @@ import org.apache.doris.system.Frontend;
 import org.apache.doris.transaction.TransactionState;
 import org.apache.doris.transaction.TransactionStatus;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -1613,6 +1615,29 @@ public class EditLog {
     }
 
     /**
+     * Serializes a backup or restore job in the calling thread and returns a Writable that only copies the bytes.
+     * Serializing such a job can take minutes, and in the single EditLog-Flusher thread it would block every other
+     * journal writer. The caller holds the job lock and waits for the journal anyway.
+     *
+     * A job that is already done must not come here. Other threads see it as done as soon as its state changes, so
+     * the next job of the db, or a DDL on the restored tables, could reach the journal first, and replaying them in
+     * that order would lose the next job. A done job has released its metadata, so the flusher serializes it quickly.
+     */
+    @VisibleForTesting
+    static Writable serializeInCallerThread(Writable writable) {
+        DataOutputBuffer buffer = new DataOutputBuffer();
+        try {
+            writable.write(buffer);
+        } catch (Throwable t) {
+            // Same as a serialization failure in the flusher: the journal can't be written,
+            // while the in-memory state is already ahead of it.
+            LOG.error("Fatal Error : serialize journal failed", t);
+            System.exit(-1);
+        }
+        return out -> out.write(buffer.getData(), 0, buffer.getLength());
+    }
+
+    /**
      * Return the size of the current EditLog
      */
     public synchronized long getEditLogSize() throws IOException {
@@ -1919,7 +1944,7 @@ public class EditLog {
     }
 
     public void logBackupJob(BackupJob job) {
-        logEdit(OperationType.OP_BACKUP_JOB, job);
+        logEdit(OperationType.OP_BACKUP_JOB, job.isDone() ? job : serializeInCallerThread(job));
     }
 
     public void logCreateRepository(Repository repo) {
@@ -1935,7 +1960,7 @@ public class EditLog {
     }
 
     public void logRestoreJob(RestoreJob job) {
-        logEdit(OperationType.OP_RESTORE_JOB, job);
+        logEdit(OperationType.OP_RESTORE_JOB, job.isDone() ? job : serializeInCallerThread(job));
     }
 
     public void logUpdateUserProperty(UserPropertyInfo propertyInfo) {
