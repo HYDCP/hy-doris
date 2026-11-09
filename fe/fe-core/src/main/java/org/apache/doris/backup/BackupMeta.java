@@ -27,6 +27,7 @@ import org.apache.doris.persist.gson.GsonPostProcessable;
 import org.apache.doris.persist.gson.GsonUtils;
 
 import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 import com.google.gson.annotations.SerializedName;
 
 import java.io.ByteArrayInputStream;
@@ -41,6 +42,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public class BackupMeta implements Writable, GsonPostProcessable {
     // tbl name -> tbl
@@ -92,6 +94,17 @@ public class BackupMeta implements Writable, GsonPostProcessable {
             return true;
         }
         return false;
+    }
+
+    /**
+     * Keeps only the tables stored under the given names. A restored table may have been renamed since this meta
+     * was built, so the names are the keys of tblNameMap, which are not always the current table names.
+     */
+    public void retainTables(Set<String> tableNames) {
+        tblNameMap.keySet().retainAll(tableNames);
+        Set<Table> retainedTables = Sets.newIdentityHashSet();
+        retainedTables.addAll(tblNameMap.values());
+        tblIdMap.values().retainAll(retainedTables);
     }
 
     public static BackupMeta fromFile(String filePath, int metaVersion) throws IOException {

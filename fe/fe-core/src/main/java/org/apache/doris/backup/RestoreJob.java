@@ -1721,6 +1721,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             snapshotFinishedTime = System.currentTimeMillis();
             state = RestoreJobState.DOWNLOAD;
 
+            // restoredTbls are the same objects as the tables in backupMeta, so this journal would carry them twice.
+            // From now on, backupMeta is only read to replay restoredPartitions.
+            backupMeta.retainTables(restoredPartitions.stream().map(entry -> entry.first).collect(Collectors.toSet()));
+
             env.getEditLog().logRestoreJob(this);
             LOG.info("finished making snapshots. {}", this);
             return;
