@@ -25,6 +25,7 @@ import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.backup.BackupJob;
 import org.apache.doris.backup.Repository;
 import org.apache.doris.backup.RestoreJob;
+import org.apache.doris.backup.RestoreJobStateChange;
 import org.apache.doris.binlog.AddPartitionRecord;
 import org.apache.doris.binlog.CreateTableRecord;
 import org.apache.doris.binlog.DropTableRecord;
@@ -484,6 +485,11 @@ public class EditLog {
                     RestoreJob job = (RestoreJob) journal.getData();
                     job.setEnv(env);
                     env.getBackupHandler().replayAddJob(job);
+                    break;
+                }
+                case OperationType.OP_RESTORE_JOB_STATE: {
+                    RestoreJobStateChange stateChange = (RestoreJobStateChange) journal.getData();
+                    env.getBackupHandler().replayRestoreJobStateChange(stateChange);
                     break;
                 }
                 case OperationType.OP_DROP_ROLLUP: {
@@ -1961,6 +1967,10 @@ public class EditLog {
 
     public void logRestoreJob(RestoreJob job) {
         logEdit(OperationType.OP_RESTORE_JOB, job.isDone() ? job : serializeInCallerThread(job));
+    }
+
+    public void logRestoreJobStateChange(RestoreJobStateChange stateChange) {
+        logEdit(OperationType.OP_RESTORE_JOB_STATE, serializeInCallerThread(stateChange));
     }
 
     public void logUpdateUserProperty(UserPropertyInfo propertyInfo) {

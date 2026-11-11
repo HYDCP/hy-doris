@@ -402,6 +402,71 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         cancelInternal(true /* is replay */);
     }
 
+    // Log the DOWNLOAD or COMMIT state the job has just entered.
+    private void logStateChange() {
+        // CloudRestoreJob has its own persisted fields and its own DOWNLOAD journal, it keeps writing the whole job.
+        if (!Config.enable_restore_job_state_journal || Config.isCloudMode()) {
+            env.getEditLog().logRestoreJob(this);
+            return;
+        }
+
+        // Same as AbstractJob.write, in the same order
+        Map<Long, String> savedTaskErrMsg = Maps.newLinkedHashMap();
+        taskErrMsg.entrySet().stream().limit(3).forEach(e -> savedTaskErrMsg.put(e.getKey(), e.getValue()));
+
+        RestoreJobStateChange stateChange = new RestoreJobStateChange(dbId, label, state, jobId, metaPreparedTime,
+                snapshotFinishedTime, downloadFinishedTime, savedTaskErrMsg);
+        if (state == RestoreJobState.DOWNLOAD) {
+            // Everything checkAndPrepareMeta and the snapshot tasks produced. jobInfo is not included,
+            // because it is not modified before the job is done.
+            stateChange.backupMeta = backupMeta;
+            stateChange.fileMapping = fileMapping;
+            stateChange.restoredPartitions = restoredPartitions;
+            stateChange.restoredTbls = restoredTbls;
+            stateChange.restoredResources = restoredResources;
+            stateChange.restoredVersionInfo = restoredVersionInfo;
+            stateChange.snapshotInfos = snapshotInfos;
+        } else {
+            // Nothing persisted is modified between DOWNLOAD and COMMIT, except that backupMeta is dropped.
+            Preconditions.checkState(state == RestoreJobState.COMMIT, state);
+        }
+        env.getEditLog().logRestoreJobStateChange(stateChange);
+    }
+
+    /**
+     * Apply the journal of entering the DOWNLOAD or COMMIT state to this job, which is in the state of
+     * its previous journal. This leaves the job the same as replaying an OP_RESTORE_JOB written at the
+     * same point, except that the job is not replaced, so restoredTbls and restoredPartitions stay the
+     * objects that replayCheckAndPrepareMeta has put into the catalog.
+     */
+    public synchronized void replayStateChange(RestoreJobStateChange stateChange) {
+        Preconditions.checkState(label.equals(stateChange.label), "%s, %s", stateChange, this);
+
+        if (stateChange.state == RestoreJobState.DOWNLOAD) {
+            Preconditions.checkState(state == RestoreJobState.PENDING, "%s, %s", stateChange, this);
+            backupMeta = stateChange.backupMeta;
+            fileMapping = stateChange.fileMapping;
+            restoredPartitions = stateChange.restoredPartitions;
+            restoredTbls = stateChange.restoredTbls;
+            restoredResources = stateChange.restoredResources;
+            restoredVersionInfo = stateChange.restoredVersionInfo;
+            snapshotInfos = stateChange.snapshotInfos;
+        } else {
+            Preconditions.checkState(stateChange.state == RestoreJobState.COMMIT, "%s, %s", stateChange, this);
+            Preconditions.checkState(state == RestoreJobState.DOWNLOAD, "%s, %s", stateChange, this);
+            backupMeta = null;
+        }
+
+        jobId = stateChange.jobId;
+        metaPreparedTime = stateChange.metaPreparedTime;
+        snapshotFinishedTime = stateChange.snapshotFinishedTime;
+        downloadFinishedTime = stateChange.downloadFinishedTime;
+        taskErrMsg = stateChange.taskErrMsg;
+        state = stateChange.state;
+
+        replayRun();
+    }
+
     @Override
     public boolean isPending() {
         return state == RestoreJobState.PENDING;
@@ -1725,7 +1790,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             // From now on, backupMeta is only read to replay restoredPartitions.
             backupMeta.retainTables(restoredPartitions.stream().map(entry -> entry.first).collect(Collectors.toSet()));
 
-            env.getEditLog().logRestoreJob(this);
+            logStateChange();
             LOG.info("finished making snapshots. {}", this);
             return;
         }
@@ -2033,7 +2098,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             // backupMeta is useless now
             backupMeta = null;
 
-            env.getEditLog().logRestoreJob(this);
+            logStateChange();
             LOG.info("finished to download. {}", this);
         }
 

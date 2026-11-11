@@ -1669,6 +1669,16 @@ public class Config extends ConfigBase {
     public static boolean restore_job_compressed_serialization = false;
 
     /**
+     * Whether a restore job writes only what changed since its previous journal when it enters the
+     * DOWNLOAD and COMMIT states, instead of the whole job.
+     *
+     * WARNING: An FE without this feature can't replay such a journal. Enable it only after all FEs are
+     * upgraded. Once it is enabled and a restore is performed, the FE version cannot be rolled back.
+     */
+    @ConfField(mutable = true, masterOnly = true)
+    public static boolean enable_restore_job_state_journal = false;
+
+    /**
      * A internal config, to reduce the backup job size during serialization by compress.
      *
      * WARNING: Once this option is enabled and a backup is performed, the FE version cannot be rolled back.
