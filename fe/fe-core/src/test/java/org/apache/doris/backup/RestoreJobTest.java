@@ -34,6 +34,7 @@ import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.Tablet;
+import org.apache.doris.catalog.View;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.MarkedCountDownLatch;
@@ -421,8 +422,11 @@ public class RestoreJobTest {
             }
         };
 
+        // the restored table has been registered on the master since PENDING, but not on an FE that replays
+        db.registerTable(expectedRestoreTbl);
         job.waitingAllSnapshotsFinished();
         Assert.assertEquals(RestoreJob.RestoreJobState.DOWNLOAD, job.getState());
+        db.unregisterTable(expectedRestoreTbl.getName());
 
         RestoreJob replayedJob = RestoreJob.read(
                 new DataInputStream(new ByteArrayInputStream(journal.getData(), 0, journal.getLength())));
@@ -504,6 +508,32 @@ public class RestoreJobTest {
             @Mock
             public void write(Invocation inv, DataOutput out) {
                 db.unregisterTable(expectedRestoreTbl.getName());
+                inv.proceed();
+            }
+        };
+        new Expectations() {
+            {
+                editLog.logRestoreJob((SerializedJournalEntity) any);
+                times = 0;
+            }
+        };
+
+        job.waitingAllSnapshotsFinished();
+        Assert.assertEquals(Status.ErrCode.NOT_FOUND, job.getStatus().getErrCode());
+    }
+
+    @Test
+    public void testDownloadJournalIsNotLoggedAfterRestoredViewIsDropped() {
+        prepareDownloadOfRestoredTable();
+        View restoredView = new View(40200L, "test_restored_view", Lists.newArrayList());
+        db.registerTable(restoredView);
+        job.restoredTbls.add(restoredView);
+
+        // DROP VIEW needs no FORCE, and the view is not in the file mapping
+        new MockUp<AbstractJob>() {
+            @Mock
+            public void write(Invocation inv, DataOutput out) {
+                db.unregisterTable(restoredView.getName());
                 inv.proceed();
             }
         };

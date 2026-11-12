@@ -1720,10 +1720,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
     /**
      * Logs the job entering DOWNLOAD. Replaying this journal registers the restored objects again, so it must not
-     * reach the journal after a DROP ... FORCE of them, which the RESTORE table state does not stop. Serializing the
-     * job can take minutes, so it is done without the db lock; then the restored objects are checked again and the
-     * journal is logged under the db read lock, which the drop needs to write. If they have been dropped, the
-     * journal is not logged and the status tells run() to cancel the job.
+     * reach the journal after a drop of them: a DROP ... FORCE, which the RESTORE table state does not stop, or a
+     * DROP VIEW. Serializing the job can take minutes, so it is done without the db lock; then the restored objects
+     * are checked again and the journal is logged under the db read lock, which the drop needs to write. If they
+     * have been dropped, the journal is not logged and the status tells run() to cancel the job.
      */
     protected void logDownloadJournal() {
         Preconditions.checkState(state == RestoreJobState.DOWNLOAD, state);
@@ -1738,6 +1738,14 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             checkIfNeedCancel();
             if (!status.ok()) {
                 return;
+            }
+            // checkIfNeedCancel() only checks the OLAP tables in fileMapping, while a restored view or another
+            // non-OLAP table can be dropped even without FORCE.
+            for (Table restoredTbl : restoredTbls) {
+                if (db.getTableNullable(restoredTbl.getId()) != restoredTbl) {
+                    status = new Status(ErrCode.NOT_FOUND, "table " + restoredTbl.getName() + " has been dropped");
+                    return;
+                }
             }
             env.getEditLog().logRestoreJob(journal);
         } finally {
