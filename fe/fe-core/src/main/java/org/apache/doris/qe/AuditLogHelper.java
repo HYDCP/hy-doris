@@ -42,6 +42,7 @@ import org.apache.doris.nereids.glue.LogicalPlanAdapter;
 import org.apache.doris.nereids.rules.exploration.mv.MaterializationContext;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.algebra.InlineTable;
+import org.apache.doris.nereids.trees.plans.commands.Command;
 import org.apache.doris.nereids.trees.plans.commands.NeedAuditEncryption;
 import org.apache.doris.nereids.trees.plans.commands.insert.InsertIntoTableCommand;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
@@ -190,6 +191,45 @@ public class AuditLogHelper {
             }
         }
         return cnt;
+    }
+
+    static String getSqlDigest(AuditEvent event, StatementBase parsedStmt) {
+        // Parsing failures and non-query statements may not have a query digest.
+        if (event.isInternal || !(parsedStmt instanceof Queriable)) {
+            return "";
+        }
+
+        // Use the audit state, which also includes failures returned by a forwarded query.
+        boolean failed = MysqlStateType.ERR.name().equals(event.state);
+        // Queries can be rejected before StmtExecutor sets isQuery, for example by SQL block rules.
+        if (!event.isQuery && !(failed && isQueryStatement(parsedStmt))) {
+            return "";
+        }
+        boolean succeeded = MysqlStateType.OK.name().equals(event.state)
+                || MysqlStateType.EOF.name().equals(event.state);
+        // Failed queries should be identifiable even when they fail before the threshold.
+        if (!failed && (!succeeded || event.queryTime <= Config.sql_digest_generation_threshold_ms)) {
+            return "";
+        }
+
+        try {
+            String digest = ((Queriable) parsedStmt).toDigest();
+            // Proxy contexts and unsupported statements can have no cached structural digest.
+            if (Strings.isNullOrEmpty(digest)) {
+                return "";
+            }
+            return DigestUtils.md5Hex(digest);
+        } catch (Exception e) {
+            // A digest failure must not discard the audit event or replace the original query error.
+            LOG.warn("Failed to generate SQL digest for query {}.", event.queryId, e);
+            return "";
+        }
+    }
+
+    private static boolean isQueryStatement(StatementBase parsedStmt) {
+        return parsedStmt instanceof QueryStmt
+                || (parsedStmt instanceof LogicalPlanAdapter
+                && !(((LogicalPlanAdapter) parsedStmt).getLogicalPlan() instanceof Command));
     }
 
     private static void logAuditLogImpl(ConnectContext ctx, String origStmt, StatementBase parsedStmt,
@@ -360,10 +400,6 @@ public class AuditLogHelper {
                             MetricRepo.updateClusterQueryLatency(cloudCluster, elapseMs);
                             MetricRepo.updateClusterQueryLatency(physicalClusterName, elapseMs);
                         }
-                        if (elapseMs > Config.sql_digest_generation_threshold_ms) {
-                            String sqlDigest = DigestUtils.md5Hex(((Queriable) parsedStmt).toDigest());
-                            auditEventBuilder.setSqlDigest(sqlDigest);
-                        }
                     }
                 }
             }
@@ -403,6 +439,7 @@ public class AuditLogHelper {
             auditEventBuilder.setState(String.valueOf(MysqlStateType.OK));
         }
         AuditEvent event = auditEventBuilder.build();
+        event.sqlDigest = getSqlDigest(event, parsedStmt);
         Env.getCurrentEnv().getWorkloadRuntimeStatusMgr().submitFinishQueryToAudit(event);
         if (LOG.isDebugEnabled()) {
             LOG.debug("submit audit event: {}", event.queryId);
