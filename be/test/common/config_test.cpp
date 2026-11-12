@@ -31,25 +31,51 @@
 namespace doris {
 using namespace config;
 
+// Unlike process-lifetime DEFINE_* registrations, test fields must be registered
+// on every invocation, including repeated runs in the same process.
+#define DEFINE_TEST_FIELD(TYPE, NAME, DEFAULT, MUTABLE) \
+    TYPE NAME;                                          \
+    Register reg_##NAME(#TYPE, #NAME, &NAME, DEFAULT, MUTABLE)
+
 class ConfigTest : public testing::Test {
-    void SetUp() override { config::Register::_s_field_map->clear(); }
-    void TearDown() override { config::Register::_s_field_map->clear(); }
+    void SetUp() override {
+        // Test fields point to local variables. Keep them and their dumped values
+        // separate from the process-wide configuration used by later tests.
+        _saved_fields = config::Register::_s_field_map;
+        _saved_values = config::full_conf_map;
+        config::Register::_s_field_map = &_test_fields;
+        config::full_conf_map = &_test_values;
+    }
+
+    void TearDown() override {
+        config::Register::_s_field_map = _saved_fields;
+        config::full_conf_map = _saved_values;
+    }
+
+    std::map<std::string, config::Register::Field> _test_fields;
+    std::map<std::string, std::string> _test_values;
+    std::map<std::string, config::Register::Field>* _saved_fields = nullptr;
+    std::map<std::string, std::string>* _saved_values = nullptr;
 };
 
 TEST_F(ConfigTest, DumpAllConfigs) {
-    DEFINE_Bool(cfg_bool_false, "false");
-    DEFINE_Bool(cfg_bool_true, "true");
-    DEFINE_Double(cfg_double, "123.456");
-    DEFINE_Int16(cfg_int16_t, "2561");
-    DEFINE_Int32(cfg_int32_t, "65536123");
-    DEFINE_Int64(cfg_int64_t, "4294967296123");
-    DEFINE_String(cfg_std_string, "doris_config_test_string");
-    DEFINE_Bools(cfg_std_vector_bool, "true,false,true");
-    DEFINE_Doubles(cfg_std_vector_double, "123.456,123.4567,123.45678");
-    DEFINE_Int16s(cfg_std_vector_int16_t, "2561,2562,2563");
-    DEFINE_Int32s(cfg_std_vector_int32_t, "65536123,65536234,65536345");
-    DEFINE_Int64s(cfg_std_vector_int64_t, "4294967296123,4294967296234,4294967296345");
-    DEFINE_Strings(cfg_std_vector_std_string, "doris,config,test,string");
+    DEFINE_TEST_FIELD(bool, cfg_bool_false, "false", false);
+    DEFINE_TEST_FIELD(bool, cfg_bool_true, "true", false);
+    DEFINE_TEST_FIELD(double, cfg_double, "123.456", false);
+    DEFINE_TEST_FIELD(int16_t, cfg_int16_t, "2561", false);
+    DEFINE_TEST_FIELD(int32_t, cfg_int32_t, "65536123", false);
+    DEFINE_TEST_FIELD(int64_t, cfg_int64_t, "4294967296123", false);
+    DEFINE_TEST_FIELD(std::string, cfg_std_string, "doris_config_test_string", false);
+    DEFINE_TEST_FIELD(std::vector<bool>, cfg_std_vector_bool, "true,false,true", false);
+    DEFINE_TEST_FIELD(std::vector<double>, cfg_std_vector_double, "123.456,123.4567,123.45678",
+                      false);
+    DEFINE_TEST_FIELD(std::vector<int16_t>, cfg_std_vector_int16_t, "2561,2562,2563", false);
+    DEFINE_TEST_FIELD(std::vector<int32_t>, cfg_std_vector_int32_t, "65536123,65536234,65536345",
+                      false);
+    DEFINE_TEST_FIELD(std::vector<int64_t>, cfg_std_vector_int64_t,
+                      "4294967296123,4294967296234,4294967296345", false);
+    DEFINE_TEST_FIELD(std::vector<std::string>, cfg_std_vector_std_string,
+                      "doris,config,test,string", false);
 
     EXPECT_TRUE(config::init(nullptr, true));
     std::stringstream ss;
@@ -67,13 +93,13 @@ TEST_F(ConfigTest, DumpAllConfigs) {
 }
 
 TEST_F(ConfigTest, UpdateConfigs) {
-    DEFINE_Bool(cfg_bool_immutable, "true");
-    DEFINE_mBool(cfg_bool, "false");
-    DEFINE_mDouble(cfg_double, "123.456");
-    DEFINE_mInt16(cfg_int16_t, "2561");
-    DEFINE_mInt32(cfg_int32_t, "65536123");
-    DEFINE_mInt64(cfg_int64_t, "4294967296123");
-    DEFINE_String(cfg_std_string, "doris_config_test_string");
+    DEFINE_TEST_FIELD(bool, cfg_bool_immutable, "true", false);
+    DEFINE_TEST_FIELD(bool, cfg_bool, "false", true);
+    DEFINE_TEST_FIELD(double, cfg_double, "123.456", true);
+    DEFINE_TEST_FIELD(int16_t, cfg_int16_t, "2561", true);
+    DEFINE_TEST_FIELD(int32_t, cfg_int32_t, "65536123", true);
+    DEFINE_TEST_FIELD(int64_t, cfg_int64_t, "4294967296123", true);
+    DEFINE_TEST_FIELD(std::string, cfg_std_string, "doris_config_test_string", false);
 
     EXPECT_TRUE(config::init(nullptr, true));
 
@@ -146,5 +172,7 @@ TEST_F(ConfigTest, UpdateConfigs) {
                 std::string::npos);
     EXPECT_EQ(cfg_std_string, "doris_config_test_string");
 }
+
+#undef DEFINE_TEST_FIELD
 
 } // namespace doris
