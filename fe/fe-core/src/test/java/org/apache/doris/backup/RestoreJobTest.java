@@ -44,6 +44,7 @@ import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.datasource.property.storage.BrokerProperties;
 import org.apache.doris.fs.FileSystemFactory;
+import org.apache.doris.journal.SerializedJournalEntity;
 import org.apache.doris.persist.EditLog;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.SystemInfoService;
@@ -55,6 +56,7 @@ import com.google.common.collect.Sets;
 import mockit.Delegate;
 import mockit.Expectations;
 import mockit.Injectable;
+import mockit.Invocation;
 import mockit.Mock;
 import mockit.MockUp;
 import mockit.Mocked;
@@ -64,6 +66,7 @@ import org.junit.Test;
 
 import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
+import java.io.DataOutput;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -71,6 +74,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.zip.Adler32;
 
@@ -407,11 +411,11 @@ public class RestoreJobTest {
         DataOutputBuffer journal = new DataOutputBuffer();
         new Expectations() {
             {
-                editLog.logRestoreJob((RestoreJob) any);
+                editLog.logRestoreJob((SerializedJournalEntity) any);
                 times = 1;
                 result = new Delegate() {
-                    public void logRestoreJob(RestoreJob restoreJob) throws IOException {
-                        restoreJob.write(journal);
+                    public void logRestoreJob(SerializedJournalEntity serializedJob) throws IOException {
+                        serializedJob.write(journal);
                     }
                 };
             }
@@ -440,5 +444,77 @@ public class RestoreJobTest {
 
         Assert.assertNotNull(localTbl.getPartition(restoredPartId));
         Assert.assertNotNull(db.getTableNullable(CatalogMocker.TEST_TBL2_ID));
+    }
+
+    // The restored table test_tbl2 has been registered and its first replica has to be downloaded.
+    private void prepareDownloadOfRestoredTable() {
+        db.registerTable(expectedRestoreTbl);
+        Partition part = expectedRestoreTbl.getPartitions().iterator().next();
+        MaterializedIndex index = part.getBaseIndex();
+        Tablet tablet = index.getTablets().get(0);
+        long replicaId = tablet.getReplicas().get(0).getId();
+        RestoreFileMapping.IdChain catalogIds = new RestoreFileMapping.IdChain(expectedRestoreTbl.getId(),
+                part.getId(), index.getId(), tablet.getId(), replicaId, -1L);
+        RestoreFileMapping.IdChain repoIds = new RestoreFileMapping.IdChain(CatalogMocker.TEST_TBL2_ID,
+                part.getId(), index.getId(), tablet.getId(), -1L, -1L);
+        job.fileMapping.putMapping(catalogIds, repoIds, true);
+        job.restoredTbls.add(expectedRestoreTbl);
+        Deencapsulation.setField(job, "backupMeta", backupMeta);
+        Deencapsulation.setField(job, "state", RestoreJob.RestoreJobState.SNAPSHOTING);
+    }
+
+    @Test
+    public void testDownloadJournalIsLoggedUnderDbReadLock() {
+        prepareDownloadOfRestoredTable();
+
+        AtomicBoolean dropCouldLockDb = new AtomicBoolean(true);
+        new Expectations() {
+            {
+                editLog.logRestoreJob((SerializedJournalEntity) any);
+                times = 1;
+                result = new Delegate() {
+                    public void logRestoreJob(SerializedJournalEntity serializedJob) throws InterruptedException {
+                        // a DROP ... FORCE of the restored table needs the db write lock
+                        Thread drop = new Thread(() -> {
+                            if (db.tryWriteLock(10, TimeUnit.MILLISECONDS)) {
+                                db.writeUnlock();
+                            } else {
+                                dropCouldLockDb.set(false);
+                            }
+                        });
+                        drop.start();
+                        drop.join();
+                    }
+                };
+            }
+        };
+
+        job.waitingAllSnapshotsFinished();
+        Assert.assertTrue(job.getStatus().ok());
+        Assert.assertEquals(RestoreJob.RestoreJobState.DOWNLOAD, job.getState());
+        Assert.assertFalse(dropCouldLockDb.get());
+    }
+
+    @Test
+    public void testDownloadJournalIsNotLoggedAfterRestoredTableIsDropped() {
+        prepareDownloadOfRestoredTable();
+
+        // DROP TABLE FORCE commits while the job is being serialized for the DOWNLOAD journal
+        new MockUp<AbstractJob>() {
+            @Mock
+            public void write(Invocation inv, DataOutput out) {
+                db.unregisterTable(expectedRestoreTbl.getName());
+                inv.proceed();
+            }
+        };
+        new Expectations() {
+            {
+                editLog.logRestoreJob((SerializedJournalEntity) any);
+                times = 0;
+            }
+        };
+
+        job.waitingAllSnapshotsFinished();
+        Assert.assertEquals(Status.ErrCode.NOT_FOUND, job.getStatus().getErrCode());
     }
 }

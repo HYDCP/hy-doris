@@ -23,9 +23,11 @@ import org.apache.doris.backup.RestoreJob;
 import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.io.DataOutputBuffer;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.journal.JournalBatch;
 import org.apache.doris.journal.JournalEntity;
+import org.apache.doris.journal.SerializedJournalEntity;
 import org.apache.doris.journal.bdbje.BDBJEJournal;
 import org.apache.doris.meta.MetaContext;
 
@@ -154,7 +156,7 @@ public class EditLogTest {
     }
 
     @Test
-    public void testSerializeInCallerThreadKeepsJournalBytes() throws IOException {
+    public void testSerializedJournalEntityKeepsJournalBytes() throws IOException {
         MetaContext metaContext = new MetaContext();
         metaContext.setMetaVersion(FeConstants.meta_version);
         metaContext.setThreadLocalInfo();
@@ -167,8 +169,16 @@ public class EditLogTest {
                         false, new ReplicaAllocation((short) 3), 1000L, -1, false, false, false, false, false, false,
                         false, null, 1L);
 
-                byte[] bytes = journalBytes(EditLog.serializeInCallerThread(job));
+                SerializedJournalEntity serialized =
+                        SerializedJournalEntity.serialize(OperationType.OP_RESTORE_JOB, job);
+                byte[] bytes = journalBytes(serialized);
                 Assert.assertArrayEquals(journalBytes(job), bytes);
+
+                // journal paths that write the op code themselves get the data only
+                DataOutputBuffer data = new DataOutputBuffer();
+                serialized.write(data);
+                Assert.assertArrayEquals(Arrays.copyOfRange(bytes, Short.BYTES, bytes.length),
+                        Arrays.copyOf(data.getData(), data.getLength()));
 
                 JournalEntity entity = new JournalEntity();
                 entity.readFields(new DataInputStream(new ByteArrayInputStream(bytes)));
@@ -301,5 +311,13 @@ public class EditLogTest {
         };
         checkSerializationDoesNotBlockOtherJournals(OperationType.OP_BACKUP_JOB, serialization,
                 editLog -> editLog.logBackupJob(job));
+    }
+
+    @Test
+    public void testSerializedJournalEntityMustBeAddedWithItsOp() {
+        SerializedJournalEntity serialized = SerializedJournalEntity.serialize(OperationType.OP_SAVE_NEXTID,
+                out -> out.writeLong(1L));
+        Assert.assertThrows(IllegalStateException.class,
+                () -> new JournalBatch().addJournal(OperationType.OP_RESTORE_JOB, serialized));
     }
 }
