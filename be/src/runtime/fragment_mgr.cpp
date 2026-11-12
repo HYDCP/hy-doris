@@ -44,7 +44,9 @@
 #include <cstddef>
 #include <ctime>
 
+#include "common/query_log_context.h"
 #include "common/status.h"
+
 // IWYU pragma: no_include <bits/chrono.h>
 #include <chrono> // IWYU pragma: keep
 #include <cstdint>
@@ -635,10 +637,11 @@ Status FragmentMgr::start_query_execution(const PExecPlanFragmentStartRequest* r
     TUniqueId query_id;
     query_id.__set_hi(request->query_id().hi());
     query_id.__set_lo(request->query_id().lo());
+    ScopedQueryLogContext query_log_scope {QueryLogIdentity(query_id)};
     auto q_ctx = get_query_ctx(query_id);
     if (q_ctx) {
         q_ctx->set_ready_to_execute(Status::OK());
-        LOG_INFO("Query {} start execution", print_id(query_id));
+        LOG_INFO("Query{} start execution", query_id_log_suffix(query_id));
     } else {
         return Status::InternalError(
                 "Failed to get query fragments context. Query may be "
@@ -713,7 +716,7 @@ Status FragmentMgr::_get_or_create_query_ctx(const TPipelineFragmentParams& para
                         }
 
                         // First time a fragment of a query arrived. print logs.
-                        LOG(INFO) << "query_id: " << print_id(query_id)
+                        LOG(INFO) << "Query" << query_id_log_suffix(query_id)
                                   << ", coord_addr: " << params.coord
                                   << ", total fragment num on current host: "
                                   << params.fragment_num_on_host
@@ -893,19 +896,20 @@ void FragmentMgr::_set_scan_concurrency(const Param& params, QueryContext* query
 }
 
 void FragmentMgr::cancel_query(const TUniqueId query_id, const Status reason) {
+    ScopedQueryLogContext query_log_scope {QueryLogIdentity(query_id)};
     std::shared_ptr<QueryContext> query_ctx = nullptr;
     {
         if (auto q_ctx = get_query_ctx(query_id)) {
             query_ctx = q_ctx;
         } else {
-            LOG(WARNING) << "Query " << print_id(query_id)
+            LOG(WARNING) << "Query" << query_id_log_suffix(query_id)
                          << " does not exists, failed to cancel it";
             return;
         }
     }
     query_ctx->cancel(reason);
     remove_query_context(query_id);
-    LOG(INFO) << "Query " << print_id(query_id)
+    LOG(INFO) << "Query" << query_id_log_suffix(query_id)
               << " is cancelled and removed. Reason: " << reason.to_string();
 }
 
@@ -952,22 +956,22 @@ void FragmentMgr::cancel_worker() {
         }
 
         {
-            _query_ctx_map.apply(
-                    [&](phmap::flat_hash_map<TUniqueId, std::weak_ptr<QueryContext>>& map)
-                            -> Status {
-                        for (auto it = map.begin(); it != map.end();) {
-                            if (auto q_ctx = it->second.lock()) {
-                                if (q_ctx->is_timeout(now)) {
-                                    LOG_WARNING("Query {} is timeout", print_id(it->first));
-                                    queries_timeout.push_back(it->first);
-                                }
-                                ++it;
-                            } else {
-                                it = map.erase(it);
-                            }
+            _query_ctx_map.apply([&](phmap::flat_hash_map<TUniqueId, std::weak_ptr<QueryContext>>&
+                                             map) -> Status {
+                for (auto it = map.begin(); it != map.end();) {
+                    if (auto q_ctx = it->second.lock()) {
+                        if (q_ctx->is_timeout(now)) {
+                            ScopedQueryLogContext query_log_scope {QueryLogIdentity(it->first)};
+                            LOG_WARNING("Query{} is timeout", query_id_log_suffix(it->first));
+                            queries_timeout.push_back(it->first);
                         }
-                        return Status::OK();
-                    });
+                        ++it;
+                    } else {
+                        it = map.erase(it);
+                    }
+                }
+                return Status::OK();
+            });
 
             // We use a very conservative cancel strategy.
             // 0. If there are no running frontends, do not cancel any queries.

@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "common/logging.h"
+#include "common/query_log_context.h"
 #include "exec/schema_scanner/schema_scanner_helper.h"
 #include "runtime/client_cache.h"
 #include "runtime/exec_env.h"
@@ -155,7 +156,7 @@ TReportExecStatusParams RuntimeQueryStatisticsMgr::create_report_exec_status_par
     }
 
     if (fragment_id_to_profile_req.empty()) {
-        LOG_WARNING("No fragment profile found for query {}", print_id(query_id));
+        LOG_WARNING("No fragment profile found for query{}", query_id_log_suffix(query_id));
     }
 
     profile.__set_fragment_id_to_profile(fragment_id_to_profile_req);
@@ -285,6 +286,8 @@ void RuntimeQueryStatisticsMgr::register_fragment_profile(
 }
 
 void RuntimeQueryStatisticsMgr::_report_query_profiles_function() {
+    // A reporting batch can contain queries other than the one that triggered it.
+    ScopedQueryLogContext query_log_scope {QueryLogIdentity {}};
     decltype(_profile_map) profile_copy;
     decltype(_load_channel_profile_map) load_channel_profile_copy;
     VLOG_DEBUG << "Beging reporting profile";
@@ -297,11 +300,12 @@ void RuntimeQueryStatisticsMgr::_report_query_profiles_function() {
     // query_id -> {coordinator_addr, {fragment_id -> std::vectpr<pipeline_profile>}}
     for (auto& entry : profile_copy) {
         const auto& query_id = entry.first;
+        ScopedQueryLogContext query_log_scope {QueryLogIdentity(query_id)};
         const auto& coor_addr = std::get<0>(entry.second);
         auto& fragment_profile_map = std::get<1>(entry.second);
 
         if (fragment_profile_map.empty()) {
-            auto msg = fmt::format("Query {} does not have profile", print_id(query_id));
+            auto msg = fmt::format("Query{} does not have profile", query_id_log_suffix(query_id));
             DCHECK(false) << msg;
             LOG_ERROR(msg);
             continue;
@@ -311,8 +315,8 @@ void RuntimeQueryStatisticsMgr::_report_query_profiles_function() {
         for (auto load_channel_profile : load_channel_profile_copy) {
             if (load_channel_profile.second == nullptr) {
                 auto msg = fmt::format(
-                        "Register fragment profile {} {} failed, load channel profile is null",
-                        print_id(query_id), -1);
+                        "Register fragment profile{} {} failed, load channel profile is null",
+                        query_id_log_suffix(query_id), -1);
                 DCHECK(false) << msg;
                 LOG_ERROR(msg);
                 continue;

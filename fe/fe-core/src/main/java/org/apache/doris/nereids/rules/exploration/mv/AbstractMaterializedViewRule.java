@@ -117,8 +117,8 @@ public abstract class AbstractMaterializedViewRule implements ExplorationRuleFac
         }
         if (statementContext.getMaterializedViewRewriteDuration()
                 > sessionVariable.materializedViewRewriteDurationThresholdMs) {
-            LOG.warn("materialized view rewrite duration is exceeded, the query queryId is {}",
-                    cascadesContext.getConnectContext().getQueryIdentifier());
+            LOG.warn("materialized view rewrite duration is exceeded, statement {}",
+                    cascadesContext.getConnectContext().getQueryLogIdentifier());
             MaterializationContext.makeFailWithDurationExceeded(queryPlan, cascadesContext.getMaterializationContexts(),
                     statementContext.getMaterializedViewRewriteDuration());
             return rewrittenPlans;
@@ -145,8 +145,8 @@ public abstract class AbstractMaterializedViewRule implements ExplorationRuleFac
                 if (statementContext.getMaterializedViewRewriteDuration()
                         > sessionVariable.materializedViewRewriteDurationThresholdMs) {
                     statementContext.getMaterializedViewStopwatch().stop();
-                    LOG.warn("materialized view rewrite duration is exceeded, the queryId is {}",
-                            cascadesContext.getConnectContext().getQueryIdentifier());
+                    LOG.warn("materialized view rewrite duration is exceeded, statement {}",
+                            cascadesContext.getConnectContext().getQueryLogIdentifier());
                     MaterializationContext.makeFailWithDurationExceeded(queryStructInfo.getOriginalPlan(),
                             cascadesContext.getMaterializationContexts(),
                             statementContext.getMaterializedViewRewriteDuration());
