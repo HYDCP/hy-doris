@@ -121,18 +121,24 @@ public class Config extends ConfigBase {
                     + "If the response time of a query exceeds this threshold, it will be recorded in audit log."})
     public static long qe_slow_log_ms = 5000;
 
-    @ConfField(mutable = true, description = "Log slow Nereids planning passes after this many milliseconds. "
-            + "Non-positive values disable slow-pass logs; failed passes are still reported.")
+    @ConfField(mutable = true, description = {"记录慢速 Nereids 查询规划的阈值，单位毫秒。非正值关闭慢规划日志，失败的规划仍会记录。",
+            "Log slow Nereids planning passes after this many milliseconds. "
+                    + "Non-positive values disable slow-pass logs; failed passes are still reported."})
     public static volatile long nereids_planning_log_threshold_ms = 5000;
 
-    @ConfField(mutable = true, description = "Minimum interval in milliseconds between running-planner reports "
-            + "from the connection checker. Nested passes share the outermost pass's interval. "
-            + "Values below 1000 use 1000.")
+    @ConfField(mutable = true, description = {"连接超时检查线程两次输出运行中规划进度的最小间隔，单位毫秒。"
+            + "嵌套规划共享最外层规划的间隔；小于 1000 的值按 1000 处理。",
+            "Minimum interval in milliseconds between running-planner reports "
+                    + "from the connection checker. Nested passes share the outermost pass's interval. "
+                    + "Values below 1000 use 1000."})
     public static volatile long nereids_planning_log_interval_ms = 30000;
 
-    @ConfField(mutable = true, description = "Slow planning lock wait/hold and external metadata operation threshold "
-            + "in milliseconds. Non-positive values disable slow-operation logs. At most 16 operations are logged "
-            + "per planning pass, after releasing planner resources; failures are reported regardless of threshold.")
+    @ConfField(mutable = true, description = {"规划期间锁等待、持锁和外部元数据操作的慢操作阈值，单位毫秒。"
+            + "非正值关闭慢操作日志；每个规划轮次最多记录 16 个操作事件，在释放规划资源后输出；失败不受阈值限制。",
+            "Slow planning lock wait/hold and external metadata operation threshold in milliseconds. "
+                    + "Non-positive values disable slow-operation logs. At most 16 operations are logged "
+                    + "per planning pass, after releasing planner resources; "
+                    + "failures are reported regardless of threshold."})
     public static volatile long nereids_planning_operation_log_threshold_ms = 1000;
 
     @ConfField(mutable = true, description = {"sql_digest 生成的时间阈值，单位为毫秒。如果一个查询的响应时间超过这个阈值，"

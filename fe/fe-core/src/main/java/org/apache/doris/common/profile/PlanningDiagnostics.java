@@ -57,6 +57,10 @@ public final class PlanningDiagnostics {
     // Internal MV planning can replace ConnectContext while the calling planner still holds table locks.
     private static final ThreadLocal<PlanningDiagnostics> ACTIVE = new ThreadLocal<>();
 
+    /**
+     * WAIT_CHANGE_VISIBLE and PRE_REWRITE_MV are upstream-compatible output keys.
+     * Branch-3.1 does not execute these phases; their Profile entries remain not_run.
+     */
     public enum Phase {
         PREPROCESS, COLLECT_TABLES, PRELOAD_METADATA, WAIT_CHANGE_VISIBLE, LOCK_TABLES,
         ANALYZE, REWRITE, PRE_REWRITE_MV, OPTIMIZE, CHOOSE_PLAN, POST_PROCESS,
