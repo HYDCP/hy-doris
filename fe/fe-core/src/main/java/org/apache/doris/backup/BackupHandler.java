@@ -1087,6 +1087,20 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
     }
 
+    public void replayRestoreJobStateChange(RestoreJobStateChange stateChange) {
+        LOG.info("replay {}", stateChange);
+
+        AbstractJob existingJob = getCurrentJob(stateChange.getDbId());
+        if (existingJob == null || existingJob.isDone()) {
+            LOG.error("invalid existing job: {}. current replay is: {}", existingJob, stateChange);
+            return;
+        }
+        // Unlike replayAddJob, the journal doesn't carry the whole job, so it is applied to the existing one.
+        RestoreJob restoreJob = (RestoreJob) existingJob;
+        restoreJob.setEnv(env);
+        restoreJob.replayStateChange(stateChange);
+    }
+
     private AbstractJob getCurrentJob(long dbId) {
         jobLock.lock();
         try {

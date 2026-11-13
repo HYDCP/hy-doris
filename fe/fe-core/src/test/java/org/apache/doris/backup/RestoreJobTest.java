@@ -35,20 +35,27 @@ import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.MarkedCountDownLatch;
+import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
+import org.apache.doris.common.io.DataOutputBuffer;
+import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.datasource.property.storage.BrokerProperties;
 import org.apache.doris.fs.FileSystemFactory;
+import org.apache.doris.journal.JournalEntity;
 import org.apache.doris.persist.EditLog;
+import org.apache.doris.persist.OperationType;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.thrift.TStorageMedium;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 import mockit.Delegate;
 import mockit.Expectations;
 import mockit.Injectable;
@@ -59,11 +66,14 @@ import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -362,5 +372,279 @@ public class RestoreJobTest {
         Partition localPart = remoteTbl.getPartition(partName);
         Assert.assertEquals(localPart.getVisibleVersion(), visibleVersion);
         Assert.assertEquals(localPart.getNextVersion(), visibleVersion + 1);
+    }
+
+    @Test
+    public void testBackupMetaRetainTablesByNameInBackup() throws Exception {
+        OlapTable keptTbl = (OlapTable) db.getTableNullable(CatalogMocker.TEST_TBL_ID);
+        BackupMeta meta = new BackupMeta(Lists.newArrayList(keptTbl, expectedRestoreTbl), Lists.newArrayList());
+
+        // a restored table gets renamed, but stays in the meta under the name it had in the backup
+        keptTbl.setName("alias_of_test_tbl");
+        meta.retainTables(Sets.newHashSet(CatalogMocker.TEST_TBL_NAME));
+
+        Assert.assertSame(keptTbl, meta.getTable(CatalogMocker.TEST_TBL_NAME));
+        Assert.assertSame(keptTbl, meta.getTable(CatalogMocker.TEST_TBL_ID));
+        Assert.assertNull(meta.getTable(CatalogMocker.TEST_TBL2_NAME));
+        Assert.assertNull(meta.getTable(CatalogMocker.TEST_TBL2_ID));
+    }
+
+    @Test
+    public void testDownloadJournalKeepsOnlyTablesOfRestoredPartitions() throws Exception {
+        // test_tbl exists locally and gets a restored partition, test_tbl2 is restored as a new table
+        OlapTable localTbl = (OlapTable) db.getTableNullable(CatalogMocker.TEST_TBL_ID);
+        OlapTable remoteTbl = (OlapTable) CatalogMocker.mockDb().getTableNullable(CatalogMocker.TEST_TBL_ID);
+        Partition restoredPart = remoteTbl.getPartition(CatalogMocker.TEST_SINGLE_PARTITION_NAME);
+        long restoredPartId = 40100L;
+        restoredPart.setIdForRestore(restoredPartId);
+
+        BackupPartitionInfo remotePartInfo = new BackupPartitionInfo();
+        remotePartInfo.id = CatalogMocker.TEST_SINGLE_PARTITION_ID;
+        BackupOlapTableInfo remoteTblInfo = new BackupOlapTableInfo();
+        remoteTblInfo.id = CatalogMocker.TEST_TBL_ID;
+        remoteTblInfo.partitions.put(restoredPart.getName(), remotePartInfo);
+        jobInfo.backupOlapTableObjects.put(CatalogMocker.TEST_TBL_NAME, remoteTblInfo);
+
+        Deencapsulation.setField(job, "backupMeta",
+                new BackupMeta(Lists.newArrayList(remoteTbl, expectedRestoreTbl), Lists.newArrayList()));
+        job.restoredPartitions.add(Pair.of(CatalogMocker.TEST_TBL_NAME, restoredPart));
+        job.restoredTbls.add(expectedRestoreTbl);
+
+        DataOutputBuffer journal = new DataOutputBuffer();
+        new Expectations() {
+            {
+                editLog.logRestoreJob((RestoreJob) any);
+                times = 1;
+                result = new Delegate() {
+                    public void logRestoreJob(RestoreJob restoreJob) throws IOException {
+                        restoreJob.write(journal);
+                    }
+                };
+            }
+        };
+
+        job.waitingAllSnapshotsFinished();
+        Assert.assertEquals(RestoreJob.RestoreJobState.DOWNLOAD, job.getState());
+
+        RestoreJob replayedJob = RestoreJob.read(
+                new DataInputStream(new ByteArrayInputStream(journal.getData(), 0, journal.getLength())));
+
+        BackupMeta replayedMeta = Deencapsulation.getField(replayedJob, "backupMeta");
+        Assert.assertEquals(Sets.newHashSet(CatalogMocker.TEST_TBL_NAME), replayedMeta.getTables().keySet());
+        Assert.assertEquals(1, replayedJob.restoredTbls.size());
+
+        // replaying the journal still finds the remote table of the restored partition
+        new Expectations() {
+            {
+                catalog.getDbOrMetaException(anyLong);
+                minTimes = 0;
+                result = db;
+            }
+        };
+        replayedJob.setEnv(env);
+        replayedJob.replayRun();
+
+        Assert.assertNotNull(localTbl.getPartition(restoredPartId));
+        Assert.assertNotNull(db.getTableNullable(CatalogMocker.TEST_TBL2_ID));
+    }
+
+    private static byte[] journalOf(Writable writable) throws IOException {
+        DataOutputBuffer buffer = new DataOutputBuffer();
+        writable.write(buffer);
+        return Arrays.copyOf(buffer.getData(), buffer.getLength());
+    }
+
+    private static DataInputStream journalInput(byte[] journal) {
+        return new DataInputStream(new ByteArrayInputStream(journal));
+    }
+
+    // The json of a job which is not done, as AbstractJob.write puts it into a journal or the image
+    private static String jsonOf(AbstractJob restoreJob) throws IOException {
+        byte[] journal = journalOf(restoreJob);
+        return new String(journal, Integer.BYTES, journal.length - Integer.BYTES, StandardCharsets.UTF_8);
+    }
+
+    private static RestoreJobStateChange readStateChangeJournal(byte[] journal) throws IOException {
+        DataOutputBuffer buffer = new DataOutputBuffer();
+        buffer.writeShort(OperationType.OP_RESTORE_JOB_STATE);
+        buffer.write(journal);
+        JournalEntity entity = new JournalEntity();
+        entity.readFields(new DataInputStream(new ByteArrayInputStream(buffer.getData(), 0, buffer.getLength())));
+        Assert.assertEquals(OperationType.OP_RESTORE_JOB_STATE, entity.getOpCode());
+        return (RestoreJobStateChange) entity.getData();
+    }
+
+    // The catalog of a follower before the restore job: test_tbl exists, test_tbl2 doesn't
+    private Database mockFollowerDb() throws Exception {
+        Database followerDb = CatalogMocker.mockDb();
+        followerDb.unregisterTable(CatalogMocker.TEST_TBL2_NAME);
+        new Expectations() {
+            {
+                catalog.getDbOrMetaException(anyLong);
+                minTimes = 0;
+                result = followerDb;
+            }
+        };
+        return followerDb;
+    }
+
+    @Test
+    public void testStateChangeJournalsReplayToSameJobAsWholeJobJournals() throws Exception {
+        // The master. test_tbl exists locally and gets a restored partition, test_tbl2 is restored as a new table.
+        OlapTable remoteTbl = (OlapTable) CatalogMocker.mockDb().getTableNullable(CatalogMocker.TEST_TBL_ID);
+        Partition restoredPart = remoteTbl.getPartition(CatalogMocker.TEST_SINGLE_PARTITION_NAME);
+        long restoredPartId = 40100L;
+        restoredPart.setIdForRestore(restoredPartId);
+
+        BackupPartitionInfo remotePartInfo = new BackupPartitionInfo();
+        remotePartInfo.id = CatalogMocker.TEST_SINGLE_PARTITION_ID;
+        BackupOlapTableInfo remoteTblInfo = new BackupOlapTableInfo();
+        remoteTblInfo.id = CatalogMocker.TEST_TBL_ID;
+        remoteTblInfo.partitions.put(restoredPart.getName(), remotePartInfo);
+        jobInfo.backupOlapTableObjects.put(CatalogMocker.TEST_TBL_NAME, remoteTblInfo);
+        Deencapsulation.setField(job, "backupMeta",
+                new BackupMeta(Lists.newArrayList(remoteTbl, expectedRestoreTbl), Lists.newArrayList()));
+
+        // 1. The creation journal is the whole job in both formats.
+        byte[] creationJournal = journalOf(job);
+
+        // 2. What checkAndPrepareMeta and the snapshot tasks produce before the DOWNLOAD state.
+        Deencapsulation.setField(job, "jobId", 60001L);
+        job.metaPreparedTime = 1700000000000L;
+        job.restoredPartitions.add(Pair.of(CatalogMocker.TEST_TBL_NAME, restoredPart));
+        job.restoredTbls.add(expectedRestoreTbl);
+        com.google.common.collect.Table<Long, Long, Long> restoredVersionInfo
+                = Deencapsulation.getField(job, "restoredVersionInfo");
+        restoredVersionInfo.put(CatalogMocker.TEST_TBL_ID, restoredPartId, 99L);
+        for (long tabletId = 10001L; tabletId <= 10003L; tabletId++) {
+            for (long beId : Lists.newArrayList(CatalogMocker.BACKEND1_ID, CatalogMocker.BACKEND2_ID)) {
+                job.snapshotInfos.put(tabletId, beId, new SnapshotInfo(db.getId(), CatalogMocker.TEST_TBL2_ID,
+                        30001L, 40001L, tabletId, beId, 1234, "/path/to/snapshot/" + tabletId,
+                        Lists.newArrayList(tabletId + ".dat", tabletId + ".hdr")));
+            }
+            job.fileMapping.putMapping(
+                    new RestoreFileMapping.IdChain(CatalogMocker.TEST_TBL2_ID, 30001L, 40001L, tabletId, 1L, -1L),
+                    new RestoreFileMapping.IdChain(CatalogMocker.TEST_TBL2_ID, 30002L, 40002L, tabletId + 100, 2L,
+                            -1L), true);
+        }
+        Map<Long, String> taskErrMsg = Deencapsulation.getField(job, "taskErrMsg");
+        taskErrMsg.put(70001L, "a failed and retried task");
+
+        // 3. The master enters DOWNLOAD and COMMIT. Each time, also take the whole job as OP_RESTORE_JOB writes it.
+        List<byte[]> stateChangeJournals = Lists.newArrayList();
+        new Expectations() {
+            {
+                editLog.logRestoreJob((RestoreJob) any);
+                times = 0;
+
+                editLog.logRestoreJobStateChange((RestoreJobStateChange) any);
+                times = 2;
+                result = new Delegate() {
+                    public void logRestoreJobStateChange(RestoreJobStateChange stateChange) throws IOException {
+                        stateChangeJournals.add(journalOf(stateChange));
+                    }
+                };
+            }
+        };
+        byte[] wholeDownloadJournal;
+        byte[] wholeCommitJournal;
+        Config.enable_restore_job_state_journal = true;
+        try {
+            job.waitingAllSnapshotsFinished();
+            Assert.assertEquals(RestoreJob.RestoreJobState.DOWNLOAD, job.getState());
+            wholeDownloadJournal = journalOf(job);
+
+            Deencapsulation.invoke(job, "waitingAllDownloadFinished");
+            Assert.assertEquals(RestoreJob.RestoreJobState.COMMIT, job.getState());
+            wholeCommitJournal = journalOf(job);
+        } finally {
+            Config.enable_restore_job_state_journal = false;
+        }
+        System.out.println("journal bytes, whole job: creation " + creationJournal.length + ", DOWNLOAD "
+                + wholeDownloadJournal.length + ", COMMIT " + wholeCommitJournal.length + "; state change: DOWNLOAD "
+                + stateChangeJournals.get(0).length + ", COMMIT " + stateChangeJournals.get(1).length);
+        Assert.assertTrue(stateChangeJournals.get(0).length < wholeDownloadJournal.length);
+        // the COMMIT state change carries no metadata
+        Assert.assertTrue(stateChangeJournals.get(1).length < 200);
+
+        // 4. Follower A replays the whole job journals.
+        Database dbA = mockFollowerDb();
+        BackupHandler handlerA = new MockBackupHandler(env);
+        List<String> jobJsonsA = Lists.newArrayList();
+        for (byte[] journal : Lists.newArrayList(creationJournal, wholeDownloadJournal, wholeCommitJournal)) {
+            RestoreJob replayedJob = RestoreJob.read(journalInput(journal));
+            replayedJob.setEnv(env);
+            handlerA.replayAddJob(replayedJob);
+            jobJsonsA.add(jsonOf(handlerA.getJob(db.getId())));
+        }
+        RestoreJob jobA = (RestoreJob) handlerA.getJob(db.getId());
+
+        // 5. Follower B replays the creation journal and the state change journals.
+        Database dbB = mockFollowerDb();
+        BackupHandler handlerB = new MockBackupHandler(env);
+        List<String> jobJsonsB = Lists.newArrayList();
+        RestoreJob jobB = RestoreJob.read(journalInput(creationJournal));
+        jobB.setEnv(env);
+        handlerB.replayAddJob(jobB);
+        jobJsonsB.add(jsonOf(handlerB.getJob(db.getId())));
+        for (byte[] journal : stateChangeJournals) {
+            handlerB.replayRestoreJobStateChange(readStateChangeJournal(journal));
+            jobJsonsB.add(jsonOf(handlerB.getJob(db.getId())));
+        }
+
+        // 6. Both followers hold the same job after every journal, so they write the same image,
+        // and either of them continues the job the same way after becoming the master.
+        Assert.assertEquals(jobJsonsA.get(0), jobJsonsB.get(0));
+        Assert.assertEquals(jobJsonsA.get(1), jobJsonsB.get(1));
+        Assert.assertEquals(jobJsonsA.get(2), jobJsonsB.get(2));
+        Assert.assertTrue(jobJsonsB.get(1).contains("\"st\":\"DOWNLOAD\""));
+        Assert.assertTrue(jobJsonsB.get(2).contains("\"st\":\"COMMIT\""));
+
+        // 7. Both followers have the same catalog.
+        for (Database followerDb : Lists.newArrayList(dbA, dbB)) {
+            OlapTable localTbl = (OlapTable) followerDb.getTableNullable(CatalogMocker.TEST_TBL_ID);
+            Assert.assertNotNull(localTbl.getPartition(restoredPartId));
+            Assert.assertNotNull(followerDb.getTableNullable(CatalogMocker.TEST_TBL2_ID));
+        }
+
+        // 8. The state change journals are applied to the job created by the creation journal, so its
+        // restored tables stay the catalog tables, as on the master. A whole job journal replaces the
+        // job, so after the COMMIT journal follower A holds a second copy of the tables.
+        Assert.assertSame(jobB, handlerB.getJob(db.getId()));
+        Assert.assertSame(dbB.getTableNullable(CatalogMocker.TEST_TBL2_ID), jobB.restoredTbls.get(0));
+        Assert.assertNotSame(dbA.getTableNullable(CatalogMocker.TEST_TBL2_ID), jobA.restoredTbls.get(0));
+    }
+
+    @Test
+    public void testStateChangeJournalRequiresJobInPreviousState() throws Exception {
+        Deencapsulation.setField(job, "backupMeta",
+                new BackupMeta(Lists.newArrayList(expectedRestoreTbl), Lists.newArrayList()));
+        byte[] creationJournal = journalOf(job);
+
+        List<byte[]> stateChangeJournals = Lists.newArrayList();
+        new Expectations() {
+            {
+                editLog.logRestoreJobStateChange((RestoreJobStateChange) any);
+                times = 2;
+                result = new Delegate() {
+                    public void logRestoreJobStateChange(RestoreJobStateChange stateChange) throws IOException {
+                        stateChangeJournals.add(journalOf(stateChange));
+                    }
+                };
+            }
+        };
+        Config.enable_restore_job_state_journal = true;
+        try {
+            job.waitingAllSnapshotsFinished();
+            Deencapsulation.invoke(job, "waitingAllDownloadFinished");
+        } finally {
+            Config.enable_restore_job_state_journal = false;
+        }
+
+        // the COMMIT state change can't be applied to a job which has not replayed the DOWNLOAD one
+        RestoreJob pendingJob = RestoreJob.read(journalInput(creationJournal));
+        pendingJob.setEnv(env);
+        RestoreJobStateChange commit = readStateChangeJournal(stateChangeJournals.get(1));
+        Assert.assertThrows(IllegalStateException.class, () -> pendingJob.replayStateChange(commit));
     }
 }

@@ -422,6 +422,9 @@ public class OperationType {
 
     public static final short OP_OPERATE_KEY = 492;
 
+    // A restore job enters a persisted state, with only what changed since its previous journal.
+    public static final short OP_RESTORE_JOB_STATE = 20117;
+
     // For cloud.
     public static final short OP_UPDATE_CLOUD_REPLICA = 1000;
     @Deprecated
