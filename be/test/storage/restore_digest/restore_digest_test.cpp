@@ -56,6 +56,7 @@
 #include "runtime/snapshot_loader.h"
 #include "runtime/thread_context.h"
 #include "service/backend_options.h"
+#include "service/http/action/restore_digest_action.h"
 #include "storage/data_dir.h"
 #include "storage/delete/delete_handler.h"
 #include "storage/merger.h"
@@ -6587,6 +6588,65 @@ TEST_F(RestoreKeptLoadTest, MergeOnWriteKeptLoadThenCompactionThenConfirmEqualsS
     EXPECT_EQ(3, current(p.target)->max_version_unlocked());
     EXPECT_TRUE(digests_equal(tablet_digest(p.origin->tablet_id(), 3),
                               tablet_digest(p.target->tablet_id(), 3)));
+}
+
+// The prefix_file request of the debug API reads only a regular file under <store>/snapshot/ of a store of
+// this BE, and only up to the size limit: no other local file (outside the snapshot dir, through "..", through
+// a symlink, a directory, a missing file, a file over the limit, a sibling dir sharing the store name prefix).
+TEST(RestoreDigestActionTest, PrefixFileOnlyUnderTheSnapshotDirOfAStore) {
+    namespace fs = std::filesystem;
+    const fs::path base =
+            fs::temp_directory_path() / ("rr_prefix_file_" + std::to_string(::getpid()));
+    fs::remove_all(base);
+    const fs::path store = base / "store";
+    fs::create_directories(store / "snapshot" / "20261113.1.86400" / "100");
+    fs::create_directories(base / "store2" / "snapshot");
+    fs::create_directories(store / "data");
+    auto write = [](const fs::path& f, size_t n) {
+        FILE* fp = fopen(f.c_str(), "w");
+        ASSERT_NE(nullptr, fp);
+        std::string data(n, 'x');
+        fwrite(data.data(), 1, data.size(), fp);
+        fclose(fp);
+    };
+    const fs::path good = store / "snapshot" / "20261113.1.86400" / "100" / "rdigest";
+    write(good, 10);
+    const fs::path outside = base / "secret";
+    write(outside, 10);
+    write(base / "store2" / "snapshot" / "f", 10);
+    write(store / "data" / "f", 10);
+    fs::create_symlink(outside, store / "snapshot" / "link");
+    const std::vector<std::string> stores {store.string()};
+    std::string real;
+    int64_t size = 0;
+
+    Status st = RestoreDigestAction::check_prefix_file(stores, good.string(), 100, &real, &size);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_EQ(fs::canonical(good).string(), real);
+    EXPECT_EQ(10, size);
+    // the same file through ".." inside the snapshot dir is fine
+    st = RestoreDigestAction::check_prefix_file(stores,
+                                                (store / "snapshot" / "20261113.1.86400" / ".." /
+                                                 "20261113.1.86400" / "100" / "rdigest")
+                                                        .string(),
+                                                100, &real, &size);
+    EXPECT_TRUE(st.ok()) << st;
+
+    auto rejected = [&](const fs::path& f, int64_t max_bytes) {
+        Status s =
+                RestoreDigestAction::check_prefix_file(stores, f.string(), max_bytes, &real, &size);
+        EXPECT_TRUE(s.is<ErrorCode::INVALID_ARGUMENT>()) << f << " " << s;
+    };
+    rejected(outside, 100);                                     // not under the store
+    rejected(store / "snapshot" / ".." / ".." / "secret", 100); // escapes through ".."
+    rejected(store / "snapshot" / "link", 100);                 // a symlink to a file outside
+    rejected(store / "snapshot" / "20261113.1.86400", 100);     // a directory
+    rejected(store / "snapshot", 100);                          // the snapshot dir itself
+    rejected(store / "snapshot" / "missing", 100);              // does not exist
+    rejected(good, 9);                                          // over the size limit
+    rejected(base / "store2" / "snapshot" / "f", 100); // a sibling dir sharing the name prefix
+    rejected(store / "data" / "f", 100);               // another dir of the store
+    fs::remove_all(base);
 }
 
 } // namespace doris

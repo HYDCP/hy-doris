@@ -17,6 +17,11 @@
 
 #pragma once
 
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "common/status.h"
 #include "service/http/http_handler_with_auth.h"
 
 namespace doris {
@@ -36,6 +41,16 @@ public:
     ~RestoreDigestAction() override = default;
 
     void handle(HttpRequest* req) override;
+
+    // The largest decomposed digest file the prefix_file request reads (it is read into memory whole).
+    static constexpr int64_t kMaxPrefixFileBytes = 256LL << 20;
+
+    // The prefix_file request reads only a regular file under <store>/snapshot/ of one of `store_paths`, of at
+    // most `max_bytes`: the debug API must not read any other local file. On success `*real_path` is the
+    // canonical path, `*size` its size. INVALID_ARGUMENT otherwise.
+    static Status check_prefix_file(const std::vector<std::string>& store_paths,
+                                    const std::string& path, int64_t max_bytes,
+                                    std::string* real_path, int64_t* size);
 
 private:
     void handle_prefix_file(HttpRequest* req, int64_t tablet_id, int64_t version,

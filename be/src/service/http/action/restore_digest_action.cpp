@@ -34,6 +34,8 @@
 #include "service/http/http_headers.h"
 #include "service/http/http_request.h"
 #include "service/http/http_status.h"
+#include "storage/data_dir.h"
+#include "storage/olap_define.h"
 #include "storage/restore_digest/restore_digest.h"
 #include "storage/storage_engine.h"
 
@@ -43,17 +45,78 @@ RestoreDigestAction::RestoreDigestAction(ExecEnv* exec_env, StorageEngine& engin
                                          TPrivilegeHier::type hier, TPrivilegeType::type type)
         : HttpHandlerWithAuth(exec_env, hier, type), _engine(engine) {}
 
+Status RestoreDigestAction::check_prefix_file(const std::vector<std::string>& store_paths,
+                                              const std::string& path, int64_t max_bytes,
+                                              std::string* real_path, int64_t* size) {
+    const auto& fs = io::global_local_filesystem();
+    std::string real;
+    if (!fs->canonicalize(path, &real).ok()) {
+        return Status::InvalidArgument("prefix_file {} does not exist", path);
+    }
+    bool under_snapshot = false;
+    for (const auto& store : store_paths) {
+        std::string root;
+        if (!fs->canonicalize(store, &root).ok()) {
+            continue;
+        }
+        const std::string dir = fmt::format("{}/{}/", root, SNAPSHOT_PREFIX);
+        if (real.size() > dir.size() && real.compare(0, dir.size(), dir) == 0) {
+            under_snapshot = true;
+            break;
+        }
+    }
+    if (!under_snapshot) {
+        return Status::InvalidArgument(
+                "prefix_file {} is not under the snapshot dir of a store of this BE", path);
+    }
+    bool is_dir = false;
+    RETURN_IF_ERROR(fs->is_directory(real, &is_dir));
+    if (is_dir) {
+        return Status::InvalidArgument("prefix_file {} is a directory", path);
+    }
+    int64_t bytes = 0;
+    RETURN_IF_ERROR(fs->file_size(real, &bytes));
+    if (bytes > max_bytes) {
+        return Status::InvalidArgument("prefix_file {} has {} bytes, more than the limit {}", path,
+                                       bytes, max_bytes);
+    }
+    *real_path = real;
+    *size = bytes;
+    return Status::OK();
+}
+
 // Debug: composes the digest at `version` from a decomposed digest file (rdigest) on this BE,
 // after checking the file against `root`. version = -1 lists the boundaries instead.
 void RestoreDigestAction::handle_prefix_file(HttpRequest* req, int64_t tablet_id, int64_t version,
                                              const std::string& path, const std::string& root) {
+    std::vector<std::string> store_paths;
+    for (auto* store : _engine.get_stores()) {
+        store_paths.push_back(store->path());
+    }
+    std::string real_path;
+    int64_t file_bytes = 0;
+    Status st = check_prefix_file(store_paths, path, kMaxPrefixFileBytes, &real_path, &file_bytes);
+    if (!st.ok()) {
+        req->add_output_header(HttpHeaders::CONTENT_TYPE, HEADER_JSON.c_str());
+        std::string escaped;
+        for (char c : st.to_string()) {
+            if (c == '"' || c == '\\') {
+                escaped.push_back('\\');
+            }
+            escaped.push_back(c == '\n' ? ' ' : c);
+        }
+        HttpChannel::send_reply(
+                req, HttpStatus::BAD_REQUEST,
+                fmt::format("{{\"status\":\"BAD_PREFIX_FILE\",\"msg\":\"{}\"}}", escaped));
+        return;
+    }
     std::string content;
-    Status st;
     {
         io::FileReaderSPtr reader;
-        st = io::global_local_filesystem()->open_file(path, &reader);
+        st = io::global_local_filesystem()->open_file(real_path, &reader);
         if (st.ok()) {
-            content.resize(reader->size());
+            // the size checked above, not the one of the reader, so a file growing meanwhile is not read past it
+            content.resize(std::min<int64_t>(reader->size(), file_bytes));
             size_t bytes_read = 0;
             st = reader->read_at(0, Slice(content.data(), content.size()), &bytes_read);
             static_cast<void>(reader->close());
@@ -109,8 +172,9 @@ void RestoreDigestAction::handle_prefix_file(HttpRequest* req, int64_t tablet_id
 
 void RestoreDigestAction::handle(HttpRequest* req) {
     if (!config::enable_restore_digest_http_api) {
-        HttpChannel::send_reply(req, HttpStatus::FORBIDDEN,
-                                "the restore digest API is off, see enable_restore_digest_http_api");
+        HttpChannel::send_reply(
+                req, HttpStatus::FORBIDDEN,
+                "the restore digest API is off, see enable_restore_digest_http_api");
         return;
     }
     const std::string& tablet_id_str = req->param(TABLET_ID);
