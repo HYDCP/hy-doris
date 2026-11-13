@@ -50,6 +50,7 @@ import org.apache.doris.analysis.ReplaceTableClause;
 import org.apache.doris.analysis.RollupRenameClause;
 import org.apache.doris.analysis.TableName;
 import org.apache.doris.analysis.TableRenameClause;
+import org.apache.doris.catalog.BinlogConfig;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.DataProperty;
 import org.apache.doris.catalog.Database;
@@ -677,10 +678,11 @@ public class Alter {
                 if (swapTable) {
                     origTable.checkAndSetName(newTblName, true);
                 }
+                BinlogConfig origTblBinlogConfig = new BinlogConfig(origTable.getBinlogConfig());
                 replaceTableInternal(db, origTable, olapNewTbl, swapTable, false);
                 // write edit log
                 ReplaceTableOperationLog log = new ReplaceTableOperationLog(db.getId(),
-                        origTable.getId(), oldTblName, olapNewTbl.getId(), newTblName, swapTable);
+                        origTable.getId(), oldTblName, olapNewTbl.getId(), newTblName, swapTable, origTblBinlogConfig);
                 Env.getCurrentEnv().getEditLog().logReplaceTable(log);
                 LOG.info("finish replacing table {} with table {}, is swap: {}", oldTblName, newTblName, swapTable);
             } finally {
@@ -704,6 +706,7 @@ public class Alter {
         tableList.sort((Comparator.comparing(Table::getId)));
         MetaLockUtils.writeLockTablesOrMetaException(tableList);
         try {
+            Env.getCurrentEnv().getBinlogManager().cacheTableBinlogConfig(origTblId, log.getOrigTblBinlogConfig());
             replaceTableInternal(db, origTable, newTbl, log.isSwapTable(), true);
         } catch (DdlException e) {
             LOG.warn("should not happen", e);
