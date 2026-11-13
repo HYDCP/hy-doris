@@ -29,6 +29,7 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
+import org.apache.doris.common.profile.PlanningDiagnostics;
 import org.apache.doris.common.util.PropertyAnalyzer;
 import org.apache.doris.common.util.Util;
 import org.apache.doris.datasource.ExternalSchemaCache.SchemaCacheKey;
@@ -38,6 +39,7 @@ import org.apache.doris.nereids.trees.plans.algebra.CatalogRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFileScan.SelectedPartitions;
 import org.apache.doris.persist.gson.GsonPostProcessable;
 import org.apache.doris.persist.gson.GsonUtils;
+import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.statistics.AnalysisInfo;
 import org.apache.doris.statistics.BaseAnalysisTask;
 import org.apache.doris.statistics.ColumnStatistic;
@@ -174,10 +176,11 @@ public class ExternalTable implements TableIf, Writable, GsonPostProcessable {
 
     @Override
     public List<Column> getFullSchema() {
-        ExternalSchemaCache cache = Env.getCurrentEnv().getExtMetaCacheMgr().getSchemaCache(catalog);
-        Optional<SchemaCacheValue> schemaCacheValue = cache.getSchemaValue(new SchemaCacheKey(getOrBuildNameMapping()));
-        return schemaCacheValue.map(SchemaCacheValue::getSchema).orElse(null);
+        return PlanningDiagnostics.operation(ConnectContext.get(), "load_schema", this,
+                this::getNameWithFullQualifiers, -1,
+                () -> getSchemaCacheValue().map(SchemaCacheValue::getSchema).orElse(null));
     }
+
 
     @Override
     public List<Column> getBaseSchema() {
@@ -413,6 +416,11 @@ public class ExternalTable implements TableIf, Writable, GsonPostProcessable {
      * @return
      */
     public SelectedPartitions initSelectedPartitions(Optional<MvccSnapshot> snapshot) {
+        return PlanningDiagnostics.operation(ConnectContext.get(), "load_partitions", this,
+                this::getNameWithFullQualifiers, -1, () -> initSelectedPartitionsInternal(snapshot));
+    }
+
+    private SelectedPartitions initSelectedPartitionsInternal(Optional<MvccSnapshot> snapshot) {
         if (!supportInternalPartitionPruned()) {
             return SelectedPartitions.NOT_PRUNED;
         }

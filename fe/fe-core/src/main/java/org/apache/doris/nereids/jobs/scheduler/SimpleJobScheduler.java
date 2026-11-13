@@ -17,6 +17,7 @@
 
 package org.apache.doris.nereids.jobs.scheduler;
 
+import org.apache.doris.common.profile.PlanningDiagnostics;
 import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.errors.QueryPlanningErrors;
 import org.apache.doris.nereids.jobs.Job;
@@ -33,6 +34,7 @@ public class SimpleJobScheduler implements JobScheduler {
         JobPool pool = scheduleContext.getJobPool();
         CascadesContext context = (CascadesContext) scheduleContext;
         SessionVariable sessionVariable = context.getConnectContext().getSessionVariable();
+        PlanningDiagnostics diagnostics = PlanningDiagnostics.current(context.getConnectContext());
         while (!pool.isEmpty()) {
             long elapsedS = context.getStatementContext().getStopwatch().elapsed(TimeUnit.MILLISECONDS) / 1000;
             if (sessionVariable.enableNereidsTimeout
@@ -41,7 +43,14 @@ public class SimpleJobScheduler implements JobScheduler {
                         context.getConnectContext().getExecutor().getSummaryProfile());
             }
             Job job = pool.pop();
-            job.execute();
+            Class<?> previousJob = diagnostics == null ? null : diagnostics.setCurrentJob(job.getClass());
+            try {
+                job.execute();
+            } finally {
+                if (diagnostics != null) {
+                    diagnostics.setCurrentJob(previousJob);
+                }
+            }
         }
     }
 }
