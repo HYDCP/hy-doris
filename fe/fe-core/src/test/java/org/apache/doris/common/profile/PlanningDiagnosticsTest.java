@@ -30,16 +30,23 @@ import org.apache.doris.datasource.SchemaCacheValue;
 import org.apache.doris.datasource.hive.HMSExternalTable;
 import org.apache.doris.datasource.mvcc.MvccSnapshot;
 import org.apache.doris.mysql.authenticate.TestLogAppender;
+import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.NereidsPlanner;
 import org.apache.doris.nereids.StatementContext;
+import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.nereids.properties.SelectHintSetVar;
+import org.apache.doris.nereids.rules.analysis.EliminateLogicalSelectHint;
 import org.apache.doris.nereids.trees.plans.commands.ExplainCommand.ExplainLevel;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFileScan.SelectedPartitions;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
+import org.apache.doris.nereids.trees.plans.logical.LogicalSelectHint;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.OriginStatement;
 import org.apache.doris.qe.StmtExecutor;
+import org.apache.doris.qe.VariableMgr;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.apache.logging.log4j.Level;
@@ -53,6 +60,7 @@ import org.mockito.Mockito;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -113,6 +121,179 @@ public class PlanningDiagnosticsTest {
         Config.nereids_planning_operation_log_threshold_ms = savedOperationThreshold;
         Config.nereids_planning_log_interval_ms = savedInterval;
         FeConstants.runningUnitTest = savedUnitTest;
+    }
+
+    @Test
+    public void testSetVarUpdatesRunningAndFinishedTimeout() throws Exception {
+        context.getSessionVariable().setQueryTimeoutS(20);
+        try (TestLogAppender appender = TestLogAppender.attach(PlanningDiagnostics.class, Level.WARN)) {
+            try {
+                run(() -> {
+                    PlanningDiagnostics.runPhase(context, Phase.PREPROCESS, () -> { });
+                    PlanningDiagnostics.runPhase(context, Phase.ANALYZE,
+                            () -> applySetVar(context, ImmutableMap.of("query_timeout", Optional.of("2"))));
+                    Assertions.assertEquals(2, context.getExecTimeout());
+                    advance(5000);
+                    CompletableFuture.runAsync(context.getPlanningDiagnostics()::reportIfSlow).join();
+                    Assertions.assertEquals(1, events(appender).size());
+                    Assertions.assertEquals("running", eventJson(events(appender).get(0)).get("status").getAsString());
+                });
+            } finally {
+                VariableMgr.revertSessionValue(context.getSessionVariable());
+            }
+            Assertions.assertEquals(20, context.getExecTimeout());
+            Assertions.assertEquals(2, events(appender).size());
+            events(appender).forEach(event ->
+                    Assertions.assertEquals(2000, eventJson(event).get("query_timeout_ms").getAsLong()));
+        }
+    }
+
+    @Test
+    public void testSetVarPartialFailureKeepsAppliedTimeout() throws Exception {
+        context.getSessionVariable().setQueryTimeoutS(20);
+        try (TestLogAppender appender = TestLogAppender.attach(PlanningDiagnostics.class, Level.WARN)) {
+            try {
+                AnalysisException failure = Assertions.assertThrows(AnalysisException.class,
+                        () -> run(() -> PlanningDiagnostics.runPhase(context, Phase.ANALYZE,
+                                () -> applySetVar(context, ImmutableMap.of("query_timeout", Optional.of("2"),
+                                        "nonexistent_planning_diagnostics_variable", Optional.of("1"))))));
+                Assertions.assertTrue(failure.getMessage().contains("nonexistent_planning_diagnostics_variable"));
+                Assertions.assertEquals(2, context.getExecTimeout());
+            } finally {
+                VariableMgr.revertSessionValue(context.getSessionVariable());
+            }
+            Assertions.assertEquals(20, context.getExecTimeout());
+            Assertions.assertEquals(1, events(appender).size());
+            JsonObject event = eventJson(events(appender).get(0));
+            Assertions.assertEquals(2000, event.get("query_timeout_ms").getAsLong());
+            Assertions.assertEquals("analyze", event.get("failed_step").getAsString());
+        }
+    }
+
+    @Test
+    public void testSetVarUsesEffectiveInsertTimeout() throws Exception {
+        context.getSessionVariable().setQueryTimeoutS(20);
+        context.getSessionVariable().setInsertTimeoutS(5);
+        Mockito.when(context.getExecutor().isSyncLoadKindStmt()).thenReturn(true);
+        try (TestLogAppender appender = TestLogAppender.attach(PlanningDiagnostics.class, Level.WARN)) {
+            try {
+                run(() -> {
+                    applySetVar(context, ImmutableMap.of("query_timeout", Optional.of("2")));
+                    Assertions.assertEquals(5, context.getExecTimeout());
+                    advance(5000);
+                });
+            } finally {
+                VariableMgr.revertSessionValue(context.getSessionVariable());
+            }
+            Assertions.assertEquals(1, events(appender).size());
+            Assertions.assertEquals(5000, eventJson(events(appender).get(0)).get("query_timeout_ms").getAsLong());
+        }
+    }
+
+    @Test
+    public void testSetVarMaxExecutionTimeUpdatesTimeout() throws Exception {
+        context.getSessionVariable().setMaxExecutionTimeMS(20000);
+        try (TestLogAppender appender = TestLogAppender.attach(PlanningDiagnostics.class, Level.WARN)) {
+            try {
+                run(() -> {
+                    applySetVar(context, ImmutableMap.of("max_execution_time", Optional.of("3000")));
+                    Assertions.assertEquals(3, context.getExecTimeout());
+                    advance(5000);
+                });
+            } finally {
+                VariableMgr.revertSessionValue(context.getSessionVariable());
+            }
+            Assertions.assertEquals(1, events(appender).size());
+            Assertions.assertEquals(3000, eventJson(events(appender).get(0)).get("query_timeout_ms").getAsLong());
+        }
+    }
+
+    @Test
+    public void testInternalSetVarKeepsOuterTimeoutAndDeferredSnapshot() throws Exception {
+        context.getSessionVariable().setQueryTimeoutS(20);
+        ConnectContext internal = new ConnectContext();
+        internal.getSessionVariable().setQueryTimeoutS(90);
+        try (TestLogAppender appender = TestLogAppender.attach(PlanningDiagnostics.class, Level.WARN)) {
+            try {
+                run(() -> {
+                    applySetVar(context, ImmutableMap.of("query_timeout", Optional.of("2")));
+                    PlanningDiagnostics.execute(new PlanningDiagnostics(internal, clock::get), () -> {
+                        applySetVar(internal, ImmutableMap.of("query_timeout", Optional.of("7")));
+                        Assertions.assertEquals(7, internal.getExecTimeout());
+                        advance(5000);
+                        context.getPlanningDiagnostics().reportIfSlow();
+                        return null;
+                    });
+                    Assertions.assertEquals(1, events(appender).size(), "Internal completion remains deferred");
+                });
+            } finally {
+                VariableMgr.revertSessionValue(internal.getSessionVariable());
+                VariableMgr.revertSessionValue(context.getSessionVariable());
+            }
+            Assertions.assertEquals(90, internal.getExecTimeout());
+            Assertions.assertEquals(20, context.getExecTimeout());
+            Assertions.assertEquals(3, events(appender).size());
+            events(appender).forEach(event -> {
+                assertDiagnosticIdentity(event, "1-2");
+                Assertions.assertEquals(2000, eventJson(event).get("query_timeout_ms").getAsLong());
+            });
+        }
+    }
+
+    @Test
+    public void testNestedSetVarWithOwnIdKeepsTimeoutAfterSessionRestoration() throws Exception {
+        context.getSessionVariable().setQueryTimeoutS(20);
+        ConnectContext child = new ConnectContext();
+        child.setQueryId(new org.apache.doris.thrift.TUniqueId(3, 4));
+        child.getSessionVariable().setQueryTimeoutS(60);
+        try (TestLogAppender appender = TestLogAppender.attach(PlanningDiagnostics.class, Level.WARN)) {
+            run(() -> {
+                try {
+                    PlanningDiagnostics.execute(new PlanningDiagnostics(child, clock::get), () -> {
+                        applySetVar(child, ImmutableMap.of("query_timeout", Optional.of("7")));
+                        advance(5000);
+                        context.getPlanningDiagnostics().reportIfSlow();
+                        return null;
+                    });
+                } finally {
+                    Assertions.assertDoesNotThrow(() -> VariableMgr.revertSessionValue(child.getSessionVariable()));
+                }
+                Assertions.assertEquals(60, child.getExecTimeout());
+                Assertions.assertEquals(1, events(appender).size(), "Child completion remains deferred");
+            });
+            Assertions.assertEquals(3, events(appender).size());
+            for (int i = 0; i < 2; i++) {
+                assertDiagnosticIdentity(events(appender).get(i), "3-4");
+                Assertions.assertEquals(7000, eventJson(events(appender).get(i)).get("query_timeout_ms").getAsLong());
+            }
+            assertDiagnosticIdentity(events(appender).get(2), "1-2");
+            Assertions.assertEquals(20000, eventJson(events(appender).get(2)).get("query_timeout_ms").getAsLong());
+        }
+    }
+
+    @Test
+    public void testSetVarWithoutActiveDiagnostics() throws Exception {
+        context.getSessionVariable().setQueryTimeoutS(20);
+        try {
+            applySetVar(context, ImmutableMap.of("query_timeout", Optional.of("2")));
+            Assertions.assertEquals(2, context.getExecTimeout());
+            Assertions.assertNull(context.getPlanningDiagnostics());
+        } finally {
+            VariableMgr.revertSessionValue(context.getSessionVariable());
+        }
+        Assertions.assertEquals(20, context.getExecTimeout());
+    }
+
+    private void applySetVar(ConnectContext target, Map<String, Optional<String>> parameters) {
+        StatementContext statement = new StatementContext(target, new OriginStatement("select 1", 0));
+        CascadesContext cascades = Mockito.mock(CascadesContext.class);
+        Mockito.when(cascades.getStatementContext()).thenReturn(statement);
+        Mockito.when(cascades.getConnectContext()).thenReturn(target);
+        LogicalPlan child = Mockito.mock(LogicalPlan.class);
+        LogicalSelectHint<LogicalPlan> hint = new LogicalSelectHint<>(
+                ImmutableMap.of("SET_VAR", new SelectHintSetVar("SET_VAR", parameters)), child);
+        Assertions.assertEquals(ImmutableList.of(child),
+                new EliminateLogicalSelectHint().build().transform(hint, cascades));
     }
 
     @Test

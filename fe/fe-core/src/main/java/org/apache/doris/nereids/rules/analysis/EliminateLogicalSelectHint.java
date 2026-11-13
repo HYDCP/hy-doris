@@ -19,6 +19,7 @@ package org.apache.doris.nereids.rules.analysis;
 
 import org.apache.doris.analysis.SetVar;
 import org.apache.doris.analysis.StringLiteral;
+import org.apache.doris.common.profile.PlanningDiagnostics;
 import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.exceptions.AnalysisException;
@@ -86,18 +87,23 @@ public class EliminateLogicalSelectHint extends OneRewriteRuleFactory {
         SessionVariable sessionVariable = context.getConnectContext().getSessionVariable();
         // set temporary session value, and then revert value in the 'finally block' of StmtExecutor#execute
         sessionVariable.setIsSingleSetVar(true);
-        for (Entry<String, Optional<String>> kv : selectHint.getParameters().entrySet()) {
-            String key = kv.getKey();
-            Optional<String> value = kv.getValue();
-            if (value.isPresent()) {
-                try {
-                    VariableMgr.setVar(sessionVariable, new SetVar(key, new StringLiteral(value.get())));
-                    context.invalidCache(key);
-                } catch (Throwable t) {
-                    throw new AnalysisException("Can not set session variable '"
-                        + key + "' = '" + value.get() + "'", t);
+        try {
+            for (Entry<String, Optional<String>> kv : selectHint.getParameters().entrySet()) {
+                String key = kv.getKey();
+                Optional<String> value = kv.getValue();
+                if (value.isPresent()) {
+                    try {
+                        VariableMgr.setVar(sessionVariable, new SetVar(key, new StringLiteral(value.get())));
+                        context.invalidCache(key);
+                    } catch (Throwable t) {
+                        throw new AnalysisException("Can not set session variable '"
+                            + key + "' = '" + value.get() + "'", t);
+                    }
                 }
             }
+        } finally {
+            // A later SET_VAR parameter may fail after the timeout has already changed.
+            PlanningDiagnostics.refreshTimeout(context.getConnectContext());
         }
     }
 

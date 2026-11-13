@@ -57,6 +57,10 @@ public final class PlanningDiagnostics {
     // Internal MV planning can replace ConnectContext while the calling planner still holds table locks.
     private static final ThreadLocal<PlanningDiagnostics> ACTIVE = new ThreadLocal<>();
 
+    /**
+     * WAIT_CHANGE_VISIBLE and PRE_REWRITE_MV are upstream-compatible output keys.
+     * Branch-3.1 does not execute these phases; their Profile entries remain not_run.
+     */
     public enum Phase {
         PREPROCESS, COLLECT_TABLES, PRELOAD_METADATA, WAIT_CHANGE_VISIBLE, LOCK_TABLES,
         ANALYZE, REWRITE, PRE_REWRITE_MV, OPTIMIZE, CHOOSE_PLAN, POST_PROCESS,
@@ -201,6 +205,18 @@ public final class PlanningDiagnostics {
         return context == null ? null : context.getPlanningDiagnostics();
     }
 
+    /**
+     * Publish SET_VAR's effective timeout on the planner thread for running and deferred reports.
+     * Internal connections without a query ID retain their owning query's budget.
+     */
+    public static void refreshTimeout(ConnectContext context) {
+        PlanningDiagnostics diagnostics = current(context);
+        if (diagnostics != null) {
+            diagnostics.timeoutMs = diagnostics.inheritsQueryIdentity
+                    ? diagnostics.parent.timeoutMs : context.getExecTimeout() * 1000L;
+        }
+    }
+
     private <T> T measure(Phase phase, String operation, String target, long budgetMs, Supplier<T> action) {
         Step previous = current;
         Step step = new Step(phase, operation, target, budgetMs, clock.getAsLong(),
@@ -225,10 +241,6 @@ public final class PlanningDiagnostics {
                 timing.nanos += elapsed;
                 timing.calls++;
                 timing.failures += success ? 0 : 1;
-                if (phase == Phase.PREPROCESS && success) {
-                    // SET_VAR hints are applied by preprocessing, after this pass was created.
-                    timeoutMs = inheritsQueryIdentity ? parent.timeoutMs : context.getExecTimeout() * 1000L;
-                }
             } else {
                 recordOperation(step, elapsed, success);
             }
