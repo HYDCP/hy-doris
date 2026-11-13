@@ -34,14 +34,18 @@ import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.Tablet;
+import org.apache.doris.catalog.View;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.MarkedCountDownLatch;
+import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
+import org.apache.doris.common.io.DataOutputBuffer;
 import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.datasource.property.storage.BrokerProperties;
 import org.apache.doris.fs.FileSystemFactory;
+import org.apache.doris.journal.SerializedJournalEntity;
 import org.apache.doris.persist.EditLog;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.SystemInfoService;
@@ -49,9 +53,11 @@ import org.apache.doris.thrift.TStorageMedium;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 import mockit.Delegate;
 import mockit.Expectations;
 import mockit.Injectable;
+import mockit.Invocation;
 import mockit.Mock;
 import mockit.MockUp;
 import mockit.Mocked;
@@ -59,7 +65,9 @@ import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
+import java.io.DataOutput;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -67,6 +75,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.zip.Adler32;
 
@@ -362,5 +371,180 @@ public class RestoreJobTest {
         Partition localPart = remoteTbl.getPartition(partName);
         Assert.assertEquals(localPart.getVisibleVersion(), visibleVersion);
         Assert.assertEquals(localPart.getNextVersion(), visibleVersion + 1);
+    }
+
+    @Test
+    public void testBackupMetaRetainTablesByNameInBackup() throws Exception {
+        OlapTable keptTbl = (OlapTable) db.getTableNullable(CatalogMocker.TEST_TBL_ID);
+        BackupMeta meta = new BackupMeta(Lists.newArrayList(keptTbl, expectedRestoreTbl), Lists.newArrayList());
+
+        // a restored table gets renamed, but stays in the meta under the name it had in the backup
+        keptTbl.setName("alias_of_test_tbl");
+        meta.retainTables(Sets.newHashSet(CatalogMocker.TEST_TBL_NAME));
+
+        Assert.assertSame(keptTbl, meta.getTable(CatalogMocker.TEST_TBL_NAME));
+        Assert.assertSame(keptTbl, meta.getTable(CatalogMocker.TEST_TBL_ID));
+        Assert.assertNull(meta.getTable(CatalogMocker.TEST_TBL2_NAME));
+        Assert.assertNull(meta.getTable(CatalogMocker.TEST_TBL2_ID));
+    }
+
+    @Test
+    public void testDownloadJournalKeepsOnlyTablesOfRestoredPartitions() throws Exception {
+        // test_tbl exists locally and gets a restored partition, test_tbl2 is restored as a new table
+        OlapTable localTbl = (OlapTable) db.getTableNullable(CatalogMocker.TEST_TBL_ID);
+        OlapTable remoteTbl = (OlapTable) CatalogMocker.mockDb().getTableNullable(CatalogMocker.TEST_TBL_ID);
+        Partition restoredPart = remoteTbl.getPartition(CatalogMocker.TEST_SINGLE_PARTITION_NAME);
+        long restoredPartId = 40100L;
+        restoredPart.setIdForRestore(restoredPartId);
+
+        BackupPartitionInfo remotePartInfo = new BackupPartitionInfo();
+        remotePartInfo.id = CatalogMocker.TEST_SINGLE_PARTITION_ID;
+        BackupOlapTableInfo remoteTblInfo = new BackupOlapTableInfo();
+        remoteTblInfo.id = CatalogMocker.TEST_TBL_ID;
+        remoteTblInfo.partitions.put(restoredPart.getName(), remotePartInfo);
+        jobInfo.backupOlapTableObjects.put(CatalogMocker.TEST_TBL_NAME, remoteTblInfo);
+
+        Deencapsulation.setField(job, "backupMeta",
+                new BackupMeta(Lists.newArrayList(remoteTbl, expectedRestoreTbl), Lists.newArrayList()));
+        job.restoredPartitions.add(Pair.of(CatalogMocker.TEST_TBL_NAME, restoredPart));
+        job.restoredTbls.add(expectedRestoreTbl);
+
+        DataOutputBuffer journal = new DataOutputBuffer();
+        new Expectations() {
+            {
+                editLog.logRestoreJob((SerializedJournalEntity) any);
+                times = 1;
+                result = new Delegate() {
+                    public void logRestoreJob(SerializedJournalEntity serializedJob) throws IOException {
+                        serializedJob.write(journal);
+                    }
+                };
+            }
+        };
+
+        // the restored table has been registered on the master since PENDING, but not on an FE that replays
+        db.registerTable(expectedRestoreTbl);
+        job.waitingAllSnapshotsFinished();
+        Assert.assertEquals(RestoreJob.RestoreJobState.DOWNLOAD, job.getState());
+        db.unregisterTable(expectedRestoreTbl.getName());
+
+        RestoreJob replayedJob = RestoreJob.read(
+                new DataInputStream(new ByteArrayInputStream(journal.getData(), 0, journal.getLength())));
+
+        BackupMeta replayedMeta = Deencapsulation.getField(replayedJob, "backupMeta");
+        Assert.assertEquals(Sets.newHashSet(CatalogMocker.TEST_TBL_NAME), replayedMeta.getTables().keySet());
+        Assert.assertEquals(1, replayedJob.restoredTbls.size());
+
+        // replaying the journal still finds the remote table of the restored partition
+        new Expectations() {
+            {
+                catalog.getDbOrMetaException(anyLong);
+                minTimes = 0;
+                result = db;
+            }
+        };
+        replayedJob.setEnv(env);
+        replayedJob.replayRun();
+
+        Assert.assertNotNull(localTbl.getPartition(restoredPartId));
+        Assert.assertNotNull(db.getTableNullable(CatalogMocker.TEST_TBL2_ID));
+    }
+
+    // The restored table test_tbl2 has been registered and its first replica has to be downloaded.
+    private void prepareDownloadOfRestoredTable() {
+        db.registerTable(expectedRestoreTbl);
+        Partition part = expectedRestoreTbl.getPartitions().iterator().next();
+        MaterializedIndex index = part.getBaseIndex();
+        Tablet tablet = index.getTablets().get(0);
+        long replicaId = tablet.getReplicas().get(0).getId();
+        RestoreFileMapping.IdChain catalogIds = new RestoreFileMapping.IdChain(expectedRestoreTbl.getId(),
+                part.getId(), index.getId(), tablet.getId(), replicaId, -1L);
+        RestoreFileMapping.IdChain repoIds = new RestoreFileMapping.IdChain(CatalogMocker.TEST_TBL2_ID,
+                part.getId(), index.getId(), tablet.getId(), -1L, -1L);
+        job.fileMapping.putMapping(catalogIds, repoIds, true);
+        job.restoredTbls.add(expectedRestoreTbl);
+        Deencapsulation.setField(job, "backupMeta", backupMeta);
+        Deencapsulation.setField(job, "state", RestoreJob.RestoreJobState.SNAPSHOTING);
+    }
+
+    @Test
+    public void testDownloadJournalIsLoggedUnderDbReadLock() {
+        prepareDownloadOfRestoredTable();
+
+        AtomicBoolean dropCouldLockDb = new AtomicBoolean(true);
+        new Expectations() {
+            {
+                editLog.logRestoreJob((SerializedJournalEntity) any);
+                times = 1;
+                result = new Delegate() {
+                    public void logRestoreJob(SerializedJournalEntity serializedJob) throws InterruptedException {
+                        // a DROP ... FORCE of the restored table needs the db write lock
+                        Thread drop = new Thread(() -> {
+                            if (db.tryWriteLock(10, TimeUnit.MILLISECONDS)) {
+                                db.writeUnlock();
+                            } else {
+                                dropCouldLockDb.set(false);
+                            }
+                        });
+                        drop.start();
+                        drop.join();
+                    }
+                };
+            }
+        };
+
+        job.waitingAllSnapshotsFinished();
+        Assert.assertTrue(job.getStatus().ok());
+        Assert.assertEquals(RestoreJob.RestoreJobState.DOWNLOAD, job.getState());
+        Assert.assertFalse(dropCouldLockDb.get());
+    }
+
+    @Test
+    public void testDownloadJournalIsNotLoggedAfterRestoredTableIsDropped() {
+        prepareDownloadOfRestoredTable();
+
+        // DROP TABLE FORCE commits while the job is being serialized for the DOWNLOAD journal
+        new MockUp<AbstractJob>() {
+            @Mock
+            public void write(Invocation inv, DataOutput out) {
+                db.unregisterTable(expectedRestoreTbl.getName());
+                inv.proceed();
+            }
+        };
+        new Expectations() {
+            {
+                editLog.logRestoreJob((SerializedJournalEntity) any);
+                times = 0;
+            }
+        };
+
+        job.waitingAllSnapshotsFinished();
+        Assert.assertEquals(Status.ErrCode.NOT_FOUND, job.getStatus().getErrCode());
+    }
+
+    @Test
+    public void testDownloadJournalIsNotLoggedAfterRestoredViewIsDropped() {
+        prepareDownloadOfRestoredTable();
+        View restoredView = new View(40200L, "test_restored_view", Lists.newArrayList());
+        db.registerTable(restoredView);
+        job.restoredTbls.add(restoredView);
+
+        // DROP VIEW needs no FORCE, and the view is not in the file mapping
+        new MockUp<AbstractJob>() {
+            @Mock
+            public void write(Invocation inv, DataOutput out) {
+                db.unregisterTable(restoredView.getName());
+                inv.proceed();
+            }
+        };
+        new Expectations() {
+            {
+                editLog.logRestoreJob((SerializedJournalEntity) any);
+                times = 0;
+            }
+        };
+
+        job.waitingAllSnapshotsFinished();
+        Assert.assertEquals(Status.ErrCode.NOT_FOUND, job.getStatus().getErrCode());
     }
 }

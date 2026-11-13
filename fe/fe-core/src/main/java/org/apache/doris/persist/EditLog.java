@@ -69,6 +69,7 @@ import org.apache.doris.journal.Journal;
 import org.apache.doris.journal.JournalBatch;
 import org.apache.doris.journal.JournalCursor;
 import org.apache.doris.journal.JournalEntity;
+import org.apache.doris.journal.SerializedJournalEntity;
 import org.apache.doris.journal.bdbje.BDBJEJournal;
 import org.apache.doris.journal.bdbje.Timestamp;
 import org.apache.doris.journal.local.LocalJournal;
@@ -106,6 +107,7 @@ import org.apache.doris.system.Frontend;
 import org.apache.doris.transaction.TransactionState;
 import org.apache.doris.transaction.TransactionStatus;
 
+import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -1919,7 +1921,21 @@ public class EditLog {
     }
 
     public void logBackupJob(BackupJob job) {
-        logEdit(OperationType.OP_BACKUP_JOB, job);
+        logJob(OperationType.OP_BACKUP_JOB, job);
+    }
+
+    /**
+     * Serializes a backup or restore job in the calling thread, unless it is done.
+     * Serializing such a job can take minutes, and in the single EditLog-Flusher thread it would block every other
+     * journal writer. The caller holds the job lock and waits for the journal anyway.
+     *
+     * A job that is already done must not be serialized before it is queued. Other threads see it as done as soon as
+     * its state changes, so the next job of the db, or a DDL on the restored tables, could reach the journal first,
+     * and replaying them in that order would lose the next job. A done job has released its metadata, so the flusher
+     * serializes it quickly.
+     */
+    private void logJob(short op, org.apache.doris.backup.AbstractJob job) {
+        logEdit(op, job.isDone() ? job : SerializedJournalEntity.serialize(op, job));
     }
 
     public void logCreateRepository(Repository repo) {
@@ -1935,7 +1951,17 @@ public class EditLog {
     }
 
     public void logRestoreJob(RestoreJob job) {
-        logEdit(OperationType.OP_RESTORE_JOB, job);
+        logJob(OperationType.OP_RESTORE_JOB, job);
+    }
+
+    /**
+     * Logs a restore job that the caller has serialized with {@link SerializedJournalEntity#serialize}, so that it
+     * can check the restored objects again under the db lock after the long serialization, right before logging.
+     */
+    public void logRestoreJob(SerializedJournalEntity serializedJob) {
+        Preconditions.checkState(serializedJob.getOpCode() == OperationType.OP_RESTORE_JOB,
+                "not a restore job journal: %s", serializedJob.getOpCode());
+        logEdit(OperationType.OP_RESTORE_JOB, serializedJob);
     }
 
     public void logUpdateUserProperty(UserPropertyInfo propertyInfo) {

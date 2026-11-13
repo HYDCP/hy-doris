@@ -68,6 +68,8 @@ import org.apache.doris.common.util.DynamicPartitionUtil;
 import org.apache.doris.common.util.PropertyAnalyzer;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.journal.SerializedJournalEntity;
+import org.apache.doris.persist.OperationType;
 import org.apache.doris.persist.gson.GsonPostProcessable;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.resource.Tag;
@@ -1716,12 +1718,51 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         LOG.info("replay check and prepare meta. {}", this);
     }
 
+    /**
+     * Logs the job entering DOWNLOAD. Replaying this journal registers the restored objects again, so it must not
+     * reach the journal after a drop of them: a DROP ... FORCE, which the RESTORE table state does not stop, or a
+     * DROP VIEW. Serializing the job can take minutes, so it is done without the db lock; then the restored objects
+     * are checked again and the journal is logged under the db read lock, which the drop needs to write. If they
+     * have been dropped, the journal is not logged and the status tells run() to cancel the job.
+     */
+    protected void logDownloadJournal() {
+        Preconditions.checkState(state == RestoreJobState.DOWNLOAD, state);
+        SerializedJournalEntity journal = SerializedJournalEntity.serialize(OperationType.OP_RESTORE_JOB, this);
+        Database db = env.getInternalCatalog().getDbNullable(dbId);
+        if (db == null) {
+            status = new Status(ErrCode.NOT_FOUND, "database " + dbId + " has been dropped");
+            return;
+        }
+        db.readLock();
+        try {
+            checkIfNeedCancel();
+            if (!status.ok()) {
+                return;
+            }
+            // checkIfNeedCancel() only checks the OLAP tables in fileMapping, while a restored view or another
+            // non-OLAP table can be dropped even without FORCE.
+            for (Table restoredTbl : restoredTbls) {
+                if (db.getTableNullable(restoredTbl.getId()) != restoredTbl) {
+                    status = new Status(ErrCode.NOT_FOUND, "table " + restoredTbl.getName() + " has been dropped");
+                    return;
+                }
+            }
+            env.getEditLog().logRestoreJob(journal);
+        } finally {
+            db.readUnlock();
+        }
+    }
+
     protected void waitingAllSnapshotsFinished() {
         if (unfinishedSignatureToId.isEmpty()) {
             snapshotFinishedTime = System.currentTimeMillis();
             state = RestoreJobState.DOWNLOAD;
 
-            env.getEditLog().logRestoreJob(this);
+            // restoredTbls are the same objects as the tables in backupMeta, so this journal would carry them twice.
+            // From now on, backupMeta is only read to replay restoredPartitions.
+            backupMeta.retainTables(restoredPartitions.stream().map(entry -> entry.first).collect(Collectors.toSet()));
+
+            logDownloadJournal();
             LOG.info("finished making snapshots. {}", this);
             return;
         }
