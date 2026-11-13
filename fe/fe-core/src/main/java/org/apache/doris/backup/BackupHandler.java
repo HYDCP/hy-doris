@@ -127,6 +127,10 @@ public class BackupHandler extends MasterDaemon implements Writable {
         return t;
     });
     private final Set<Long> nudgePending = ConcurrentHashMap.newKeySet();
+    // Taken around each run of a job, by the daemon and by the nudge thread: the jobs are still run one at a time,
+    // as when only the daemon ran them (a nudge may come in between two jobs of a round, not run beside one).
+    // Always taken before the lock of the job (run() is synchronized), never while holding it.
+    private final ReentrantLock jobRunLock = new ReentrantLock();
 
     // map to store backup info, key is label name, value is the BackupJob
     // this map not present in persist && only in fe memory
@@ -234,10 +238,16 @@ public class BackupHandler extends MasterDaemon implements Writable {
             return;
         }
         job.setEnv(env);
+        jobRunLock.lock();
         try {
-            job.run();
+            // looked at again under the lock: the daemon may have run the job to its end meanwhile
+            if (!job.isDone()) {
+                job.run();
+            }
         } catch (Throwable t) {
             LOG.warn("failed to run the nudged backup or restore job {}", job, t);
+        } finally {
+            jobRunLock.unlock();
         }
     }
 
@@ -273,11 +283,14 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
         for (AbstractJob job : getAllCurrentJobs()) {
             job.setEnv(env);
+            jobRunLock.lock();
             try {
                 job.run();
             } catch (Throwable t) {
                 // the other jobs still run this round
                 LOG.warn("failed to run the backup or restore job {}", job, t);
+            } finally {
+                jobRunLock.unlock();
             }
         }
     }

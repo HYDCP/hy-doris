@@ -624,6 +624,60 @@ public class BackupJobTest {
     }
 
     /**
+     * The snapshot task of a dropped table is the last one the SNAPSHOTING state waits for: its TABLET_MISSING
+     * report, handled as a drop, nudges the job like the report of a finished task (backup_restore_run_on_task_finish).
+     */
+    @Test
+    public void testTabletMissingLastTaskNudges() {
+        try {
+            AgentTaskQueue.clearAllTasks();
+            List<TableRefInfo> tableRefs = Lists.newArrayList();
+            for (String name : new String[] {UnitTestUtil.TABLE_NAME, table2Name}) {
+                tableRefs.add(new TableRefInfo(
+                        new TableNameInfo(InternalCatalog.INTERNAL_CATALOG_NAME, UnitTestUtil.DB_NAME, name),
+                        null, null, null, new ArrayList<>(), null, null, new ArrayList<>()));
+            }
+            job = new BackupJob("label", dbId, UnitTestUtil.DB_NAME, tableRefs, 13600 * 1000,
+                    BackupCommand.BackupContent.ALL, env, repo.getId(), 0);
+            job.run();
+            Assertions.assertEquals(BackupJobState.SNAPSHOTING, job.getState());
+            Assertions.assertEquals(2, AgentTaskQueue.getTaskNum());
+            db.unregisterTable(table2Name);
+
+            SnapshotTask first = (SnapshotTask) AgentTaskQueue.getTask(backendId, TTaskType.MAKE_SNAPSHOT, id.get() - 2);
+            SnapshotTask second = (SnapshotTask) AgentTaskQueue.getTask(backendId, TTaskType.MAKE_SNAPSHOT, id.get() - 1);
+            SnapshotTask existing = first.getTabletId() == tabletId ? first : second;
+            SnapshotTask dropped = existing == first ? second : first;
+            TBackend tBackend = new TBackend("", 0, 1);
+            Mockito.clearInvocations(backupHandler);
+
+            // the existing table first: one task is still unfinished, no nudge
+            TFinishTaskRequest ok = new TFinishTaskRequest(tBackend, TTaskType.MAKE_SNAPSHOT,
+                    existing.getSignature(), new TStatus(TStatusCode.OK));
+            ok.setSnapshotFiles(Lists.newArrayList("1.dat", "1.idx", "1.hdr"));
+            ok.setSnapshotPath("/path/to/snapshot");
+            Assertions.assertTrue(job.finishTabletSnapshotTask(existing, ok));
+            Mockito.verify(backupHandler, Mockito.never()).nudge(Mockito.anyLong(), Mockito.anyLong());
+
+            // the dropped one last: handled as a drop, and it is the last task, so the job is nudged once
+            TStatus missing = new TStatus(TStatusCode.TABLET_MISSING);
+            missing.setErrorMsgs(Lists.newArrayList("Tablet missing"));
+            Assertions.assertTrue(job.finishTabletSnapshotTask(dropped,
+                    new TFinishTaskRequest(tBackend, TTaskType.MAKE_SNAPSHOT, dropped.getSignature(), missing)));
+            Mockito.verify(backupHandler, Mockito.times(1)).nudge(dbId, job.getJobId());
+
+            job.run();
+            Assertions.assertEquals(Status.OK, job.getStatus());
+            Assertions.assertEquals(BackupJobState.UPLOAD_SNAPSHOT, job.getState());
+        } finally {
+            AgentTaskQueue.clearAllTasks();
+            if (db.getTableNullable(table2Name) == null && table2 != null) {
+                db.registerTable(table2);
+            }
+        }
+    }
+
+    /**
      * Test backup job serialization and deserialization
      *
      * Scenario: Write backup job to file and read it back

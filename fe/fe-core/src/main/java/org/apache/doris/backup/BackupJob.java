@@ -376,6 +376,8 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                     taskProgress.remove(task.getSignature());
                     taskErrMsg.remove(task.getSignature());
                     Long oldValue = unfinishedTaskIds.remove(task.getSignature());
+                    // it may be the last task the state waits for, like a finished one
+                    nudgeIfIdle(oldValue != null && unfinishedTaskIds.isEmpty());
                     return oldValue != null;
                 } else {
                     // Not caused by drop, follow original logic

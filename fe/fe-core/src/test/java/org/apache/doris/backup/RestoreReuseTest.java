@@ -93,6 +93,7 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
@@ -4457,6 +4458,61 @@ public class RestoreReuseTest {
             drainNudges(handler);
             Mockito.verify(replayed, Mockito.times(1)).run();
             Mockito.verify(next, Mockito.never()).run();
+        } finally {
+            Config.backup_restore_run_on_task_finish = orig;
+        }
+    }
+
+    // A nudged job is not run beside the job the daemon is running (the jobs are still run one at a time), and
+    // a nudge waiting for the daemon does not run again a job the daemon has run to its end meanwhile.
+    @Test
+    public void testNudgedRunDoesNotOverlapTheDaemonRun() throws Exception {
+        BackupHandler handler = newHandler();
+        boolean orig = Config.backup_restore_run_on_task_finish;
+        try {
+            Config.backup_restore_run_on_task_finish = true;
+            Deencapsulation.setField(handler, "isInit", true);
+            Mockito.when(env.isReady()).thenReturn(true);
+            Mockito.when(env.isMaster()).thenReturn(true);
+            CountDownLatch aStarted = new CountDownLatch(1);
+            CountDownLatch releaseA = new CountDownLatch(1);
+            AtomicBoolean aRunning = new AtomicBoolean(false);
+            AtomicBoolean aDone = new AtomicBoolean(false);
+            AtomicBoolean overlap = new AtomicBoolean(false);
+            AbstractJob a = mockJob(7);
+            Mockito.when(a.isDone()).thenAnswer(inv -> aDone.get());
+            Mockito.doAnswer(inv -> {
+                aRunning.set(true);
+                aStarted.countDown();
+                releaseA.await(10, TimeUnit.SECONDS);
+                aDone.set(true);
+                aRunning.set(false);
+                return null;
+            }).when(a).run();
+            AbstractJob b = mockJob(8);
+            Mockito.doAnswer(inv -> {
+                overlap.compareAndSet(false, aRunning.get());
+                return null;
+            }).when(b).run();
+            Deencapsulation.invoke(handler, "addBackupOrRestoreJob", 5L, a);
+
+            // the daemon round runs A, which is held
+            Thread daemon = new Thread(handler::runAfterCatalogReady);
+            daemon.start();
+            Assertions.assertTrue(aStarted.await(10, TimeUnit.SECONDS));
+            // B of another database is nudged, and A too
+            Deencapsulation.invoke(handler, "addBackupOrRestoreJob", 6L, b);
+            handler.nudge(6, 8);
+            handler.nudge(5, 7);
+            Thread.sleep(300);
+            Mockito.verify(b, Mockito.never()).run();
+            releaseA.countDown();
+            daemon.join(10000);
+            drainNudges(handler);
+            Mockito.verify(b, Mockito.times(1)).run();
+            Assertions.assertFalse(overlap.get(), "B was run beside A");
+            // A was run to its end by the daemon: its nudge did not run it again
+            Mockito.verify(a, Mockito.times(1)).run();
         } finally {
             Config.backup_restore_run_on_task_finish = orig;
         }
