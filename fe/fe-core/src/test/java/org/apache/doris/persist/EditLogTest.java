@@ -202,6 +202,13 @@ public class EditLogTest {
                 batch.getJournalEntities().forEach(entity -> writtenOps.add(entity.getOpCode()));
                 return writtenOps.size();
             }
+
+            @Mock
+            public long write(short op, Writable writable) throws IOException {
+                writable.write(new DataOutputBuffer());
+                writtenOps.add(op);
+                return writtenOps.size();
+            }
         };
 
         String originalEditLogType = Config.edit_log_type;
@@ -319,5 +326,55 @@ public class EditLogTest {
                 out -> out.writeLong(1L));
         Assert.assertThrows(IllegalStateException.class,
                 () -> new JournalBatch().addJournal(OperationType.OP_RESTORE_JOB, serialized));
+    }
+
+    // A restore job that is not serialized by the caller: it is serialized where the journal is written.
+    private List<String> logRestoreJobAndRecordOrder(boolean batchEditLog) throws Exception {
+        List<String> events = Collections.synchronizedList(Lists.newArrayList());
+        CountDownLatch queued = new CountDownLatch(1);
+        Writable job = out -> {
+            // with the flusher, the journal has its place in the log before it is serialized
+            if (batchEditLog) {
+                Uninterruptibles.awaitUninterruptibly(queued, 30, TimeUnit.SECONDS);
+            }
+            events.add("serialized by " + Thread.currentThread().getName());
+        };
+
+        boolean originalBatchEditLog = Config.enable_batch_editlog;
+        Config.enable_batch_editlog = batchEditLog;
+        try {
+            EditLog editLog = newEditLog(Collections.synchronizedList(Lists.newArrayList()));
+            Thread submitter = new Thread(() -> editLog.logRestoreJob(job, () -> {
+                events.add("queued by " + Thread.currentThread().getName());
+                queued.countDown();
+            }), "submitter");
+            submitter.setDaemon(true);
+            submitter.start();
+            submitter.join(60000);
+            Assert.assertFalse(submitter.isAlive());
+        } finally {
+            Config.enable_batch_editlog = originalBatchEditLog;
+        }
+        return events;
+    }
+
+    @Test
+    public void testRestoreJobIsQueuedBeforeFlusherWritesIt() throws Exception {
+        Assert.assertEquals(Lists.newArrayList("queued by submitter", "serialized by EditLog-Flusher"),
+                logRestoreJobAndRecordOrder(true));
+    }
+
+    @Test
+    public void testRestoreJobHasItsPlaceOnceWrittenWithoutFlusher() throws Exception {
+        Assert.assertEquals(Lists.newArrayList("serialized by submitter", "queued by submitter"),
+                logRestoreJobAndRecordOrder(false));
+    }
+
+    @Test
+    public void testSerializedRestoreJobMustBeARestoreJobJournal() {
+        SerializedJournalEntity serialized = SerializedJournalEntity.serialize(OperationType.OP_BACKUP_JOB,
+                out -> out.writeLong(1L));
+        EditLog editLog = newEditLog(Collections.synchronizedList(Lists.newArrayList()));
+        Assert.assertThrows(IllegalStateException.class, () -> editLog.logRestoreJob(serialized, () -> { }));
     }
 }

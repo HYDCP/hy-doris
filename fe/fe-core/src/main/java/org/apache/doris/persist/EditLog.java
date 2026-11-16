@@ -1507,6 +1507,10 @@ public class EditLog {
      * This method blocks until the log is written and returns the logId.
      */
     public long logEditWithQueue(short op, Writable writable) {
+        return logEditWithQueue(op, writable, () -> { });
+    }
+
+    private long logEditWithQueue(short op, Writable writable, Runnable afterQueued) {
         EditLogItem req = new EditLogItem(op, writable);
         if (LOG.isDebugEnabled()) {
             LOG.debug("logEditWithQueue: op = {}, uid = {}", op, req.uid);
@@ -1524,6 +1528,8 @@ public class EditLog {
                 }
             }
         }
+        // The flusher writes the queue in order, so the place of this journal in the log is fixed from here on.
+        afterQueued.run();
         synchronized (req.lock) {
             while (!req.finished) {
                 try {
@@ -1538,7 +1544,7 @@ public class EditLog {
         return req.logId;
     }
 
-    private synchronized long logEditDirectly(short op, Writable writable) {
+    private synchronized long logEditDirectly(short op, Writable writable, Runnable afterQueued) {
         long logId = -1;
         try {
             logId = journal.write(op, writable);
@@ -1551,6 +1557,8 @@ public class EditLog {
             LOG.error("Fatal Error : write stream Exception", t);
             System.exit(-1);
         }
+        // Journals are written one at a time here, so the place of this journal in the log is fixed only now.
+        afterQueued.run();
 
         // get a new transactionId
         txId++;
@@ -1569,6 +1577,18 @@ public class EditLog {
      * Write an operation to the edit log. Do not sync to persistent store yet.
      */
     private long logEdit(short op, Writable writable) {
+        return logEdit(op, writable, () -> { });
+    }
+
+    /**
+     * Writes an operation to the edit log, and runs afterQueued as soon as the place of the journal in the log is
+     * fixed. With enable_batch_editlog that is when the journal is queued for the flusher, long before it is
+     * written; otherwise it is when the journal has been written.
+     *
+     * A caller that has to order its journal with the journals of other threads holds the lock that does so until
+     * afterQueued, and releases it there instead of holding it until the journal is written.
+     */
+    private long logEdit(short op, Writable writable, Runnable afterQueued) {
         if (this.getNumEditStreams() == 0) {
             LOG.error("Fatal Error : no editLog stream", new Exception());
             throw new Error("Fatal Error : no editLog stream");
@@ -1591,9 +1611,9 @@ public class EditLog {
         }
         long logId = -1;
         if (Config.enable_batch_editlog && op != OperationType.OP_TIMESTAMP) {
-            logId = logEditWithQueue(op, writable);
+            logId = logEditWithQueue(op, writable, afterQueued);
         } else {
-            logId = logEditDirectly(op, writable);
+            logId = logEditDirectly(op, writable, afterQueued);
         }
 
         // update statistics
@@ -1955,13 +1975,18 @@ public class EditLog {
     }
 
     /**
-     * Logs a restore job that the caller has serialized with {@link SerializedJournalEntity#serialize}, so that it
-     * can check the restored objects again under the db lock after the long serialization, right before logging.
+     * Logs a restore job whose journal has to be ordered with the journals of other threads, see
+     * {@link RestoreJob#logDownloadJournal}. The job is logged as the caller hands it over: either serialized by the
+     * caller with {@link SerializedJournalEntity#serialize}, or the job itself, which is then serialized when the
+     * journal is written. afterQueued releases the locks of the caller, see
+     * {@link #logEdit(short, Writable, Runnable)}.
      */
-    public void logRestoreJob(SerializedJournalEntity serializedJob) {
-        Preconditions.checkState(serializedJob.getOpCode() == OperationType.OP_RESTORE_JOB,
-                "not a restore job journal: %s", serializedJob.getOpCode());
-        logEdit(OperationType.OP_RESTORE_JOB, serializedJob);
+    public void logRestoreJob(Writable job, Runnable afterQueued) {
+        if (job instanceof SerializedJournalEntity) {
+            short opCode = ((SerializedJournalEntity) job).getOpCode();
+            Preconditions.checkState(opCode == OperationType.OP_RESTORE_JOB, "not a restore job journal: %s", opCode);
+        }
+        logEdit(OperationType.OP_RESTORE_JOB, job, afterQueued);
     }
 
     public void logUpdateUserProperty(UserPropertyInfo propertyInfo) {

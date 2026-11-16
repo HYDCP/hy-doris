@@ -62,9 +62,11 @@ import org.apache.doris.common.MarkedCountDownLatch;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.io.Text;
+import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.DbUtil;
 import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.common.util.DynamicPartitionUtil;
+import org.apache.doris.common.util.MetaLockUtils;
 import org.apache.doris.common.util.PropertyAnalyzer;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.datasource.InternalCatalog;
@@ -94,6 +96,7 @@ import org.apache.doris.thrift.TTaskType;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.HashBasedTable;
 import com.google.common.collect.HashMultimap;
@@ -116,6 +119,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import java.util.zip.GZIPInputStream;
 
@@ -131,6 +135,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     private static final String ATOMIC_RESTORE_TABLE_PREFIX = "__doris_atomic_restore_prefix__";
 
     private static final Logger LOG = LogManager.getLogger(RestoreJob.class);
+
+    // How many times the job serializes its DOWNLOAD journal itself before it leaves that to the EditLog flusher.
+    // The second time is for a restored table that has been written once in the meantime.
+    private static final int MAX_PRE_SERIALIZE_DOWNLOAD_JOURNAL_NUM = 2;
 
     // CHECKSTYLE OFF
     public enum RestoreJobState {
@@ -1719,37 +1727,168 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     /**
-     * Logs the job entering DOWNLOAD. Replaying this journal registers the restored objects again, so it must not
-     * reach the journal after a drop of them: a DROP ... FORCE, which the RESTORE table state does not stop, or a
-     * DROP VIEW. Serializing the job can take minutes, so it is done without the db lock; then the restored objects
-     * are checked again and the journal is logged under the db read lock, which the drop needs to write. If they
-     * have been dropped, the journal is not logged and the status tells run() to cancel the job.
+     * Logs the job entering DOWNLOAD.
+     *
+     * This journal carries objects that have been in the catalog of the master since allReplicasCreated(), which is
+     * not logged: restoredTbls, and restoredPartitions inside tables that existed before. An FE that replays the
+     * journal registers them as they are in the journal, and has skipped every journal about them that comes
+     * earlier, because it did not know them yet. So the journal must carry them as they are at its place in the log:
+     * 1. an object that has been dropped must not be in the journal, or the replay brings it back;
+     * 2. a change of an object that has been logged earlier must be in the journal, or the replay loses it.
+     *
+     * Serializing the job can take minutes, which is too long both for the EditLog flusher, where it blocks every
+     * other journal, and for holding the locks of the objects. So the job is serialized here without any lock, and
+     * is then logged under the db read lock and the read locks of the tables, if they prove that the bytes are still
+     * right: the tables are still registered, which a drop changes under the db write lock, and their write locks,
+     * which every other change needs, have not been taken since before the serialization. The locks are released
+     * as soon as the journal has its place in the log, without waiting for it to be written.
+     *
+     * If a table has been written in the meantime, the job is serialized again. If that happens repeatedly, the
+     * tables are being written all the time, like a table restored with allow_load, and the journal is left to the
+     * flusher, as it was before the job serialized itself: the flusher serializes the job after the journal has got
+     * its place in the log, so it meets 2 whatever has been written before. A job with objects that are changed and
+     * logged without the write lock of a table is always left to the flusher, see
+     * isEveryLoggedChangeUnderTableWriteLock().
+     *
+     * If a restored object has been dropped, the journal is not logged and the status tells run() to cancel the job.
      */
     protected void logDownloadJournal() {
         Preconditions.checkState(state == RestoreJobState.DOWNLOAD, state);
-        SerializedJournalEntity journal = SerializedJournalEntity.serialize(OperationType.OP_RESTORE_JOB, this);
         Database db = env.getInternalCatalog().getDbNullable(dbId);
         if (db == null) {
             status = new Status(ErrCode.NOT_FOUND, "database " + dbId + " has been dropped");
             return;
         }
-        db.readLock();
-        try {
-            checkIfNeedCancel();
+
+        for (int i = 0; i < MAX_PRE_SERIALIZE_DOWNLOAD_JOURNAL_NUM; i++) {
+            List<Table> tables = getCatalogTablesOfDownloadJournal(db);
             if (!status.ok()) {
                 return;
             }
+            if (!isEveryLoggedChangeUnderTableWriteLock(tables)) {
+                break;
+            }
+            List<Long> writeLockCounts = Lists.newArrayList();
+            for (Table table : tables) {
+                table.readLock();
+                try {
+                    writeLockCounts.add(table.getWriteLockCount());
+                } finally {
+                    table.readUnlock();
+                }
+            }
+            SerializedJournalEntity journal = SerializedJournalEntity.serialize(OperationType.OP_RESTORE_JOB, this);
+            if (logDownloadJournalIfUnchanged(db, journal, tables, writeLockCounts)) {
+                return;
+            }
+            LOG.info("restored tables have been written while the DOWNLOAD journal was serialized, times: {}. {}",
+                    i + 1, this);
+        }
+
+        boolean logged = logDownloadJournalIfUnchanged(db, this, null, null);
+        Preconditions.checkState(logged, "the DOWNLOAD journal serialized by the flusher can not be outdated");
+    }
+
+    /**
+     * Whether every logged change of the objects in the DOWNLOAD journal takes the write lock of one of the tables.
+     * Only then do the write lock counts of the tables prove that a serialized journal is not outdated.
+     */
+    private boolean isEveryLoggedChangeUnderTableWriteLock(List<Table> tables) {
+        // ResourceMgr changes and logs resources without any lock.
+        if (!restoredResources.isEmpty()) {
+            return false;
+        }
+        for (Table table : tables) {
+            if (table.getType() != TableType.OLAP) {
+                continue;
+            }
+            OlapTable olapTable = (OlapTable) table;
+            // CooldownConfHandler changes the cooldown replica of tablets with a storage policy without any lock.
+            if (!Strings.isNullOrEmpty(olapTable.getStoragePolicy())) {
+                return false;
+            }
+            // A load takes a range of auto increment ids under the lock of AutoIncrementGenerator only, even a load
+            // that can not commit into a table in RESTORE state. The generator is part of a restored table.
+            if (restoredTbls.contains(olapTable) && olapTable.getAutoIncrementGenerator() != null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Returns the tables in the catalog that the DOWNLOAD journal carries in whole or in part, ordered by id.
+     */
+    private List<Table> getCatalogTablesOfDownloadJournal(Database db) {
+        Map<Long, Table> tables = Maps.newTreeMap();
+        for (Table restoredTbl : restoredTbls) {
+            tables.put(restoredTbl.getId(), restoredTbl);
+        }
+        for (Pair<String, Partition> entry : restoredPartitions) {
+            // The replay looks up the table of a restored partition by this name, too.
+            Table tbl = db.getTableNullable(entry.first);
+            if (tbl == null) {
+                status = new Status(ErrCode.NOT_FOUND, "table " + entry.first + " has been dropped");
+                break;
+            }
+            tables.put(tbl.getId(), tbl);
+        }
+        return Lists.newArrayList(tables.values());
+    }
+
+    /**
+     * Logs the DOWNLOAD journal unless a table it carries has been written since serializedTables and
+     * writeLockCounts were taken, which was before the journal was serialized. They are null if the journal is the
+     * job itself, to be serialized by the flusher.
+     *
+     * Returns false if the journal is outdated. Returns true if it has been logged, or if a restored object has
+     * been dropped, which is told by the status.
+     */
+    private boolean logDownloadJournalIfUnchanged(Database db, Writable journal, List<Table> serializedTables,
+            List<Long> writeLockCounts) {
+        List<Table> lockedTables = Lists.newArrayList();
+        AtomicBoolean locked = new AtomicBoolean(true);
+        Runnable unlock = () -> {
+            if (locked.compareAndSet(true, false)) {
+                MetaLockUtils.readUnlockTables(lockedTables);
+                db.readUnlock();
+            }
+        };
+        db.readLock();
+        try {
+            List<Table> tables = getCatalogTablesOfDownloadJournal(db);
+            if (!status.ok()) {
+                return true;
+            }
+            MetaLockUtils.readLockTables(tables);
+            lockedTables.addAll(tables);
+
+            checkIfNeedCancel();
             // checkIfNeedCancel() only checks the OLAP tables in fileMapping, while a restored view or another
             // non-OLAP table can be dropped even without FORCE.
             for (Table restoredTbl : restoredTbls) {
-                if (db.getTableNullable(restoredTbl.getId()) != restoredTbl) {
+                if (status.ok() && db.getTableNullable(restoredTbl.getId()) != restoredTbl) {
                     status = new Status(ErrCode.NOT_FOUND, "table " + restoredTbl.getName() + " has been dropped");
-                    return;
                 }
             }
-            env.getEditLog().logRestoreJob(journal);
+            if (!status.ok()) {
+                return true;
+            }
+
+            if (serializedTables != null) {
+                if (!tables.equals(serializedTables)) {
+                    return false;
+                }
+                for (int i = 0; i < tables.size(); i++) {
+                    if (tables.get(i).getWriteLockCount() != writeLockCounts.get(i)) {
+                        return false;
+                    }
+                }
+            }
+            env.getEditLog().logRestoreJob(journal, unlock);
+            return true;
         } finally {
-            db.readUnlock();
+            unlock.run();
         }
     }
 
@@ -2436,6 +2575,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             setTableStateToNormalAndUpdateProperties(db, false, isReplay);
 
             // remove restored tbls
+            // They are unregistered by id, not by name: a restored table may have been dropped, and its name may
+            // belong to another table by now, which this job must not touch.
             for (Table restoreTbl : restoredTbls) {
                 if (isAtomicRestore
                         && (restoreTbl.getType() == TableType.OLAP || restoreTbl.getType() == TableType.VIEW)
@@ -2458,14 +2599,14 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                                         }
                                     }
                                 }
-                                db.unregisterTable(restoreTbl.getName());
+                                db.unregisterTable(restoreTbl.getId());
                             } finally {
                                 restoreTbl.writeUnlock();
                             }
                         } else if (restoreTbl.getType() == TableType.VIEW) {
                             restoreTbl.writeLock();
                             try {
-                                db.unregisterTable(restoreTbl.getName());
+                                db.unregisterTable(restoreTbl.getId());
                             } finally {
                                 restoreTbl.writeUnlock();
                             }
@@ -2479,17 +2620,23 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
             // remove restored partitions
             for (Pair<String, Partition> entry : restoredPartitions) {
-                OlapTable restoreTbl = (OlapTable) db.getTableNullable(entry.first);
-                if (restoreTbl == null) {
+                Table tbl = db.getTableNullable(entry.first);
+                // The table may have been dropped, and its name may belong to another table by now.
+                if (tbl == null || tbl.getType() != TableType.OLAP) {
                     continue;
                 }
+                OlapTable restoreTbl = (OlapTable) tbl;
                 if (!restoreTbl.writeLockIfExist()) {
                     continue;
                 }
                 LOG.info("remove restored partition in table {} when cancelled: {}",
                         restoreTbl.getName(), entry.second.getName());
                 try {
-                    restoreTbl.dropPartitionAndReserveTablet(entry.second.getName());
+                    // Only drop the partition this job has added. It is found by id, because another table with
+                    // the name of the dropped one may have a partition with the same name.
+                    if (restoreTbl.getPartition(entry.second.getId()) != null) {
+                        restoreTbl.dropPartitionAndReserveTablet(entry.second.getName());
+                    }
                     for (MaterializedIndex index : entry.second.getMaterializedIndices(IndexExtState.ALL)) {
                         for (Tablet tablet : index.getTablets()) {
                             Env.getCurrentInvertedIndex().deleteTablet(tablet.getId());
