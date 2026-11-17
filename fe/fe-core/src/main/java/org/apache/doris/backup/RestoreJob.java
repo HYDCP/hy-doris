@@ -1798,6 +1798,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         if (!restoredResources.isEmpty()) {
             return false;
         }
+        Set<Long> restoredTblIds = restoredTbls.stream().map(Table::getId).collect(Collectors.toSet());
         for (Table table : tables) {
             if (table.getType() != TableType.OLAP) {
                 continue;
@@ -1809,7 +1810,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             }
             // A load takes a range of auto increment ids under the lock of AutoIncrementGenerator only, even a load
             // that can not commit into a table in RESTORE state. The generator is part of a restored table.
-            if (restoredTbls.contains(olapTable) && olapTable.getAutoIncrementGenerator() != null) {
+            if (olapTable.getAutoIncrementGenerator() != null && restoredTblIds.contains(olapTable.getId())) {
                 return false;
             }
         }
@@ -1876,11 +1877,13 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             }
 
             if (serializedTables != null) {
-                if (!tables.equals(serializedTables)) {
+                // The same table objects, not equal ones: OlapTable.equals() compares the content.
+                if (tables.size() != serializedTables.size()) {
                     return false;
                 }
                 for (int i = 0; i < tables.size(); i++) {
-                    if (tables.get(i).getWriteLockCount() != writeLockCounts.get(i)) {
+                    if (tables.get(i) != serializedTables.get(i)
+                            || tables.get(i).getWriteLockCount() != writeLockCounts.get(i)) {
                         return false;
                     }
                 }
