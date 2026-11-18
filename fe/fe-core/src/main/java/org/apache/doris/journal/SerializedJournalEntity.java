@@ -43,6 +43,11 @@ public class SerializedJournalEntity implements Writable {
         this.buffer = buffer;
     }
 
+    /**
+     * Returns null if serializing the data throws an exception. Another thread can cause one by changing the data
+     * at the same time, like a ConcurrentModificationException of a list. The caller can then serialize it again,
+     * or leave it to the flusher, which serializes it as before. An Error is fatal, as it is in the flusher.
+     */
     public static SerializedJournalEntity serialize(short opCode, Writable data) {
         JournalEntity entity = new JournalEntity();
         entity.setOpCode(opCode);
@@ -50,6 +55,9 @@ public class SerializedJournalEntity implements Writable {
         DataOutputBuffer buffer = new DataOutputBuffer();
         try {
             entity.write(buffer);
+        } catch (Exception e) {
+            LOG.warn("failed to serialize journal {} in the calling thread", opCode, e);
+            return null;
         } catch (Throwable t) {
             // Same as a serialization failure in the flusher: the journal can't be written,
             // while the in-memory state is already ahead of it.

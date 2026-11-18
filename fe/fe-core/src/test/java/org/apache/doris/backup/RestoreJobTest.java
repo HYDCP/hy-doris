@@ -28,10 +28,12 @@ import org.apache.doris.catalog.HashDistributionInfo;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
 import org.apache.doris.catalog.OdbcCatalogResource;
+import org.apache.doris.catalog.OdbcTable;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.PartitionInfo;
 import org.apache.doris.catalog.PartitionType;
+import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.Table;
@@ -76,12 +78,16 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 import java.util.zip.Adler32;
 
@@ -509,18 +515,32 @@ public class RestoreJobTest {
     // The restored table test_tbl2 has been registered and its first replica has to be downloaded.
     private void prepareDownloadOfRestoredTable() {
         db.registerTable(expectedRestoreTbl);
-        Partition part = expectedRestoreTbl.getPartitions().iterator().next();
-        MaterializedIndex index = part.getBaseIndex();
-        Tablet tablet = index.getTablets().get(0);
-        long replicaId = tablet.getReplicas().get(0).getId();
-        RestoreFileMapping.IdChain catalogIds = new RestoreFileMapping.IdChain(expectedRestoreTbl.getId(),
-                part.getId(), index.getId(), tablet.getId(), replicaId, -1L);
-        RestoreFileMapping.IdChain repoIds = new RestoreFileMapping.IdChain(CatalogMocker.TEST_TBL2_ID,
-                part.getId(), index.getId(), tablet.getId(), -1L, -1L);
-        job.fileMapping.putMapping(catalogIds, repoIds, true);
+        putFileMappingOfFirstReplica(expectedRestoreTbl);
         job.restoredTbls.add(expectedRestoreTbl);
         Deencapsulation.setField(job, "backupMeta", backupMeta);
         Deencapsulation.setField(job, "state", RestoreJob.RestoreJobState.SNAPSHOTING);
+    }
+
+    // The first replica of the table has to be downloaded.
+    private void putFileMappingOfFirstReplica(OlapTable tbl) {
+        Partition part = tbl.getPartitions().iterator().next();
+        MaterializedIndex index = part.getBaseIndex();
+        Tablet tablet = index.getTablets().get(0);
+        long replicaId = tablet.getReplicas().get(0).getId();
+        RestoreFileMapping.IdChain catalogIds = new RestoreFileMapping.IdChain(tbl.getId(),
+                part.getId(), index.getId(), tablet.getId(), replicaId, -1L);
+        RestoreFileMapping.IdChain repoIds = new RestoreFileMapping.IdChain(tbl.getId(),
+                part.getId(), index.getId(), tablet.getId(), -1L, -1L);
+        job.fileMapping.putMapping(catalogIds, repoIds, true);
+    }
+
+    private OdbcTable prepareDownloadOfRestoredOdbcTable() {
+        OdbcTable restoredOdbcTable = new OdbcTable();
+        Deencapsulation.setField(restoredOdbcTable, "id", 40300L);
+        Deencapsulation.setField(restoredOdbcTable, "name", "test_restored_odbc_table");
+        db.registerTable(restoredOdbcTable);
+        job.restoredTbls.add(restoredOdbcTable);
+        return restoredOdbcTable;
     }
 
     private View prepareDownloadOfRestoredView() {
@@ -610,6 +630,155 @@ public class RestoreJobTest {
         job.waitingAllSnapshotsFinished();
         Assert.assertEquals(Status.ErrCode.NOT_FOUND, job.getStatus().getErrCode());
         Assert.assertTrue(journals.isEmpty());
+    }
+
+    @Test
+    public void testDownloadJournalLocksTablesOfFileMappingInOrderOfIds() throws Exception {
+        // test_tbl2 is restored as a new table. test_tbl, which has a smaller id, gets data restored into a partition
+        // it has already, so it is only in fileMapping.
+        prepareDownloadOfRestoredTable();
+        OlapTable localTbl = (OlapTable) db.getTableNullable(CatalogMocker.TEST_TBL_ID);
+        Assert.assertTrue(localTbl.getId() < expectedRestoreTbl.getId());
+        putFileMappingOfFirstReplica(localTbl);
+        List<Writable> journals = logDownloadJournals();
+
+        // A load that commits into both tables write locks them in the order of ids, without a timeout. It has
+        // locked test_tbl when the job is going to log the DOWNLOAD journal, and goes on to test_tbl2 once the job
+        // waits for test_tbl. That is a deadlock if the job holds test_tbl2 by then.
+        AtomicBoolean loadLockedBoth = new AtomicBoolean(false);
+        List<Thread> loads = Lists.newArrayList();
+        afterEachSerialization(num -> {
+            if (num != 1) {
+                return;
+            }
+            CountDownLatch firstTableLocked = new CountDownLatch(1);
+            Thread load = new Thread(() -> {
+                localTbl.writeLock();
+                try {
+                    firstTableLocked.countDown();
+                    ReentrantReadWriteLock lock = Deencapsulation.getField(localTbl, "rwLock");
+                    long deadline = System.currentTimeMillis() + 30000;
+                    while (!lock.hasQueuedThreads() && System.currentTimeMillis() < deadline) {
+                        Uninterruptibles.sleepUninterruptibly(1, TimeUnit.MILLISECONDS);
+                    }
+                    if (expectedRestoreTbl.tryWriteLock(5, TimeUnit.SECONDS)) {
+                        loadLockedBoth.set(true);
+                        expectedRestoreTbl.writeUnlock();
+                    }
+                } finally {
+                    localTbl.writeUnlock();
+                }
+            });
+            load.start();
+            loads.add(load);
+            Uninterruptibles.awaitUninterruptibly(firstTableLocked);
+        });
+
+        job.waitingAllSnapshotsFinished();
+        loads.get(0).join();
+        Assert.assertTrue(loadLockedBoth.get());
+        Assert.assertTrue(job.getStatus().ok());
+        Assert.assertEquals(1, journals.size());
+    }
+
+    // A replica list that a session changes, as ReportHandler does under the table write lock, once the
+    // serialization of the job has read a replica of it. The serialization then fails like Gson does, with a
+    // ConcurrentModificationException of the ArrayList.
+    private static class ReplicasChangedWhileWritten extends ArrayList<Replica> {
+        private final Runnable change;
+        private volatile boolean armed = false;
+
+        ReplicasChangedWhileWritten(List<Replica> replicas, Runnable change) {
+            super(replicas);
+            this.change = change;
+        }
+
+        @Override
+        public Iterator<Replica> iterator() {
+            Iterator<Replica> iterator = super.iterator();
+            return new Iterator<Replica>() {
+                @Override
+                public boolean hasNext() {
+                    return iterator.hasNext();
+                }
+
+                @Override
+                public Replica next() {
+                    Replica replica = iterator.next();
+                    if (armed) {
+                        armed = false;
+                        Thread session = new Thread(change);
+                        session.start();
+                        Uninterruptibles.joinUninterruptibly(session);
+                    }
+                    return replica;
+                }
+
+                @Override
+                public void remove() {
+                    iterator.remove();
+                }
+            };
+        }
+    }
+
+    @Test
+    public void testDownloadJournalIsSerializedAgainIfReplicaIsDeletedWhileSerialized() throws Exception {
+        prepareDownloadOfRestoredTable();
+        Tablet tablet = expectedRestoreTbl.getPartitions().iterator().next().getBaseIndex().getTablets().get(0);
+        int replicaNum = tablet.getReplicas().size();
+        // Deleting one of 2 replicas after the first has been read ends the iteration without an exception.
+        Assert.assertTrue(replicaNum >= 3);
+        long backendId = tablet.getReplicas().get(replicaNum - 1).getBackendIdWithoutException();
+        ReplicasChangedWhileWritten replicas = new ReplicasChangedWhileWritten(tablet.getReplicas(), () -> {
+            expectedRestoreTbl.writeLock();
+            try {
+                Assert.assertTrue(tablet.deleteReplicaByBackendId(backendId));
+            } finally {
+                expectedRestoreTbl.writeUnlock();
+            }
+        });
+        Deencapsulation.setField(tablet, "replicas", replicas);
+        List<Writable> journals = logDownloadJournals();
+
+        AtomicInteger serializedNum = new AtomicInteger();
+        new MockUp<AbstractJob>() {
+            @Mock
+            public void write(Invocation inv, DataOutput out) {
+                if (serializedNum.incrementAndGet() == 1) {
+                    replicas.armed = true;
+                }
+                inv.proceed();
+            }
+        };
+
+        job.waitingAllSnapshotsFinished();
+        Assert.assertTrue(job.getStatus().ok());
+        Assert.assertEquals(2, serializedNum.get());
+        Assert.assertEquals(1, journals.size());
+        Assert.assertTrue(journals.get(0) instanceof SerializedJournalEntity);
+        OlapTable replayedTbl = (OlapTable) readDownloadJournal(journals.get(0)).restoredTbls.get(0);
+        Tablet replayedTablet = replayedTbl.getPartitions().iterator().next().getBaseIndex().getTablets().get(0);
+        Assert.assertEquals(replicaNum - 1, replayedTablet.getReplicas().size());
+    }
+
+    @Test
+    public void testCancelAfterRestoredViewIsDroppedRemovesRestoredOdbcTable() {
+        prepareDownloadOfRestoredTable();
+        View restoredView = prepareDownloadOfRestoredView();
+        OdbcTable restoredOdbcTable = prepareDownloadOfRestoredOdbcTable();
+        List<Writable> journals = logDownloadJournals();
+
+        afterEachSerialization(num -> db.unregisterTable(restoredView.getName()));
+        job.waitingAllSnapshotsFinished();
+        Assert.assertEquals(Status.ErrCode.NOT_FOUND, job.getStatus().getErrCode());
+        Assert.assertTrue(journals.isEmpty());
+
+        // An FE that replays has not got the DOWNLOAD journal, so the ODBC table has never been in its catalog.
+        logCancelledJob();
+        Assert.assertTrue(job.cancel().ok());
+        Assert.assertNull(db.getTableNullable(restoredOdbcTable.getId()));
+        Assert.assertNull(db.getTableNullable(restoredOdbcTable.getName()));
     }
 
     // What Alter.modifyViewDef() does to a view, under the same locks.
@@ -781,20 +950,23 @@ public class RestoreJobTest {
     }
 
     @Test
-    public void testCancelRemovesRestoredTableAndView() {
+    public void testCancelRemovesRestoredTableViewAndOdbcTable() {
         prepareDownloadOfRestoredTable();
         View restoredView = prepareDownloadOfRestoredView();
+        OdbcTable restoredOdbcTable = prepareDownloadOfRestoredOdbcTable();
         logCancelledJob();
 
         Assert.assertTrue(job.cancel().ok());
         Assert.assertNull(db.getTableNullable(expectedRestoreTbl.getId()));
         Assert.assertNull(db.getTableNullable(restoredView.getId()));
+        Assert.assertNull(db.getTableNullable(restoredOdbcTable.getId()));
     }
 
     @Test
-    public void testReplayCancelRemovesRestoredTableAndView() throws Exception {
+    public void testReplayCancelRemovesRestoredTableViewAndOdbcTable() throws Exception {
         prepareDownloadOfRestoredTable();
         View restoredView = prepareDownloadOfRestoredView();
+        OdbcTable restoredOdbcTable = prepareDownloadOfRestoredOdbcTable();
 
         // an FE that replays has its own copy of the job, whose restored tables are not the objects in its catalog
         Deencapsulation.setField(job, "state", RestoreJob.RestoreJobState.DOWNLOAD);
@@ -805,6 +977,7 @@ public class RestoreJobTest {
 
         Assert.assertNull(db.getTableNullable(expectedRestoreTbl.getId()));
         Assert.assertNull(db.getTableNullable(restoredView.getId()));
+        Assert.assertNull(db.getTableNullable(restoredOdbcTable.getId()));
     }
 
     @Test

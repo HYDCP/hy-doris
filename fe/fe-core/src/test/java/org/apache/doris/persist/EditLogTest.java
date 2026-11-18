@@ -46,6 +46,7 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.ConcurrentModificationException;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -274,6 +275,27 @@ public class EditLogTest {
         };
         checkDoneJobIsSerializedByFlusher(OperationType.OP_RESTORE_JOB, serializeThread,
                 editLog -> editLog.logRestoreJob(job));
+    }
+
+    @Test
+    public void testRestoreJobChangedWhileSerializedIsSerializedByFlusher() {
+        List<Thread> serializeThreads = Collections.synchronizedList(Lists.newArrayList());
+        RestoreJob job = new RestoreJob() {
+            @Override
+            public void write(DataOutput out) {
+                serializeThreads.add(Thread.currentThread());
+                // what another thread changing the job in the middle of the serialization causes
+                if (serializeThreads.size() == 1) {
+                    throw new ConcurrentModificationException();
+                }
+            }
+        };
+        List<Short> writtenOps = Collections.synchronizedList(Lists.newArrayList());
+        newEditLog(writtenOps).logRestoreJob(job);
+        Assert.assertEquals(2, serializeThreads.size());
+        Assert.assertSame(Thread.currentThread(), serializeThreads.get(0));
+        Assert.assertEquals("EditLog-Flusher", serializeThreads.get(1).getName());
+        Assert.assertEquals(Lists.newArrayList(OperationType.OP_RESTORE_JOB), writtenOps);
     }
 
     @Test

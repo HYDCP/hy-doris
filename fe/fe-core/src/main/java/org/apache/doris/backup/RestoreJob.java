@@ -1777,12 +1777,14 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     table.readUnlock();
                 }
             }
+            // Null if another thread has changed a restored object in the middle of the serialization, like
+            // ReportHandler deleting a replica from the list that is being written. It takes the write lock of the
+            // table, so the job is serialized again, as if the serialization had completed with outdated bytes.
             SerializedJournalEntity journal = SerializedJournalEntity.serialize(OperationType.OP_RESTORE_JOB, this);
-            if (logDownloadJournalIfUnchanged(db, journal, tables, writeLockCounts)) {
+            if (journal != null && logDownloadJournalIfUnchanged(db, journal, tables, writeLockCounts)) {
                 return;
             }
-            LOG.info("restored tables have been written while the DOWNLOAD journal was serialized, times: {}. {}",
-                    i + 1, this);
+            LOG.info("the DOWNLOAD journal is outdated or failed to be serialized, times: {}. {}", i + 1, this);
         }
 
         boolean logged = logDownloadJournalIfUnchanged(db, this, null, null);
@@ -1838,6 +1840,29 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     /**
+     * Returns the tables that are locked to log the DOWNLOAD journal, ordered by id: the tables of the journal, and
+     * the tables in fileMapping, which checkIfNeedCancel() read locks one by one. They are all locked at once in the
+     * order of ids, like every thread that locks several tables, such as a load that commits into them. Locking a
+     * table of fileMapping after the others, out of that order, could deadlock with such a thread.
+     */
+    private List<Table> getTablesToLockForDownloadJournal(Database db, List<Table> tables) {
+        Map<Long, Table> tablesToLock = Maps.newTreeMap();
+        for (Table table : tables) {
+            tablesToLock.put(table.getId(), table);
+        }
+        for (IdChain idChain : fileMapping.getMapping().keySet()) {
+            if (!tablesToLock.containsKey(idChain.getTblId())) {
+                Table tbl = db.getTableNullable(idChain.getTblId());
+                // A dropped table is told by checkIfNeedCancel().
+                if (tbl != null) {
+                    tablesToLock.put(tbl.getId(), tbl);
+                }
+            }
+        }
+        return Lists.newArrayList(tablesToLock.values());
+    }
+
+    /**
      * Logs the DOWNLOAD journal unless a table it carries has been written since serializedTables and
      * writeLockCounts were taken, which was before the journal was serialized. They are null if the journal is the
      * job itself, to be serialized by the flusher.
@@ -1861,9 +1886,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             if (!status.ok()) {
                 return true;
             }
-            MetaLockUtils.readLockTables(tables);
-            lockedTables.addAll(tables);
+            List<Table> tablesToLock = getTablesToLockForDownloadJournal(db, tables);
+            MetaLockUtils.readLockTables(tablesToLock);
+            lockedTables.addAll(tablesToLock);
 
+            // It read locks the tables in fileMapping again, which only reenters the locks taken above.
             checkIfNeedCancel();
             // checkIfNeedCancel() only checks the OLAP tables in fileMapping, while a restored view or another
             // non-OLAP table can be dropped even without FORCE.
@@ -2591,28 +2618,22 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 LOG.info("remove restored table when cancelled: {}", restoreTbl.getName());
                 if (db.writeLockIfExist()) {
                     try {
-                        if (restoreTbl.getType() == TableType.OLAP) {
-                            OlapTable restoreOlapTable = (OlapTable) restoreTbl;
-                            restoreOlapTable.writeLock();
-                            try {
-                                for (Partition part : restoreOlapTable.getPartitions()) {
+                        // Every type of restored table has been registered, an ODBC table as well as an OLAP table
+                        // or a view.
+                        restoreTbl.writeLock();
+                        try {
+                            if (restoreTbl.getType() == TableType.OLAP) {
+                                for (Partition part : ((OlapTable) restoreTbl).getPartitions()) {
                                     for (MaterializedIndex idx : part.getMaterializedIndices(IndexExtState.VISIBLE)) {
                                         for (Tablet tablet : idx.getTablets()) {
                                             Env.getCurrentInvertedIndex().deleteTablet(tablet.getId());
                                         }
                                     }
                                 }
-                                db.unregisterTable(restoreTbl.getId());
-                            } finally {
-                                restoreTbl.writeUnlock();
                             }
-                        } else if (restoreTbl.getType() == TableType.VIEW) {
-                            restoreTbl.writeLock();
-                            try {
-                                db.unregisterTable(restoreTbl.getId());
-                            } finally {
-                                restoreTbl.writeUnlock();
-                            }
+                            db.unregisterTable(restoreTbl.getId());
+                        } finally {
+                            restoreTbl.writeUnlock();
                         }
                     } finally {
                         db.writeUnlock();

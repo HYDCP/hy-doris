@@ -1953,9 +1953,17 @@ public class EditLog {
      * its state changes, so the next job of the db, or a DDL on the restored tables, could reach the journal first,
      * and replaying them in that order would lose the next job. A done job has released its metadata, so the flusher
      * serializes it quickly.
+     *
+     * If another thread changes the job in the middle of its serialization here, the flusher serializes it, as it
+     * did before.
      */
     private void logJob(short op, org.apache.doris.backup.AbstractJob job) {
-        logEdit(op, job.isDone() ? job : SerializedJournalEntity.serialize(op, job));
+        if (job.isDone()) {
+            logEdit(op, job);
+            return;
+        }
+        SerializedJournalEntity serializedJob = SerializedJournalEntity.serialize(op, job);
+        logEdit(op, serializedJob != null ? serializedJob : job);
     }
 
     public void logCreateRepository(Repository repo) {
