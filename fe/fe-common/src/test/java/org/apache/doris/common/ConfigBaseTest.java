@@ -70,18 +70,19 @@ public class ConfigBaseTest {
 
     @Test
     public void testHostSetCapacityDefaultAndMetadata() throws Exception {
-        Assert.assertEquals(8, Config.tablet_health_check_host_set_initial_capacity);
+        Assert.assertEquals(4, Config.tablet_health_check_host_set_initial_capacity);
         Field field = Config.class.getField(HOST_SET_CAPACITY);
         ConfigBase.ConfField annotation = field.getAnnotation(ConfigBase.ConfField.class);
         Assert.assertTrue(annotation.mutable());
         Assert.assertTrue(annotation.masterOnly());
         Assert.assertEquals(1, annotation.minValue());
+        Assert.assertEquals(16, annotation.maxValue());
         Assert.assertTrue(Modifier.isVolatile(field.getModifiers()));
     }
 
     @Test
     public void testHostSetCapacityLoadedFromConfig() throws Exception {
-        for (int capacity : new int[] {4, 6, 8, 16}) {
+        for (int capacity : new int[] {1, 4, 6, 8, 16}) {
             new Config().init(writeCapacity("startup-" + capacity + ".conf", Integer.toString(capacity)));
             Assert.assertEquals(capacity, Config.tablet_health_check_host_set_initial_capacity);
         }
@@ -96,19 +97,21 @@ public class ConfigBaseTest {
     @Test
     public void testHostSetCapacityRejectsInvalidStartupConfig() throws Exception {
         Config.tablet_health_check_host_set_initial_capacity = 8;
-        for (String value : new String[] {"0", "-1", "invalid", "2147483648"}) {
+        for (String value : new String[] {"0", "-1", "17", "2147483647", "invalid", "2147483648"}) {
             String path = writeCapacity("startup-invalid-" + value + ".conf", value);
             Assert.assertThrows(IllegalArgumentException.class, () -> new Config().init(path));
             Assert.assertEquals(8, Config.tablet_health_check_host_set_initial_capacity);
         }
-        String path = writeCapacity("custom-invalid.conf", "0");
-        Assert.assertThrows(IllegalArgumentException.class, () -> new Config().initCustom(path));
-        Assert.assertEquals(8, Config.tablet_health_check_host_set_initial_capacity);
+        for (String value : new String[] {"0", "17"}) {
+            String path = writeCapacity("custom-invalid-" + value + ".conf", value);
+            Assert.assertThrows(IllegalArgumentException.class, () -> new Config().initCustom(path));
+            Assert.assertEquals(8, Config.tablet_health_check_host_set_initial_capacity);
+        }
     }
 
     @Test
     public void testHostSetCapacityDynamicUpdates() throws Exception {
-        for (String value : new String[] {"4", "6", "8", "16", " 6 "}) {
+        for (String value : new String[] {"1", "4", "6", "8", "16", " 6 "}) {
             ConfigBase.setMutableConfig(HOST_SET_CAPACITY, value);
             Assert.assertEquals(Integer.parseInt(value.trim()), Config.tablet_health_check_host_set_initial_capacity);
         }
@@ -117,7 +120,7 @@ public class ConfigBaseTest {
     @Test
     public void testHostSetCapacityRejectsInvalidDynamicUpdates() {
         Config.tablet_health_check_host_set_initial_capacity = 8;
-        for (String value : new String[] {"0", "-1", "invalid", "2147483648"}) {
+        for (String value : new String[] {"0", "-1", "17", "2147483647", "invalid", "2147483648"}) {
             Assert.assertThrows(ConfigException.class, () -> ConfigBase.setMutableConfig(HOST_SET_CAPACITY, value));
             Assert.assertEquals(8, Config.tablet_health_check_host_set_initial_capacity);
         }
@@ -129,6 +132,8 @@ public class ConfigBaseTest {
         try {
             ConfigBase.setMutableConfig("max_backup_tablets_per_job", "-1");
             Assert.assertEquals(-1, Config.max_backup_tablets_per_job);
+            ConfigBase.setMutableConfig("max_backup_tablets_per_job", Integer.toString(Integer.MAX_VALUE));
+            Assert.assertEquals(Integer.MAX_VALUE, Config.max_backup_tablets_per_job);
         } finally {
             Config.max_backup_tablets_per_job = previous;
         }

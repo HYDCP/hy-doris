@@ -1085,14 +1085,14 @@ public class Config extends ConfigBase {
     @ConfField(mutable = false, masterOnly = true)
     public static long tablet_checker_interval_ms = 20 * 1000;
 
-    @ConfField(mutable = true, masterOnly = true, minValue = 1, description = {
-            "Tablet 普通和 Colocate 健康检查中主机去重 HashSet 的初始容量。必须为正整数，JDK 将桶数向上取整为 2 的幂；"
+    @ConfField(mutable = true, masterOnly = true, minValue = 1, maxValue = 16, description = {
+            "Tablet 普通和 Colocate 健康检查中主机去重 HashSet 的初始容量。取值范围为 1 到 16，JDK 将桶数向上取整为 2 的幂；"
                     + "默认负载因子为 0.75，超过阈值后自动扩容。动态修改对后续健康检查生效。",
             "Initial HashSet capacity for host deduplication in normal and colocate tablet health checks. "
-                    + "Must be positive; the JDK rounds the bucket count up to a power of two and grows it "
-                    + "at the default load factor of 0.75. Dynamic changes apply to subsequent health checks."
+                    + "Valid range is 1 to 16 inclusive. The JDK rounds up to a power of two and grows the set "
+                    + "at a load factor of 0.75. Dynamic changes apply to subsequent health checks."
     })
-    public static volatile int tablet_health_check_host_set_initial_capacity = 8;
+    public static volatile int tablet_health_check_host_set_initial_capacity = 4;
 
     /**
      * tablet scheduled interval. Do not modify it in production environment.

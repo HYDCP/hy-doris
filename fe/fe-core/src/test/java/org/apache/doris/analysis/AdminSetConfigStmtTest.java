@@ -39,7 +39,7 @@ public class AdminSetConfigStmtTest extends TestWithFeService {
     public void testTabletHealthHostSetCapacityDynamicConfig() throws Exception {
         int originalValue = Config.tablet_health_check_host_set_initial_capacity;
         try {
-            for (int capacity : new int[] {4, 6, 8, 16}) {
+            for (int capacity : new int[] {1, 4, 6, 8, 16}) {
                 AdminSetConfigStmt statement = (AdminSetConfigStmt) parseAndAnalyzeStmt(
                         "admin set frontend config(\"tablet_health_check_host_set_initial_capacity\" = \""
                                 + capacity + "\");");
@@ -58,7 +58,7 @@ public class AdminSetConfigStmtTest extends TestWithFeService {
         int originalValue = Config.tablet_health_check_host_set_initial_capacity;
         try {
             Config.tablet_health_check_host_set_initial_capacity = 8;
-            for (String value : new String[] {"0", "-1", "invalid", "2147483648"}) {
+            for (String value : new String[] {"0", "-1", "17", "2147483647", "invalid", "2147483648"}) {
                 AdminSetConfigStmt statement = (AdminSetConfigStmt) parseAndAnalyzeStmt(
                         "admin set frontend config(\"tablet_health_check_host_set_initial_capacity\" = \""
                                 + value + "\");");
