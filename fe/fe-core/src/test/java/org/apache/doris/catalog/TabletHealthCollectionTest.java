@@ -35,6 +35,8 @@ import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.util.Set;
+
 public class TabletHealthCollectionTest {
     @Mocked
     private Env env;
@@ -46,6 +48,7 @@ public class TabletHealthCollectionTest {
     private boolean savedRepairSlowReplica;
     private String savedDeployMode;
     private String savedCloudUniqueId;
+    private int savedHostSetInitialCapacity;
 
     @Before
     public void setUp() {
@@ -54,6 +57,7 @@ public class TabletHealthCollectionTest {
         savedRepairSlowReplica = Config.repair_slow_replica;
         savedDeployMode = Config.deploy_mode;
         savedCloudUniqueId = Config.cloud_unique_id;
+        savedHostSetInitialCapacity = Config.tablet_health_check_host_set_initial_capacity;
         Config.allow_replica_on_same_host = false;
         FeConstants.runningUnitTest = false;
         Config.repair_slow_replica = false;
@@ -77,6 +81,7 @@ public class TabletHealthCollectionTest {
         Config.repair_slow_replica = savedRepairSlowReplica;
         Config.deploy_mode = savedDeployMode;
         Config.cloud_unique_id = savedCloudUniqueId;
+        Config.tablet_health_check_host_set_initial_capacity = savedHostSetInitialCapacity;
     }
 
     @Test
@@ -157,6 +162,46 @@ public class TabletHealthCollectionTest {
     @Test
     public void testEmptyTablet() {
         assertHealth(new ReplicaAllocation((short) 3), Tablet.TabletStatus.UNRECOVERABLE, Priority.NORMAL, 0);
+    }
+
+    @Test
+    public void testHostSetCapacityCanChangeAndGrow() {
+        Set<Long> backendIds = Sets.newHashSet();
+        for (long id = 1L; id <= 7L; id++) {
+            addReplica(id, "127.0.0." + id, "default");
+            backendIds.add(id);
+        }
+        ReplicaAllocation allocation = new ReplicaAllocation((short) 7);
+        for (int capacity : new int[] {4, 8, 16, 6, 1}) {
+            Config.tablet_health_check_host_set_initial_capacity = capacity;
+            assertHealth(allocation, Tablet.TabletStatus.HEALTHY, Priority.NORMAL, 7);
+            Tablet.TabletHealth health = tablet.getColocateHealth(100L, allocation, backendIds);
+            Assert.assertEquals(Tablet.TabletStatus.HEALTHY, health.status);
+            Assert.assertEquals(7, health.aliveAndVersionCompleteNum);
+        }
+    }
+
+    @Test
+    public void testSparseReplicasWithConfiguredHostSetCapacity() {
+        for (long id = 1L; id <= 1000L; id++) {
+            addReplica(id, "127.0." + id / 256 + "." + id % 256, "default");
+            infoService.getBackend(id).setAlive(id == 1L);
+        }
+        ReplicaAllocation allocation = new ReplicaAllocation((short) 3);
+        Config.tablet_health_check_host_set_initial_capacity = 16;
+        Tablet.TabletHealth expected = tablet.getHealth(infoService, 100L, allocation,
+                infoService.getAllBackendIds(true));
+        Tablet.TabletHealth expectedColocate = tablet.getColocateHealth(100L, allocation,
+                Sets.newHashSet(1L, 2L, 3L));
+        for (int capacity : new int[] {4, 8}) {
+            Config.tablet_health_check_host_set_initial_capacity = capacity;
+            assertHealth(allocation, expected.status, expected.priority, expected.aliveAndVersionCompleteNum);
+            Tablet.TabletHealth health = tablet.getColocateHealth(100L, allocation,
+                    Sets.newHashSet(1L, 2L, 3L));
+            Assert.assertEquals(expectedColocate.status, health.status);
+            Assert.assertEquals(expectedColocate.priority, health.priority);
+            Assert.assertEquals(expectedColocate.aliveAndVersionCompleteNum, health.aliveAndVersionCompleteNum);
+        }
     }
 
     private void addReplica(long backendId, String host, String zone) {

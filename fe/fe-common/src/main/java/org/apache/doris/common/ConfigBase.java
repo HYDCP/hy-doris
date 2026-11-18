@@ -52,6 +52,12 @@ public class ConfigBase {
 
         boolean masterOnly() default false;
 
+        // Inclusive lower bound for int-valued configurations.
+        int minValue() default Integer.MIN_VALUE;
+
+        // Inclusive upper bound for int-valued configurations.
+        int maxValue() default Integer.MAX_VALUE;
+
         String comment() default "";
 
         VariableAnnotation varType() default VariableAnnotation.NONE;
@@ -267,7 +273,13 @@ public class ConfigBase {
                 f.setShort(null, Short.parseShort(confVal));
                 break;
             case "int":
-                f.setInt(null, Integer.parseInt(confVal));
+                int intValue = Integer.parseInt(confVal);
+                ConfField bounds = f.getAnnotation(ConfField.class);
+                if (intValue < bounds.minValue() || intValue > bounds.maxValue()) {
+                    throw new IllegalArgumentException("Config '" + f.getName() + "' must be between "
+                            + bounds.minValue() + " and " + bounds.maxValue() + " (inclusive)");
+                }
+                f.setInt(null, intValue);
                 break;
             case "long":
                 f.setLong(null, Long.parseLong(confVal));
