@@ -47,6 +47,7 @@ import java.io.DataInput;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -589,7 +590,7 @@ public class Tablet extends MetaObject {
 
         Replica needFurtherRepairReplica = null;
         boolean hasAliveAndVersionIncomplete = false;
-        Set<String> hosts = Sets.newHashSetWithExpectedSize(replicas.size());
+        Set<String> hosts = new HashSet<>(Config.tablet_health_check_host_set_initial_capacity);
         long minVersionCount = Long.MAX_VALUE;
         long maxVersionCount = Long.MIN_VALUE;
         for (Replica replica : replicas) {
@@ -806,7 +807,7 @@ public class Tablet extends MetaObject {
         short replicationNum = replicaAlloc.getTotalReplicaNum();
         boolean hasAliveAndVersionIncomplete = false;
         int aliveAndVersionComplete = 0;
-        Set<String> hosts = Sets.newHashSetWithExpectedSize(replicas.size());
+        Set<String> hosts = new HashSet<>(Config.tablet_health_check_host_set_initial_capacity);
         for (Replica replica : replicas) {
             Backend backend = systemInfoService.getBackend(replica.getBackendIdWithoutException());
             if (!isReplicaAndBackendAlive(replica, backend, hosts)) {

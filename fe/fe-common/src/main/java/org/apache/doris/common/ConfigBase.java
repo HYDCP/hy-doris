@@ -52,6 +52,9 @@ public class ConfigBase {
 
         boolean masterOnly() default false;
 
+        // Inclusive lower bound for int-valued configurations.
+        int minValue() default Integer.MIN_VALUE;
+
         String comment() default "";
 
         VariableAnnotation varType() default VariableAnnotation.NONE;
@@ -267,7 +270,12 @@ public class ConfigBase {
                 f.setShort(null, Short.parseShort(confVal));
                 break;
             case "int":
-                f.setInt(null, Integer.parseInt(confVal));
+                int intValue = Integer.parseInt(confVal);
+                int minValue = f.getAnnotation(ConfField.class).minValue();
+                if (intValue < minValue) {
+                    throw new IllegalArgumentException("Config '" + f.getName() + "' must be >= " + minValue);
+                }
+                f.setInt(null, intValue);
                 break;
             case "long":
                 f.setLong(null, Long.parseLong(confVal));

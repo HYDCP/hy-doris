@@ -36,6 +36,41 @@ import java.util.List;
 
 public class AdminSetConfigStmtTest extends TestWithFeService {
     @Test
+    public void testTabletHealthHostSetCapacityDynamicConfig() throws Exception {
+        int originalValue = Config.tablet_health_check_host_set_initial_capacity;
+        try {
+            for (int capacity : new int[] {4, 6, 8, 16}) {
+                AdminSetConfigStmt statement = (AdminSetConfigStmt) parseAndAnalyzeStmt(
+                        "admin set frontend config(\"tablet_health_check_host_set_initial_capacity\" = \""
+                                + capacity + "\");");
+                Assertions.assertTrue(ConfigBase.checkIsMasterOnly("tablet_health_check_host_set_initial_capacity"));
+                Assertions.assertEquals(RedirectStatus.FORWARD_NO_SYNC, statement.getRedirectStatus());
+                Env.getCurrentEnv().setConfig(statement, false);
+                Assertions.assertEquals(capacity, Config.tablet_health_check_host_set_initial_capacity);
+            }
+        } finally {
+            Config.tablet_health_check_host_set_initial_capacity = originalValue;
+        }
+    }
+
+    @Test
+    public void testTabletHealthHostSetCapacityRejectsInvalidConfig() throws Exception {
+        int originalValue = Config.tablet_health_check_host_set_initial_capacity;
+        try {
+            Config.tablet_health_check_host_set_initial_capacity = 8;
+            for (String value : new String[] {"0", "-1", "invalid", "2147483648"}) {
+                AdminSetConfigStmt statement = (AdminSetConfigStmt) parseAndAnalyzeStmt(
+                        "admin set frontend config(\"tablet_health_check_host_set_initial_capacity\" = \""
+                                + value + "\");");
+                Assertions.assertThrows(DdlException.class, () -> Env.getCurrentEnv().setConfig(statement, false));
+                Assertions.assertEquals(8, Config.tablet_health_check_host_set_initial_capacity);
+            }
+        } finally {
+            Config.tablet_health_check_host_set_initial_capacity = originalValue;
+        }
+    }
+
+    @Test
     public void testNormal() throws Exception {
         String stmt = "admin set frontend config(\"alter_table_timeout_second\" = \"60\");";
         AdminSetConfigStmt adminSetConfigStmt = (AdminSetConfigStmt) parseAndAnalyzeStmt(stmt);
