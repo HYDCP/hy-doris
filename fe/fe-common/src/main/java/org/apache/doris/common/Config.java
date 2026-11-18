@@ -1092,7 +1092,7 @@ public class Config extends ConfigBase {
                     + "Valid range is 1 to 16 inclusive. The JDK rounds up to a power of two and grows the set "
                     + "at a load factor of 0.75. Dynamic changes apply to subsequent health checks."
     })
-    public static volatile int tablet_health_check_host_set_initial_capacity = 4;
+    public static volatile int tablet_health_check_host_set_initial_capacity = 8;
 
     /**
      * tablet scheduled interval. Do not modify it in production environment.

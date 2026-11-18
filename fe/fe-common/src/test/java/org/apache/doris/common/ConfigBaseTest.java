@@ -70,7 +70,7 @@ public class ConfigBaseTest {
 
     @Test
     public void testHostSetCapacityDefaultAndMetadata() throws Exception {
-        Assert.assertEquals(4, Config.tablet_health_check_host_set_initial_capacity);
+        Assert.assertEquals(8, Config.tablet_health_check_host_set_initial_capacity);
         Field field = Config.class.getField(HOST_SET_CAPACITY);
         ConfigBase.ConfField annotation = field.getAnnotation(ConfigBase.ConfField.class);
         Assert.assertTrue(annotation.mutable());
