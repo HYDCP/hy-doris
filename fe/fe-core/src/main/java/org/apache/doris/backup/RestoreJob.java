@@ -224,6 +224,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
     private Map<Long, AgentBoundedBatchTask> batchTaskPerTable = new HashMap<>();
 
+    // Bounded batch tasks register tasks to AgentTaskQueue asynchronously, they must be cancelled
+    // before cleaning up AgentTaskQueue when this job is cancelled. Only the batch tasks which are
+    // not stopped yet are kept here.
+    private List<AgentBoundedBatchTask> submittedBatchTasks = Lists.newArrayList();
+
     private MarkedCountDownLatch<Long, Long> createReplicaTasksLatch = null;
 
     public RestoreJob() {
@@ -297,6 +302,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     public synchronized boolean finishTabletSnapshotTask(SnapshotTask task, TFinishTaskRequest request) {
+        if (isLateTaskOfDoneJob(task, request)) {
+            return true;
+        }
         if (checkTaskStatus(task, task.getJobId(), request)) {
             return false;
         }
@@ -329,6 +337,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
 
     public synchronized boolean finishTabletDownloadTask(DownloadTask task, TFinishTaskRequest request) {
+        if (isLateTaskOfDoneJob(task, request)) {
+            return true;
+        }
         if (checkTaskStatus(task, task.getJobId(), request)) {
             return false;
         }
@@ -356,6 +367,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     public synchronized boolean finishDirMoveTask(DirMoveTask task, TFinishTaskRequest request) {
+        if (isLateTaskOfDoneJob(task, request)) {
+            return true;
+        }
         if (checkTaskStatus(task, task.getJobId(), request)) {
             return false;
         }
@@ -368,6 +382,31 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
 
         taskErrMsg.remove(task.getSignature());
+        return true;
+    }
+
+    private void submitBatchTask(AgentBoundedBatchTask batchTask) {
+        releaseStoppedBatchTasks();
+        submittedBatchTasks.add(batchTask);
+        AgentTaskExecutor.submit(batchTask);
+    }
+
+    // Only keep the batch tasks which may still register tasks, release the stopped ones (e.g. those of the
+    // previous phases) so that their tasks can be garbage collected. A batch task may stop after the job
+    // has moved to the next phase, so this is also done in every run() of the job.
+    private void releaseStoppedBatchTasks() {
+        submittedBatchTasks.removeIf(AgentBoundedBatchTask::isStopped);
+    }
+
+    // A finished or cancelled job no longer waits for any task, but its tasks may still be reported,
+    // e.g. tasks that were registered to AgentTaskQueue after the job was cancelled. Such a task must be
+    // removed from AgentTaskQueue, otherwise ReportHandler keeps resending it to BE forever.
+    private boolean isLateTaskOfDoneJob(AgentTask task, TFinishTaskRequest request) {
+        if (!isDone()) {
+            return false;
+        }
+        LOG.info("remove late {} task {} of done restore job, task status: {}. {}", task.getTaskType(),
+                task.getSignature(), request.getTaskStatus().getStatusCode(), this);
         return true;
     }
 
@@ -444,6 +483,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         if (state == RestoreJobState.FINISHED || state == RestoreJobState.CANCELLED) {
             return;
         }
+
+        releaseStoppedBatchTasks();
 
         if (System.currentTimeMillis() - createTime > timeoutMs) {
             status = new Status(ErrCode.TIMEOUT, "restore job with label: " + label + "  timeout.");
@@ -1025,12 +1066,12 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         if (numBatchTasks > 0) {
             LOG.info("begin to send create replica tasks to BE for restore. total {} tasks. {}",
                     numBatchTasks, this);
-            for (AgentBatchTask batchTask : batchTaskPerTable.values()) {
+            for (AgentBoundedBatchTask batchTask : batchTaskPerTable.values()) {
                 for (AgentTask task : batchTask.getAllTasks()) {
                     createReplicaTasksLatch.addMark(task.getBackendId(), task.getTabletId());
                     ((CreateReplicaTask) task).setLatch(createReplicaTasksLatch);
                 }
-                AgentTaskExecutor.submit(batchTask);
+                submitBatchTask(batchTask);
             }
         }
 
@@ -1292,7 +1333,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             return;
         }
 
-        AgentTaskExecutor.submit(batchTask);
+        submitBatchTask(batchTask);
         LOG.info("finished to send snapshot tasks, num: {}. {}", batchTask.getTaskNum(), this);
     }
 
@@ -1837,7 +1878,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             }
         }
 
-        AgentTaskExecutor.submit(batchTask);
+        submitBatchTask(batchTask);
 
         state = RestoreJobState.DOWNLOADING;
 
@@ -1962,7 +2003,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             }
         }
 
-        AgentTaskExecutor.submit(batchTask);
+        submitBatchTask(batchTask);
 
         state = RestoreJobState.DOWNLOADING;
 
@@ -2054,7 +2095,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             unfinishedSignatureToId.put(signature, info.getTabletId());
         }
 
-        AgentTaskExecutor.submit(batchTask);
+        submitBatchTask(batchTask);
 
         state = RestoreJobState.COMMITTING;
 
@@ -2152,6 +2193,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             snapshotInfos.clear();
             fileMapping.clear();
             jobInfo.releaseSnapshotInfo();
+
+            // All tasks of the batch tasks are finished, release them.
+            submittedBatchTasks.clear();
 
             finishedTime = System.currentTimeMillis();
             state = RestoreJobState.FINISHED;
@@ -2328,6 +2372,13 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     private void cancelInternal(boolean isReplay) {
         // We need to clean the residual due to current state
         if (!isReplay) {
+            // Stop the batch tasks first, so that no task is registered to AgentTaskQueue after it is cleaned up.
+            for (AgentBoundedBatchTask batchTask : submittedBatchTasks) {
+                batchTask.cancel();
+            }
+            submittedBatchTasks.clear();
+            // The create replica tasks are not submitted yet if the job is cancelled before doCreateReplicas().
+            batchTaskPerTable.clear();
             switch (state) {
                 case SNAPSHOTING:
                     // remove all snapshot tasks in AgentTaskQueue

@@ -52,6 +52,10 @@ public class AgentBoundedBatchTask extends AgentBatchTask {
     private int taskConcurrency;
     private Map<Long, Integer> backendIdToConsumedTaskIndex;
     private int beUnavailableMaxLostTimeSecond;
+    // guarded by this
+    private boolean cancelled = false;
+    // guarded by this, true once run() returns, no task is registered after that
+    private boolean stopped = false;
 
     /**
      * NOTE:
@@ -84,13 +88,47 @@ public class AgentBoundedBatchTask extends AgentBatchTask {
         }
     }
 
+    /**
+     * Stop registering tasks to AgentTaskQueue. A task registered before this method returns stays in
+     * AgentTaskQueue, so the caller must remove the registered tasks after calling this method, and no task
+     * will be registered after that.
+     */
+    public synchronized void cancel() {
+        cancelled = true;
+    }
+
+    private synchronized boolean isCancelled() {
+        return cancelled;
+    }
+
+    /**
+     * Whether run() has returned. A stopped batch task never registers any task to AgentTaskQueue again,
+     * so the owner job no longer needs to cancel it and can release it.
+     */
+    public synchronized boolean isStopped() {
+        return stopped;
+    }
+
     @Override
     public void run() {
+        try {
+            submitAllTasks();
+        } finally {
+            synchronized (this) {
+                stopped = true;
+            }
+        }
+    }
+
+    private void submitAllTasks() {
         int taskNum = getTaskNum();
         LOG.info("begin to submit tasks to BE. total {} tasks, be task concurrency: {}", taskNum, taskConcurrency);
         boolean submitFinished = false;
-        while (getSubmitTaskNum() < taskNum && !submitFinished) {
+        while (getSubmitTaskNum() < taskNum && !submitFinished && !isCancelled()) {
             for (Long backendId : backendIdToTasks.keySet()) {
+                if (isCancelled()) {
+                    break;
+                }
                 int consumedTaskIndex = backendIdToConsumedTaskIndex.getOrDefault(backendId, 0);
                 if (consumedTaskIndex >= backendIdToTasks.get(backendId).size()) {
                     LOG.info("backend {} has submitted all tasks, taskNum: {}",
@@ -127,9 +165,15 @@ public class AgentBoundedBatchTask extends AgentBatchTask {
                     int index = consumedTaskIndex;
                     for (; index < tasks.size()
                             && index < consumedTaskIndex + taskConcurrency - runningTaskNum; index++) {
+                        // Check and register under the same lock as cancel(), so that no task is registered
+                        // after the owner job has cancelled this batch task and cleaned up AgentTaskQueue.
+                        synchronized (this) {
+                            if (cancelled) {
+                                break;
+                            }
+                            AgentTaskQueue.addTask(tasks.get(index));
+                        }
                         agentTaskRequests.add(toAgentTaskRequest(tasks.get(index)));
-                        // add to AgentTaskQueue
-                        AgentTaskQueue.addTask(tasks.get(index));
                         if (agentTaskRequests.size() >= batchSize) {
                             submitTasks(backend, agentTaskRequests);
                             agentTaskRequests.clear();
@@ -177,6 +221,10 @@ public class AgentBoundedBatchTask extends AgentBatchTask {
                 Thread.currentThread().interrupt();
                 break;
             }
+        }
+        if (isCancelled()) {
+            LOG.info("stop submitting tasks to BE because it is cancelled, submitted {}/{} tasks",
+                    getSubmitTaskNum(), taskNum);
         }
     }
 

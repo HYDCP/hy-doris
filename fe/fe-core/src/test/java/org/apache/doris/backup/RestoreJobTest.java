@@ -21,6 +21,7 @@ import org.apache.doris.backup.BackupJobInfo.BackupIndexInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupOlapTableInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupPartitionInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupTabletInfo;
+import org.apache.doris.backup.RestoreJob.RestoreJobState;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.HashDistributionInfo;
@@ -45,6 +46,13 @@ import org.apache.doris.fs.FileSystemFactory;
 import org.apache.doris.persist.EditLog;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.SystemInfoService;
+import org.apache.doris.task.AgentBoundedBatchTask;
+import org.apache.doris.task.DirMoveTask;
+import org.apache.doris.task.DownloadTask;
+import org.apache.doris.task.SnapshotTask;
+import org.apache.doris.thrift.TFinishTaskRequest;
+import org.apache.doris.thrift.TStatus;
+import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TStorageMedium;
 
 import com.google.common.collect.Lists;
@@ -338,6 +346,96 @@ public class RestoreJobTest {
         // 3. delete files
         in.close();
         Files.delete(path);
+    }
+
+    @Test
+    public void testLateTaskOfDoneJobIsRemoved() {
+        DownloadTask downloadTask = new DownloadTask(null, CatalogMocker.BACKEND1_ID, 1001L, job.getJobId(),
+                db.getId(), Lists.newArrayList());
+        SnapshotTask snapshotTask = new SnapshotTask(null, CatalogMocker.BACKEND1_ID, 1002L, job.getJobId(),
+                db.getId(), 0, 0, 0, 0, 0, 0, 1, true);
+        DirMoveTask dirMoveTask = new DirMoveTask(null, CatalogMocker.BACKEND1_ID, 1003L, job.getJobId(),
+                db.getId(), 0, 0, 0, 0, "", 0, true);
+
+        TFinishTaskRequest cancelled = new TFinishTaskRequest();
+        TStatus cancelledStatus = new TStatus(TStatusCode.CANCELLED);
+        cancelledStatus.setErrorMsgs(Lists.newArrayList("Cancelled"));
+        cancelled.setTaskStatus(cancelledStatus);
+        TFinishTaskRequest ok = new TFinishTaskRequest();
+        ok.setTaskStatus(new TStatus(TStatusCode.OK));
+
+        // a running job keeps its failed tasks in AgentTaskQueue, so ReportHandler can resend them
+        Deencapsulation.setField(job, "state", RestoreJobState.DOWNLOADING);
+        Assert.assertFalse(job.finishTabletDownloadTask(downloadTask, cancelled));
+        Assert.assertFalse(job.finishTabletSnapshotTask(snapshotTask, cancelled));
+        Assert.assertFalse(job.finishDirMoveTask(dirMoveTask, cancelled));
+
+        // a done job removes every late task from AgentTaskQueue, whatever the task status is
+        for (RestoreJobState doneState : new RestoreJobState[] {RestoreJobState.CANCELLED, RestoreJobState.FINISHED}) {
+            Deencapsulation.setField(job, "state", doneState);
+            for (TFinishTaskRequest request : new TFinishTaskRequest[] {cancelled, ok}) {
+                Assert.assertTrue(job.finishTabletDownloadTask(downloadTask, request));
+                Assert.assertTrue(job.finishTabletSnapshotTask(snapshotTask, request));
+                Assert.assertTrue(job.finishDirMoveTask(dirMoveTask, request));
+            }
+        }
+    }
+
+    @Test
+    public void testStoppedBatchTaskIsReleased() {
+        // a batch task without any task stops as soon as it runs
+        AgentBoundedBatchTask stoppedBatchTask = new AgentBoundedBatchTask(10, 1);
+        stoppedBatchTask.run();
+        AgentBoundedBatchTask runningBatchTask = new AgentBoundedBatchTask(10, 1);
+        List<AgentBoundedBatchTask> submittedBatchTasks = Deencapsulation.getField(job, "submittedBatchTasks");
+        submittedBatchTasks.add(stoppedBatchTask);
+        submittedBatchTasks.add(runningBatchTask);
+
+        // submitting the batch task of the next phase releases the stopped batch task of the previous phase
+        AgentBoundedBatchTask nextBatchTask = new AgentBoundedBatchTask(10, 1);
+        Deencapsulation.invoke(job, "submitBatchTask", nextBatchTask);
+        Assert.assertEquals(Lists.newArrayList(runningBatchTask, nextBatchTask), submittedBatchTasks);
+
+        // the create replica tasks which are not submitted yet
+        Map<Long, AgentBoundedBatchTask> batchTaskPerTable = Deencapsulation.getField(job, "batchTaskPerTable");
+        batchTaskPerTable.put(CatalogMocker.TEST_TBL2_ID, new AgentBoundedBatchTask(10, 1));
+
+        // cancelling the job still cancels the batch task which is not stopped, and releases all batch tasks
+        Assert.assertTrue(job.cancel().ok());
+        Assert.assertTrue(Deencapsulation.getField(runningBatchTask, "cancelled"));
+        Assert.assertTrue(submittedBatchTasks.isEmpty());
+        Assert.assertTrue(batchTaskPerTable.isEmpty());
+    }
+
+    @Test
+    public void testBatchTaskStoppedAfterNextPhaseIsReleasedByRun() {
+        AgentBoundedBatchTask previousBatchTask = new AgentBoundedBatchTask(10, 1);
+        AgentBoundedBatchTask currentBatchTask = new AgentBoundedBatchTask(10, 1);
+        List<AgentBoundedBatchTask> submittedBatchTasks = Deencapsulation.getField(job, "submittedBatchTasks");
+        submittedBatchTasks.add(previousBatchTask);
+        submittedBatchTasks.add(currentBatchTask);
+
+        // the job is waiting for the tasks of the current phase, and no batch task will be submitted any more
+        Deencapsulation.setField(job, "state", RestoreJobState.SNAPSHOTING);
+        Map<Long, Long> unfinishedSignatureToId = Deencapsulation.getField(job, "unfinishedSignatureToId");
+        unfinishedSignatureToId.put(1001L, 2001L);
+        Deencapsulation.setField(job, "repo", repo);
+
+        job.run();
+        Assert.assertEquals(Lists.newArrayList(previousBatchTask, currentBatchTask), submittedBatchTasks);
+
+        // the batch task of the previous phase stops after the job has moved to the current phase,
+        // the next run() of the job releases it
+        Deencapsulation.setField(previousBatchTask, "stopped", true);
+        job.run();
+        Assert.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+        Assert.assertEquals(Lists.newArrayList(currentBatchTask), submittedBatchTasks);
+
+        // cancelling the job still cancels the batch task which is not stopped
+        Assert.assertTrue(job.cancel().ok());
+        Assert.assertTrue(Deencapsulation.getField(currentBatchTask, "cancelled"));
+        Assert.assertFalse(Deencapsulation.getField(previousBatchTask, "cancelled"));
+        Assert.assertTrue(submittedBatchTasks.isEmpty());
     }
 
     @Test

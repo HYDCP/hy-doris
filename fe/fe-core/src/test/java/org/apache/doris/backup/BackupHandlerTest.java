@@ -320,6 +320,16 @@ public class BackupHandlerTest {
         // cancel restore
         handler.cancel(new CancelBackupStmt(CatalogMocker.TEST_DB_NAME, true));
 
+        // late tasks of the cancelled restore job must be removed from AgentTaskQueue
+        request = new TFinishTaskRequest();
+        TStatus cancelledStatus = new TStatus(TStatusCode.CANCELLED);
+        cancelledStatus.setErrorMsgs(Lists.newArrayList("Cancelled"));
+        request.setTaskStatus(cancelledStatus);
+        Assert.assertTrue(restoreJob.isCancelled());
+        Assert.assertTrue(handler.handleFinishedSnapshotTask(snapshotTask, request));
+        Assert.assertTrue(handler.handleDownloadSnapshotTask(downloadTask, request));
+        Assert.assertTrue(handler.handleDirMoveTask(dirMoveTask, request));
+
         // drop repo
         handler.dropRepository(new DropRepositoryStmt("repo"));
     }
