@@ -22,6 +22,7 @@ import org.apache.doris.common.io.DataOutputBuffer;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.persist.OperationType;
 
+import com.google.common.base.Preconditions;
 import lombok.Getter;
 
 import java.io.IOException;
@@ -54,6 +55,15 @@ public class JournalBatch {
         if (op == OperationType.OP_TIMESTAMP) {
             // OP_TIMESTAMP is not supported, see `BDBJEJournal.write` for details.
             throw new RuntimeException("JournalBatch.addJournal is not supported OP_TIMESTAMP");
+        }
+
+        if (data instanceof SerializedJournalEntity) {
+            SerializedJournalEntity serialized = (SerializedJournalEntity) data;
+            Preconditions.checkState(serialized.getOpCode() == op, "op %s of a journal serialized as op %s",
+                    op, serialized.getOpCode());
+            size += serialized.getBuffer().size();
+            entities.add(new Entity(op, serialized.getBuffer()));
+            return;
         }
 
         JournalEntity entity = new JournalEntity();

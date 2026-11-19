@@ -17,14 +17,60 @@
 
 package org.apache.doris.persist;
 
+import org.apache.doris.backup.BackupJob;
+import org.apache.doris.backup.BackupJobInfo;
+import org.apache.doris.backup.RestoreJob;
+import org.apache.doris.catalog.ReplicaAllocation;
+import org.apache.doris.common.Config;
+import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.io.DataOutputBuffer;
+import org.apache.doris.common.io.Writable;
+import org.apache.doris.journal.JournalBatch;
+import org.apache.doris.journal.JournalEntity;
+import org.apache.doris.journal.SerializedJournalEntity;
+import org.apache.doris.journal.bdbje.BDBJEJournal;
+import org.apache.doris.meta.MetaContext;
+
+import com.google.common.collect.Lists;
+import com.google.common.util.concurrent.Uninterruptibles;
+import mockit.Mock;
+import mockit.MockUp;
+import org.junit.Assert;
 import org.junit.Test;
 
+import java.io.ByteArrayInputStream;
+import java.io.DataInputStream;
+import java.io.DataOutput;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.ConcurrentModificationException;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 public class EditLogTest {
     private String meta = "editLogTestDir/";
+
+    /**
+     * Holds a job in the middle of its serialization until the test releases it.
+     */
+    private static class BlockingSerialization {
+        private final CountDownLatch started = new CountDownLatch(1);
+        private final CountDownLatch finish = new CountDownLatch(1);
+        private volatile Thread serializeThread;
+
+        void write(DataOutput out) throws IOException {
+            serializeThread = Thread.currentThread();
+            started.countDown();
+            Uninterruptibles.awaitUninterruptibly(finish);
+            out.writeInt(1);
+        }
+    }
 
     public void mkdir() {
         File dir = new File(meta);
@@ -101,5 +147,256 @@ public class EditLogTest {
     @Test
     public void test() {
 
+    }
+
+    private static byte[] journalBytes(Writable writable) throws IOException {
+        JournalBatch batch = new JournalBatch();
+        batch.addJournal(OperationType.OP_RESTORE_JOB, writable);
+        JournalBatch.Entity entity = batch.getJournalEntities().get(0);
+        return Arrays.copyOf(entity.getBinaryData(), entity.getBinaryDataLength());
+    }
+
+    @Test
+    public void testSerializedJournalEntityKeepsJournalBytes() throws IOException {
+        MetaContext metaContext = new MetaContext();
+        metaContext.setMetaVersion(FeConstants.meta_version);
+        metaContext.setThreadLocalInfo();
+
+        boolean originalCompression = Config.restore_job_compressed_serialization;
+        try {
+            for (boolean compression : new boolean[] {false, true}) {
+                Config.restore_job_compressed_serialization = compression;
+                RestoreJob job = new RestoreJob("test_label", "2026-11-09 00:00:00", 1L, "test_db", new BackupJobInfo(),
+                        false, new ReplicaAllocation((short) 3), 1000L, -1, false, false, false, false, false, false,
+                        false, null, 1L);
+
+                SerializedJournalEntity serialized =
+                        SerializedJournalEntity.serialize(OperationType.OP_RESTORE_JOB, job);
+                byte[] bytes = journalBytes(serialized);
+                Assert.assertArrayEquals(journalBytes(job), bytes);
+
+                // journal paths that write the op code themselves get the data only
+                DataOutputBuffer data = new DataOutputBuffer();
+                serialized.write(data);
+                Assert.assertArrayEquals(Arrays.copyOfRange(bytes, Short.BYTES, bytes.length),
+                        Arrays.copyOf(data.getData(), data.getLength()));
+
+                JournalEntity entity = new JournalEntity();
+                entity.readFields(new DataInputStream(new ByteArrayInputStream(bytes)));
+                Assert.assertEquals(OperationType.OP_RESTORE_JOB, entity.getOpCode());
+                Assert.assertEquals("test_label", ((RestoreJob) entity.getData()).getLabel());
+            }
+        } finally {
+            Config.restore_job_compressed_serialization = originalCompression;
+            MetaContext.remove();
+        }
+    }
+
+    private EditLog newEditLog(List<Short> writtenOps) {
+        new MockUp<BDBJEJournal>() {
+            @Mock
+            public void $init(String nodeName) { // CHECKSTYLE IGNORE THIS LINE
+            }
+
+            @Mock
+            public long write(JournalBatch batch) {
+                batch.getJournalEntities().forEach(entity -> writtenOps.add(entity.getOpCode()));
+                return writtenOps.size();
+            }
+
+            @Mock
+            public long write(short op, Writable writable) throws IOException {
+                writable.write(new DataOutputBuffer());
+                writtenOps.add(op);
+                return writtenOps.size();
+            }
+        };
+
+        String originalEditLogType = Config.edit_log_type;
+        Config.edit_log_type = "bdb";
+        try {
+            return new EditLog("test_node");
+        } finally {
+            Config.edit_log_type = originalEditLogType;
+        }
+    }
+
+    private void checkSerializationDoesNotBlockOtherJournals(short jobOp, BlockingSerialization serialization,
+            Consumer<EditLog> logJob) throws Exception {
+        List<Short> writtenOps = Collections.synchronizedList(Lists.newArrayList());
+        EditLog editLog = newEditLog(writtenOps);
+        Thread submitter = new Thread(() -> logJob.accept(editLog));
+        submitter.setDaemon(true);
+        submitter.start();
+        try {
+            Assert.assertTrue(serialization.started.await(30, TimeUnit.SECONDS));
+
+            // the flusher is free while the job is being serialized, so another journal can still be written
+            CountDownLatch otherJournalWritten = new CountDownLatch(1);
+            Thread otherWriter = new Thread(() -> {
+                editLog.logSaveNextId(1L);
+                otherJournalWritten.countDown();
+            });
+            otherWriter.setDaemon(true);
+            otherWriter.start();
+            Assert.assertTrue(otherJournalWritten.await(30, TimeUnit.SECONDS));
+            Assert.assertEquals(Lists.newArrayList(OperationType.OP_SAVE_NEXTID), writtenOps);
+        } finally {
+            serialization.finish.countDown();
+        }
+
+        submitter.join(30000);
+        Assert.assertFalse(submitter.isAlive());
+        Assert.assertSame(submitter, serialization.serializeThread);
+        Assert.assertEquals(Lists.newArrayList(OperationType.OP_SAVE_NEXTID, jobOp), writtenOps);
+    }
+
+    private void checkDoneJobIsSerializedByFlusher(short jobOp, AtomicReference<Thread> serializeThread,
+            Consumer<EditLog> logJob) {
+        List<Short> writtenOps = Collections.synchronizedList(Lists.newArrayList());
+        logJob.accept(newEditLog(writtenOps));
+        Assert.assertEquals("EditLog-Flusher", serializeThread.get().getName());
+        Assert.assertEquals(Lists.newArrayList(jobOp), writtenOps);
+    }
+
+    @Test
+    public void testDoneRestoreJobIsSerializedByFlusher() {
+        AtomicReference<Thread> serializeThread = new AtomicReference<>();
+        RestoreJob job = new RestoreJob() {
+            @Override
+            public boolean isDone() {
+                return true;
+            }
+
+            @Override
+            public void write(DataOutput out) {
+                serializeThread.set(Thread.currentThread());
+            }
+        };
+        checkDoneJobIsSerializedByFlusher(OperationType.OP_RESTORE_JOB, serializeThread,
+                editLog -> editLog.logRestoreJob(job));
+    }
+
+    @Test
+    public void testRestoreJobChangedWhileSerializedIsSerializedByFlusher() {
+        List<Thread> serializeThreads = Collections.synchronizedList(Lists.newArrayList());
+        RestoreJob job = new RestoreJob() {
+            @Override
+            public void write(DataOutput out) {
+                serializeThreads.add(Thread.currentThread());
+                // what another thread changing the job in the middle of the serialization causes
+                if (serializeThreads.size() == 1) {
+                    throw new ConcurrentModificationException();
+                }
+            }
+        };
+        List<Short> writtenOps = Collections.synchronizedList(Lists.newArrayList());
+        newEditLog(writtenOps).logRestoreJob(job);
+        Assert.assertEquals(2, serializeThreads.size());
+        Assert.assertSame(Thread.currentThread(), serializeThreads.get(0));
+        Assert.assertEquals("EditLog-Flusher", serializeThreads.get(1).getName());
+        Assert.assertEquals(Lists.newArrayList(OperationType.OP_RESTORE_JOB), writtenOps);
+    }
+
+    @Test
+    public void testDoneBackupJobIsSerializedByFlusher() {
+        AtomicReference<Thread> serializeThread = new AtomicReference<>();
+        BackupJob job = new BackupJob() {
+            @Override
+            public boolean isDone() {
+                return true;
+            }
+
+            @Override
+            public void write(DataOutput out) {
+                serializeThread.set(Thread.currentThread());
+            }
+        };
+        checkDoneJobIsSerializedByFlusher(OperationType.OP_BACKUP_JOB, serializeThread,
+                editLog -> editLog.logBackupJob(job));
+    }
+
+    @Test
+    public void testSerializingRestoreJobDoesNotBlockOtherJournals() throws Exception {
+        BlockingSerialization serialization = new BlockingSerialization();
+        RestoreJob job = new RestoreJob() {
+            @Override
+            public void write(DataOutput out) throws IOException {
+                serialization.write(out);
+            }
+        };
+        checkSerializationDoesNotBlockOtherJournals(OperationType.OP_RESTORE_JOB, serialization,
+                editLog -> editLog.logRestoreJob(job));
+    }
+
+    @Test
+    public void testSerializingBackupJobDoesNotBlockOtherJournals() throws Exception {
+        BlockingSerialization serialization = new BlockingSerialization();
+        BackupJob job = new BackupJob() {
+            @Override
+            public void write(DataOutput out) throws IOException {
+                serialization.write(out);
+            }
+        };
+        checkSerializationDoesNotBlockOtherJournals(OperationType.OP_BACKUP_JOB, serialization,
+                editLog -> editLog.logBackupJob(job));
+    }
+
+    @Test
+    public void testSerializedJournalEntityMustBeAddedWithItsOp() {
+        SerializedJournalEntity serialized = SerializedJournalEntity.serialize(OperationType.OP_SAVE_NEXTID,
+                out -> out.writeLong(1L));
+        Assert.assertThrows(IllegalStateException.class,
+                () -> new JournalBatch().addJournal(OperationType.OP_RESTORE_JOB, serialized));
+    }
+
+    // A restore job that is not serialized by the caller: it is serialized where the journal is written.
+    private List<String> logRestoreJobAndRecordOrder(boolean batchEditLog) throws Exception {
+        List<String> events = Collections.synchronizedList(Lists.newArrayList());
+        CountDownLatch queued = new CountDownLatch(1);
+        Writable job = out -> {
+            // with the flusher, the journal has its place in the log before it is serialized
+            if (batchEditLog) {
+                Uninterruptibles.awaitUninterruptibly(queued, 30, TimeUnit.SECONDS);
+            }
+            events.add("serialized by " + Thread.currentThread().getName());
+        };
+
+        boolean originalBatchEditLog = Config.enable_batch_editlog;
+        Config.enable_batch_editlog = batchEditLog;
+        try {
+            EditLog editLog = newEditLog(Collections.synchronizedList(Lists.newArrayList()));
+            Thread submitter = new Thread(() -> editLog.logRestoreJob(job, () -> {
+                events.add("queued by " + Thread.currentThread().getName());
+                queued.countDown();
+            }), "submitter");
+            submitter.setDaemon(true);
+            submitter.start();
+            submitter.join(60000);
+            Assert.assertFalse(submitter.isAlive());
+        } finally {
+            Config.enable_batch_editlog = originalBatchEditLog;
+        }
+        return events;
+    }
+
+    @Test
+    public void testRestoreJobIsQueuedBeforeFlusherWritesIt() throws Exception {
+        Assert.assertEquals(Lists.newArrayList("queued by submitter", "serialized by EditLog-Flusher"),
+                logRestoreJobAndRecordOrder(true));
+    }
+
+    @Test
+    public void testRestoreJobHasItsPlaceOnceWrittenWithoutFlusher() throws Exception {
+        Assert.assertEquals(Lists.newArrayList("serialized by submitter", "queued by submitter"),
+                logRestoreJobAndRecordOrder(false));
+    }
+
+    @Test
+    public void testSerializedRestoreJobMustBeARestoreJobJournal() {
+        SerializedJournalEntity serialized = SerializedJournalEntity.serialize(OperationType.OP_BACKUP_JOB,
+                out -> out.writeLong(1L));
+        EditLog editLog = newEditLog(Collections.synchronizedList(Lists.newArrayList()));
+        Assert.assertThrows(IllegalStateException.class, () -> editLog.logRestoreJob(serialized, () -> { }));
     }
 }
