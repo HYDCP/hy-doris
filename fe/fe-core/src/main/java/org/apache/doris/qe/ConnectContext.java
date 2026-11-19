@@ -38,7 +38,6 @@ import org.apache.doris.cloud.qe.ComputeGroupException;
 import org.apache.doris.cloud.system.CloudSystemInfoService;
 import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.Config;
-import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
@@ -79,6 +78,7 @@ import org.apache.doris.transaction.TransactionEntry;
 import org.apache.doris.transaction.TransactionStatus;
 
 import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
@@ -250,7 +250,7 @@ public class ConnectContext {
     // unique session id in the doris cluster, added in #40680
     private String sessionId = "";
 
-    private Map<String, Set<String>> dbToTempTableNamesMap = new HashMap<>();
+    private final Map<String, Set<String>> dbToTempTableNamesMap = new HashMap<>();
 
     // internal call like `insert overwrite` need skipAuth
     // For example, `insert overwrite` only requires load permission,
@@ -903,16 +903,21 @@ public class ConnectContext {
             return;
         }
 
+        ImmutableListMultimap<String, String> tempTables = snapshotTempTables();
+        if (tempTables.isEmpty()) {
+            return;
+        }
+
         // if current fe is master, delete temporary table directly
         if (Env.getCurrentEnv().isMaster()) {
-            for (String dbName : dbToTempTableNamesMap.keySet()) {
-                Database db = Env.getCurrentEnv().getInternalCatalog().getDb(dbName).get();
-                for (String tableName : dbToTempTableNamesMap.get(dbName)) {
+            InternalCatalog catalog = Env.getCurrentEnv().getInternalCatalog();
+            for (String dbName : tempTables.keySet()) {
+                for (String tableName : tempTables.get(dbName)) {
                     LOG.info("try to drop temporary table: {}.{}", dbName, tableName);
                     try {
-                        Env.getCurrentEnv().getInternalCatalog()
-                            .dropTableWithoutCheck(db, db.getTable(tableName).get(), false, true);
-                    } catch (DdlException e) {
+                        Database db = catalog.getDb(dbName).get();
+                        catalog.dropTableWithoutCheck(db, db.getTable(tableName).get(), false, true);
+                    } catch (Exception e) {
                         LOG.error("drop temporary table error: {}.{}", dbName, tableName, e);
                     }
                 }
@@ -920,8 +925,8 @@ public class ConnectContext {
         } else {
             // forward to master fe to drop table
             RedirectStatus redirectStatus = new RedirectStatus(true, false);
-            for (String dbName : dbToTempTableNamesMap.keySet()) {
-                for (String tableName : dbToTempTableNamesMap.get(dbName)) {
+            for (String dbName : tempTables.keySet()) {
+                for (String tableName : tempTables.get(dbName)) {
                     LOG.info("request to delete temporary table: {}.{}", dbName, tableName);
                     String dropTableSql = String.format("drop table `%s`.`%s`", dbName, tableName);
                     OriginStatement originStmt = new OriginStatement(dropTableSql, 0);
@@ -1615,7 +1620,17 @@ public class ConnectContext {
         return dbToTempTableNamesMap;
     }
 
-    public void addTempTableToDB(String database, String tableName) {
+    // A connection can be killed from another thread. Copy the names before any DROP or RPC.
+    private synchronized ImmutableListMultimap<String, String> snapshotTempTables() {
+        if (dbToTempTableNamesMap.isEmpty()) {
+            return ImmutableListMultimap.of();
+        }
+        ImmutableListMultimap.Builder<String, String> snapshot = ImmutableListMultimap.builder();
+        dbToTempTableNamesMap.forEach(snapshot::putAll);
+        return snapshot.build();
+    }
+
+    public synchronized void addTempTableToDB(String database, String tableName) {
         Set<String> tableNameSet = dbToTempTableNamesMap.get(database);
         if (tableNameSet == null) {
             tableNameSet = new HashSet<>();
@@ -1625,7 +1640,7 @@ public class ConnectContext {
         tableNameSet.add(tableName);
     }
 
-    public void removeTempTableFromDB(String database, String tableName) {
+    public synchronized void removeTempTableFromDB(String database, String tableName) {
         Set<String> tableNameSet = dbToTempTableNamesMap.get(database);
         if (tableNameSet != null) {
             tableNameSet.remove(tableName);
