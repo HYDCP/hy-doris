@@ -1805,7 +1805,8 @@ public:
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
                         size_t result, size_t input_rows_count) const override {
         auto res_column = ColumnString::create();
-        ColumnPtr argument_column = block.get_by_position(arguments[0]).column;
+        ColumnPtr argument_column =
+                block.get_by_position(arguments[0]).column->convert_to_full_column_if_const();
         ColumnPtr argument_column_2;
         bool is_const;
         std::tie(argument_column_2, is_const) =
@@ -2697,9 +2698,8 @@ public:
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
                         size_t result, size_t input_rows_count) const override {
-        DCHECK(!is_column_const(*block.get_by_position(arguments[0]).column));
-
-        ColumnPtr str_col = block.get_by_position(arguments[0]).column;
+        ColumnPtr str_col =
+                block.get_by_position(arguments[0]).column->convert_to_full_column_if_const();
         auto& data = assert_cast<const ColumnString*>(str_col.get())->get_chars();
         auto& offset = assert_cast<const ColumnString*>(str_col.get())->get_offsets();
 
