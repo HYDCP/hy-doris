@@ -156,7 +156,7 @@ public class ThriftServer {
         }
 
         TThreadPoolServer.Args serverArgs = new TThreadPoolServer.Args(new ImprovedTServerSocket(socketTransportArgs))
-                .protocolFactory(new TBinaryProtocol.Factory())
+                .protocolFactory(new CachedTBinaryProtocol.Factory())
                 .processor(processor);
         ThreadPoolExecutor threadPoolExecutor = ThreadPoolManager.newDaemonCacheThreadPool(
                 Config.thrift_server_max_worker_threads, "thrift-server-pool", true);
