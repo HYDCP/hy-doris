@@ -20,18 +20,22 @@ package org.apache.doris.service;
 
 import org.apache.doris.analysis.CreateDbStmt;
 import org.apache.doris.analysis.CreateTableStmt;
+import org.apache.doris.analysis.ShowTableStatusStmt;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
+import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.ConfigBase;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.jmockit.Deencapsulation;
+import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.ha.FrontendNodeType;
 import org.apache.doris.ha.MasterInfo;
 import org.apache.doris.insertoverwrite.InsertOverwriteManager;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.ShowExecutor;
 import org.apache.doris.qe.ShowResultSet;
 import org.apache.doris.tablefunction.BackendsTableValuedFunction;
 import org.apache.doris.thrift.TBackendsMetadataParams;
@@ -52,6 +56,8 @@ import org.apache.doris.thrift.TGetMasterTokenRequest;
 import org.apache.doris.thrift.TGetMasterTokenResult;
 import org.apache.doris.thrift.TGetSnapshotRequest;
 import org.apache.doris.thrift.TGetSnapshotResult;
+import org.apache.doris.thrift.TGetTablesParams;
+import org.apache.doris.thrift.TListTableStatusResult;
 import org.apache.doris.thrift.TLockBinlogRequest;
 import org.apache.doris.thrift.TLockBinlogResult;
 import org.apache.doris.thrift.TMetadataTableRequestParams;
@@ -68,8 +74,10 @@ import org.apache.doris.thrift.TSchemaTableName;
 import org.apache.doris.thrift.TShowUserRequest;
 import org.apache.doris.thrift.TShowUserResult;
 import org.apache.doris.thrift.TStatusCode;
+import org.apache.doris.thrift.TTableStatus;
 import org.apache.doris.utframe.UtFrameUtils;
 
+import com.google.common.collect.Sets;
 import mockit.Mocked;
 import org.junit.AfterClass;
 import org.junit.Assert;
@@ -77,9 +85,11 @@ import org.junit.BeforeClass;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
+import org.mockito.Mockito;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.UUID;
@@ -117,6 +127,91 @@ public class FrontendServiceImplTest {
     private static void createTable(String sql) throws Exception {
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseAndAnalyzeStmt(sql, connectContext);
         Env.getCurrentEnv().createTable(createTableStmt);
+    }
+
+    @Test
+    public void testListTableStatusColumnProjection() throws Exception {
+        createTable("CREATE TABLE test.prune_status_columns (k1 INT, v1 INT) "
+                + "DUPLICATE KEY(k1) DISTRIBUTED BY HASH(k1) BUCKETS 1 PROPERTIES(\"replication_num\" = \"1\")");
+        Database db = Env.getCurrentInternalCatalog().getDbOrAnalysisException("test");
+        OlapTable table = (OlapTable) db.getTableOrAnalysisException("prune_status_columns");
+        OlapTable spyTable = Mockito.spy(table);
+        Mockito.doReturn(10_000L).when(spyTable).getLastCheckTime();
+        Mockito.doReturn(new TableIf.TableStatusStats(10L, 20L, 2L, 30L)).when(spyTable).getTableStatusStats();
+        db.unregisterTable(table.getName());
+        db.registerTable(spyTable);
+        try {
+            FrontendServiceImpl service = new FrontendServiceImpl(exeEnv);
+            TGetTablesParams params = new TGetTablesParams();
+            params.setCatalog(InternalCatalog.INTERNAL_CATALOG_NAME);
+            params.setDb("test");
+            params.setTable(table.getName());
+            params.setCurrentUserIdent(connectContext.getCurrentUserIdentity().toThrift());
+
+            params.setRequiredColumns(Collections.singleton("UPDATE_TIME"));
+            TTableStatus updateTime = getOnlyTableStatus(service, params);
+            Assert.assertTrue(updateTime.isSetUpdateTime());
+            Assert.assertFalse(updateTime.isSetRows());
+            Assert.assertFalse(updateTime.isSetDataLength());
+            Assert.assertFalse(updateTime.isSetAvgRowLength());
+            Assert.assertFalse(updateTime.isSetIndexLength());
+
+            params.setRequiredColumns(Collections.singleton("CHECK_TIME"));
+            TTableStatus checkTime = getOnlyTableStatus(service, params);
+            Assert.assertTrue(checkTime.isSetLastCheckTime());
+            Assert.assertEquals(10L, checkTime.getLastCheckTime());
+            Assert.assertTrue(checkTime.isSetCheckTime());
+            Assert.assertEquals(10L, checkTime.getCheckTime());
+            Assert.assertFalse(checkTime.isSetUpdateTime());
+
+            params.setRequiredColumns(Collections.emptySet());
+            TTableStatus emptyProjection = getOnlyTableStatus(service, params);
+            Assert.assertEquals(table.getName(), emptyProjection.getName());
+            Assert.assertFalse(emptyProjection.isSetEngine());
+            Assert.assertFalse(emptyProjection.isSetUpdateTime());
+            Assert.assertFalse(emptyProjection.isSetRows());
+            Mockito.verify(spyTable, Mockito.never()).getTableStatusStats();
+
+            params.setRequiredColumns(Sets.newHashSet("table_rows", "Data_Length", "avg_row_length", "INDEX_LENGTH"));
+            TTableStatus projectedStats = getOnlyTableStatus(service, params);
+            Assert.assertEquals(10L, projectedStats.getRows());
+            Assert.assertEquals(20L, projectedStats.getDataLength());
+            Assert.assertEquals(2L, projectedStats.getAvgRowLength());
+            Assert.assertEquals(30L, projectedStats.getIndexLength());
+            Assert.assertFalse(projectedStats.isSetEngine());
+            Mockito.verify(spyTable).getTableStatusStats();
+
+            params.unsetRequiredColumns();
+            TTableStatus legacy = getOnlyTableStatus(service, params);
+            Assert.assertTrue(legacy.isSetEngine());
+            Assert.assertTrue(legacy.isSetUpdateTime());
+            Assert.assertTrue(legacy.isSetLastCheckTime());
+            Assert.assertTrue(legacy.isSetCheckTime());
+            Assert.assertEquals(10L, legacy.getRows());
+            Assert.assertEquals(20L, legacy.getDataLength());
+            Assert.assertEquals(2L, legacy.getAvgRowLength());
+            Assert.assertEquals(30L, legacy.getIndexLength());
+
+            ShowTableStatusStmt showStmt = new ShowTableStatusStmt(InternalCatalog.INTERNAL_CATALOG_NAME,
+                    "test", table.getName(), null);
+            List<List<String>> showRows = new ShowExecutor(connectContext, showStmt).execute().getResultRows();
+            Assert.assertEquals(1, showRows.size());
+            List<String> showRow = showRows.get(0);
+            Assert.assertEquals("10", showRow.get(4));
+            Assert.assertEquals("2", showRow.get(5));
+            Assert.assertEquals("20", showRow.get(6));
+            Assert.assertNull(showRow.get(8));
+            Mockito.verify(spyTable, Mockito.times(3)).getTableStatusStats();
+        } finally {
+            db.unregisterTable(spyTable.getName());
+            db.registerTable(table);
+        }
+    }
+
+    private TTableStatus getOnlyTableStatus(FrontendServiceImpl service, TGetTablesParams params) throws Exception {
+        TListTableStatusResult result = service.listTableStatus(params);
+        Assert.assertEquals(1, result.getTablesSize());
+        return result.getTables().get(0);
     }
 
     private static class NotMasterEnvState implements AutoCloseable {

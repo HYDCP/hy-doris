@@ -1652,6 +1652,30 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
         return indexSize;
     }
 
+    @Override
+    public TableStatusStats getTableStatusStats() {
+        long rows = getCachedRowCount();
+        long rowCountForAvg = 0;
+        long dataSizeForAvg = 0;
+        long dataLength = 0;
+        long indexLength = 0;
+        for (Partition partition : idToPartition.values()) {
+            MaterializedIndex baseIndex = partition.getBaseIndex();
+            rowCountForAvg += baseIndex.getRowCount();
+            for (Tablet tablet : baseIndex.getTablets()) {
+                for (Replica replica : tablet.getReplicas()) {
+                    if (replica.getState() == Replica.ReplicaState.NORMAL) {
+                        dataSizeForAvg += replica.getDataSize();
+                    }
+                    dataLength += replica.getLocalSegmentSize() + replica.getRemoteSegmentSize();
+                    indexLength += replica.getLocalInvertedIndexSize() + replica.getRemoteInvertedIndexSize();
+                }
+            }
+        }
+        long avgRowLength = rowCountForAvg > 0 ? dataSizeForAvg / rowCountForAvg : 0;
+        return new TableStatusStats(rows, dataLength, avgRowLength, indexLength);
+    }
+
     // Get the signature string of this table with specified partitions.
     // This method is used to determine whether the tables have the same schema.
     // Contains:

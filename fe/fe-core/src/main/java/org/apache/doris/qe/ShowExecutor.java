@@ -1112,12 +1112,22 @@ public class ShowExecutor {
                 row.add(null);
                 // Row_format
                 row.add(null);
-                // Rows
-                row.add(String.valueOf(table.getCachedRowCount()));
-                // Avg_row_length
-                row.add(String.valueOf(table.getAvgRowLength()));
-                // Data_length
-                row.add(String.valueOf(table.getDataLength()));
+                // Rows, Avg_row_length, Data_length
+                if (table instanceof OlapTable) {
+                    table.readLock();
+                    try {
+                        TableIf.TableStatusStats stats = table.getTableStatusStats();
+                        row.add(String.valueOf(stats.getRows()));
+                        row.add(String.valueOf(stats.getAvgRowLength()));
+                        row.add(String.valueOf(stats.getDataLength()));
+                    } finally {
+                        table.readUnlock();
+                    }
+                } else {
+                    row.add(String.valueOf(table.getCachedRowCount()));
+                    row.add(String.valueOf(table.getAvgRowLength()));
+                    row.add(String.valueOf(table.getDataLength()));
+                }
                 // Max_data_length
                 row.add(null);
                 // Index_length
