@@ -38,6 +38,15 @@ public class SnapshotTask extends AgentTask {
     // Only for copy tablet task.
     // Save the snapshot path.
     private String resultSnapshotPath;
+    // Whether the backend computes the SHA-256 of the snapshot files, for the manifest of a backup.
+    private boolean computeDigest = false;
+    // Whether the backend computes the logical digest of the tablet over (0, version] after the snapshot is made.
+    private boolean computeLogicalDigest = false;
+    // Whether the backend writes the manifest of the snapshot (enable_backup_manifest). Without the field the
+    // backend does not, as for an older frontend.
+    private boolean writeManifest = false;
+    // Restore only: the backend makes an empty snapshot dir, for the increment of the incremental restore.
+    private boolean restoreIncremental = false;
     // Restore only (atomic restore): the data of the snapshot is the local tablet refTabletId at the version, see
     // TSnapshotRequest.restore_local_source.
     private boolean restoreLocalSource = false;
@@ -105,6 +114,38 @@ public class SnapshotTask extends AgentTask {
         return resultSnapshotPath;
     }
 
+    public void setComputeDigest(boolean computeDigest) {
+        this.computeDigest = computeDigest;
+    }
+
+    public boolean isComputeDigest() {
+        return computeDigest;
+    }
+
+    public void setWriteManifest(boolean writeManifest) {
+        this.writeManifest = writeManifest;
+    }
+
+    public boolean isWriteManifest() {
+        return writeManifest;
+    }
+
+    public void setComputeLogicalDigest(boolean computeLogicalDigest) {
+        this.computeLogicalDigest = computeLogicalDigest;
+    }
+
+    public boolean isComputeLogicalDigest() {
+        return computeLogicalDigest;
+    }
+
+    public void setRestoreIncremental(boolean restoreIncremental) {
+        this.restoreIncremental = restoreIncremental;
+    }
+
+    public boolean isRestoreIncremental() {
+        return restoreIncremental;
+    }
+
     public void setRestoreLocalSource(boolean restoreLocalSource) {
         this.restoreLocalSource = restoreLocalSource;
     }
@@ -137,6 +178,18 @@ public class SnapshotTask extends AgentTask {
         }
         if (version > 0L) {
             request.setVersion(version);
+        }
+        if (computeDigest) {
+            request.setComputeDigest(true);
+        }
+        if (computeLogicalDigest) {
+            request.setComputeLogicalDigest(true);
+        }
+        if (writeManifest) {
+            request.setWriteManifest(true);
+        }
+        if (restoreIncremental) {
+            request.setRestoreIncremental(true);
         }
         if (restoreLocalSource) {
             request.setRestoreLocalSource(true);

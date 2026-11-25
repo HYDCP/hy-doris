@@ -42,6 +42,7 @@ public class ShowBackupStmt extends ShowStmt implements NotFallbackInParser {
             .add("JobId").add("SnapshotName").add("DbName").add("State").add("BackupObjs").add("CreateTime")
             .add("SnapshotFinishedTime").add("UploadFinishedTime").add("FinishedTime").add("UnfinishedTasks")
             .add("Progress").add("TaskErrMsg").add("Status").add("Timeout")
+            .add("LogicalDigest")
             .build();
 
     private String dbName;

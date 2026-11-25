@@ -105,6 +105,10 @@ public class Partition extends MetaObject {
     private long nextVersionHash;
     @SerializedName(value = "di", alternate = {"distributionInfo"})
     private DistributionInfo distributionInfo;
+    // The lineage of the data written by the last RESTORE job on this partition, null if the partition
+    // was never restored. See RestoreLineage.
+    @SerializedName(value = "rl")
+    private RestoreLineage restoreLineage;
     // The state token of the partition, null if it never got one. See PartitionStateToken.
     @SerializedName(value = "stk")
     private PartitionStateToken stateToken;
@@ -488,6 +492,14 @@ public class Partition extends MetaObject {
             dataSize += mIndex.getDataSize(singleReplica, true);
         }
         return dataSize + getRemoteDataSize();
+    }
+
+    public RestoreLineage getRestoreLineage() {
+        return restoreLineage;
+    }
+
+    public void setRestoreLineage(RestoreLineage restoreLineage) {
+        this.restoreLineage = restoreLineage;
     }
 
     public PartitionStateToken getStateToken() {

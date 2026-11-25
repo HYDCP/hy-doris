@@ -74,7 +74,8 @@ import java.security.SecureRandom;
  * may be given to it, for another cluster would adopt a name of content this cluster does not have on every replica. A
  * write keeps the taint (and names nothing), a backup names nothing, an invalidation keeps it. Only a restore that
  * adopts the token of the backup for the partition clears it: a restore keeps the local data of a partition by its
- * token, and a tainted partition has no token, so it is downloaded as a whole.
+ * token or by the digest of every replica (unless Config#restore_reuse_allow_unverified_keep, for experiments only),
+ * and a tainted partition has no token, so it is downloaded or proved the same on every replica.
  *
  * <p>The object is immutable. The serialized names are part of the persisted metadata and must not be changed.
  */

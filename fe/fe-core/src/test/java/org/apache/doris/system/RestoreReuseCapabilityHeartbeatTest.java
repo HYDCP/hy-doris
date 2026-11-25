@@ -46,8 +46,8 @@ public class RestoreReuseCapabilityHeartbeatTest {
         Assertions.assertEquals(1, HeartbeatMgr.restoreReuseCapabilityOf(ping));
     }
 
-    // A capability above the one of this build (a node of a later version) is reported as it is, and the frontend
-    // reports its own, which is the minimum that the reuse needs.
+    // The version 2 of the capability (the logical digest of the merge-on-write tables) is reported as it is, and the
+    // frontend reports it, while the minimum that the reuse of the other tables needs stays 1.
     @Test
     public void testCapability2IsReportedAndKept() {
         TBackendInfo backendInfo = new TBackendInfo();
@@ -55,10 +55,11 @@ public class RestoreReuseCapabilityHeartbeatTest {
         Assertions.assertEquals(2, HeartbeatMgr.restoreReuseCapabilityOf(backendInfo));
         TFrontendPingFrontendResult ping = new TFrontendPingFrontendResult();
         ping.setRestoreReuseCapability(RestoreJob.RESTORE_REUSE_CAPABILITY_REPORTED);
-        // 1: the local source snapshot and the load of a kept partition by the snapshot task
-        Assertions.assertEquals(1, HeartbeatMgr.restoreReuseCapabilityOf(ping));
-        Assertions.assertEquals(1, RestoreJob.RESTORE_REUSE_CAPABILITY_REPORTED);
+        // 3: the load of a kept partition by the snapshot task, which no node is required to have
+        Assertions.assertEquals(3, HeartbeatMgr.restoreReuseCapabilityOf(ping));
+        Assertions.assertEquals(3, RestoreJob.RESTORE_REUSE_CAPABILITY_REPORTED);
         Assertions.assertEquals(1, RestoreJob.RESTORE_REUSE_CAPABILITY_MIN_REQUIRED);
+        Assertions.assertTrue(RestoreJob.RESTORE_REUSE_CAPABILITY_REPORTED >= RestoreJob.RESTORE_REUSE_CAPABILITY_MOW);
 
         Backend be = new Backend(10001, "127.0.0.1", 9050);
         be.handleHbResponse(new BackendHbResponse(10001, 9060, 8040, 8060, System.currentTimeMillis(), 1L,

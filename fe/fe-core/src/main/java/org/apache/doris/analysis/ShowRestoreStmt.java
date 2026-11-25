@@ -46,7 +46,7 @@ public class ShowRestoreStmt extends ShowStmt implements NotFallbackInParser {
             .add("SnapshotFinishedTime").add("DownloadFinishedTime").add("FinishedTime").add("UnfinishedTasks")
             .add("Progress").add("TaskErrMsg").add("Status").add("Timeout")
             // new columns must be appended at the end, tools may read the columns by position.
-            .add("ReuseEstimate")
+            .add("ReuseEstimate").add("ManifestCheck").add("DownloadStats")
             .build();
     public static final ImmutableList<String> BRIEF_TITLE_NAMES = new ImmutableList.Builder<String>()
             .add("JobId").add("Label").add("Timestamp").add("DbName").add("State")

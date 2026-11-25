@@ -221,6 +221,11 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
     @SerializedName(value = "aIncg")
     private AutoIncrementGenerator autoIncrementGenerator;
 
+    // The source table of the last RESTORE job that wrote this table, null if the table was never restored.
+    // See RestoreSource.
+    @SerializedName(value = "rsrc")
+    private RestoreSource restoreSource;
+
     private volatile Statistics statistics = new Statistics();
 
     public OlapTable() {
@@ -3635,5 +3640,13 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
                                         : invertedIndexesWithFieldPattern.stream()
                                         .filter(Index::isAnalyzedInvertedIndex).findFirst().orElse(null);
         }
+    }
+
+    public RestoreSource getRestoreSource() {
+        return restoreSource;
+    }
+
+    public void setRestoreSource(RestoreSource restoreSource) {
+        this.restoreSource = restoreSource;
     }
 }

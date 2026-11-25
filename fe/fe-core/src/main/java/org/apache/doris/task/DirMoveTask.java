@@ -19,6 +19,7 @@ package org.apache.doris.task;
 
 import org.apache.doris.thrift.TMoveDirReq;
 import org.apache.doris.thrift.TResourceInfo;
+import org.apache.doris.thrift.TRestoreBackupDigest;
 import org.apache.doris.thrift.TRestoreIncrementalRange;
 import org.apache.doris.thrift.TTaskType;
 
@@ -30,6 +31,7 @@ public class DirMoveTask extends AgentTask {
     private boolean overwrite;
     // Append the rowsets of the range to the tablet instead of replacing it, null for the plain restore.
     private TRestoreIncrementalRange incrementalRange;
+    private TRestoreBackupDigest backupLogicalDigest;
     // The tablet was loaded from a local source by the atomic restore (the backend judges the task by the evidence).
     private boolean localSourceLoaded = false;
     // The tablet of a kept partition of the atomic restore: the snapshot task may have loaded it, then the backend
@@ -62,8 +64,18 @@ public class DirMoveTask extends AgentTask {
         return overwrite;
     }
 
+    public void setIncrementalRange(long baseVersion, long endVersion) {
+        this.incrementalRange = new TRestoreIncrementalRange(baseVersion, endVersion);
+    }
+
     public TRestoreIncrementalRange getIncrementalRange() {
         return incrementalRange;
+    }
+
+    // The logical digest of the backup of the tablet, for an incremental append: lets the backend tell that the
+    // tablet is already the backup. Null if the backup has none.
+    public void setBackupLogicalDigest(TRestoreBackupDigest backupLogicalDigest) {
+        this.backupLogicalDigest = backupLogicalDigest;
     }
 
     public void setLocalSourceLoaded(boolean localSourceLoaded) {
@@ -82,8 +94,21 @@ public class DirMoveTask extends AgentTask {
         return localSourceKept;
     }
 
+    public TRestoreBackupDigest getBackupLogicalDigest() {
+        return backupLogicalDigest;
+    }
+
     public TMoveDirReq toThrift() {
         TMoveDirReq req = new TMoveDirReq(tabletId, schemaHash, src, jobId, overwrite);
+        if (incrementalRange != null) {
+            req.setIncremental(incrementalRange);
+            if (localSourceLoaded) {
+                req.setLocalSourceLoaded(true);
+            }
+            if (backupLogicalDigest != null) {
+                req.setBackupLogicalDigest(backupLogicalDigest);
+            }
+        }
         return req;
     }
 
