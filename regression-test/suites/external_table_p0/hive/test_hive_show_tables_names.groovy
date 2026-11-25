@@ -62,12 +62,16 @@ suite("test_hive_show_tables_names", "p0,external,hive,external_docker,external_
                 where Tables_in_show_tables_names = 'show_tables_a'"""))
 
         sql """drop user if exists show_tables_names_user"""
-        sql """create user show_tables_names_user identified by 'show_tables_names_password'"""
-        sql """grant select_priv on internal.${context.config.defaultDb}.* to show_tables_names_user"""
-        sql """grant select_priv on ${catalog}.show_tables_names.show_tables_a to show_tables_names_user"""
-        connect("show_tables_names_user", "show_tables_names_password", context.config.jdbcUrl) {
-            assertEquals([["show_tables_a"]], sql("show tables from ${catalog}.show_tables_names"))
-            assertEquals([], sql("show tables from ${catalog}.show_tables_names like '%denied'"))
+        try {
+            sql """create user show_tables_names_user identified by 'show_tables_names_password'"""
+            sql """grant select_priv on internal.${context.config.defaultDb}.* to show_tables_names_user"""
+            sql """grant select_priv on ${catalog}.show_tables_names.show_tables_a to show_tables_names_user"""
+            connect("show_tables_names_user", "show_tables_names_password", context.config.jdbcUrl) {
+                assertEquals([["show_tables_a"]], sql("show tables from ${catalog}.show_tables_names"))
+                assertEquals([], sql("show tables from ${catalog}.show_tables_names like '%denied'"))
+            }
+        } finally {
+            sql """drop user if exists show_tables_names_user"""
         }
 
         sql """drop table if exists ${catalog}.show_tables_names.show_tables_added"""
