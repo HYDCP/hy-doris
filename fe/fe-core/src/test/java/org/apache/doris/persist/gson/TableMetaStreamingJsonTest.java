@@ -71,9 +71,9 @@ import java.util.List;
 public class TableMetaStreamingJsonTest {
 
     @Test
-    public void testSafeRolloutDefaults() {
-        Assert.assertFalse(Config.enable_table_meta_streaming_json);
-        Assert.assertTrue(Config.backup_meta_reserve_replica_info);
+    public void testDefaults() {
+        Assert.assertTrue(Config.enable_table_meta_streaming_json);
+        Assert.assertFalse(Config.backup_meta_reserve_replica_info);
     }
 
     private static OlapTable createTable() {
