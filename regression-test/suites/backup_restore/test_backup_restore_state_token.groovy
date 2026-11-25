@@ -20,7 +20,7 @@ import groovy.json.JsonSlurper
 // A partition kept by its state token in a restore (restore_state_token_track, restore_reuse_trust_state_token):
 //   1. Backed up with the tracking on, restored onto a database that has the same data: every partition is kept by
 //      its state token (KEPT_STATE_TOKEN), nothing is downloaded. With the trust off the tokens are equal, but the
-//      partitions are downloaded.
+//      partitions are proved by the digest.
 //   2. ADMIN SET REPLICA VERSION taints the partition, on the source (the backup records no token for it) and on the
 //      target (the local partition has none): that partition is not kept by its token, the data is still right.
 //   3. A finished BUILD INDEX of a partition invalidates its token: the backup gives the partition a new name, the
@@ -29,7 +29,7 @@ import groovy.json.JsonSlurper
 // The ReuseEstimate column of SHOW RESTORE has the counts (kept_token, token_equal); the per partition reasons are in
 // the fe.log ("restore reuse: partition ..."). Single replica, auto compaction off.
 suite("test_backup_restore_state_token", "backup_restore") {
-    setFeConfigTemporary([enable_restore_partition_reuse: false,
+    setFeConfigTemporary([enable_backup_manifest: true, enable_restore_partition_reuse: false,
             restore_reuse_min_partition_bytes: 0, restore_state_token_track: false,
             restore_reuse_trust_state_token: false, restore_reset_index_id: false]) {
     String suiteName = "test_backup_restore_state_token"
@@ -58,6 +58,7 @@ suite("test_backup_restore_state_token", "backup_restore") {
             BACKUP SNAPSHOT ${dbA}.${snapshot}
             TO `${repoName}`
             ON (${tbl})
+            PROPERTIES ("logical_digest" = "true")
         """
         syncer.waitSnapshotFinish(dbA)
         def timestamp = syncer.getSnapshotTimestamp(repoName, snapshot)
@@ -65,8 +66,9 @@ suite("test_backup_restore_state_token", "backup_restore") {
         return timestamp
     }
 
-    // the ReuseEstimate of the last restore job
+    // the ReuseEstimate and the DownloadStats of the last restore job
     def lastEstimate = null
+    def lastStats = null
     def restoreAndWait = { String snapshot, String timestamp, String tbl ->
         sql """
             RESTORE SNAPSHOT ${dbB}.${snapshot}
@@ -79,8 +81,9 @@ suite("test_backup_restore_state_token", "backup_restore") {
         def job = result.last()
         logger.info("restore ${snapshot} into ${dbB}: ${job}")
         assertEquals("FINISHED", job.State)
+        lastStats = new JsonSlurper().parseText(job.DownloadStats as String)
         lastEstimate = job.ReuseEstimate == null ? null : new JsonSlurper().parseText(job.ReuseEstimate as String)
-        logger.info("reuse estimate: ${lastEstimate}")
+        logger.info("download stats: ${lastStats}, reuse estimate: ${lastEstimate}")
     }
     def keptPartitions = { (lastEstimate?.kept_partitions ?: 0) as int }
     def keptByToken = { (lastEstimate?.kept_token ?: 0) as int }
@@ -146,25 +149,25 @@ suite("test_backup_restore_state_token", "backup_restore") {
     String ts1 = backupAndWait(snap1, "test_backup_restore_state_token_dup")
     // B is new: downloaded as a whole, the partitions adopt the tokens of the backup
     restoreAndWait(snap1, ts1, "test_backup_restore_state_token_dup")
-    assertEquals(0, keptPartitions())
-    assertEquals(rowsOf(dbA, "test_backup_restore_state_token_dup"), rowsOf(dbB, "test_backup_restore_state_token_dup"))
+    assertTrue((lastStats.downloaded_bytes as long) > 0)
     waitDataSize(dbB, "test_backup_restore_state_token_dup", 120)
 
     restoreAndWait(snap1, ts1, "test_backup_restore_state_token_dup")
     assertEquals(3, keptByToken())
     assertEquals(3, tokenEqual())
     assertEquals(3, keptPartitions())
+    assertEquals(0L, lastStats.downloaded_bytes as long)
     order_qt_kept_by_token """SELECT id DIV 1000, COUNT(*), SUM(CRC32(CONCAT(CAST(id AS STRING), '|', v1)))
             FROM ${dbB}.test_backup_restore_state_token_dup GROUP BY id DIV 1000"""
     assertEquals(rowsOf(dbA, "test_backup_restore_state_token_dup"), rowsOf(dbB, "test_backup_restore_state_token_dup"))
 
-    // the trust off: the tokens are equal, the partitions are downloaded
+    // the trust off: the tokens are equal, the partitions are kept by the digest
     setConfig("restore_reuse_trust_state_token", "false")
     restoreAndWait(snap1, ts1, "test_backup_restore_state_token_dup")
     setConfig("restore_reuse_trust_state_token", "true")
     assertEquals(0, keptByToken())
     assertEquals(3, tokenEqual())
-    assertEquals(0, keptPartitions())
+    assertEquals(3, keptPartitions())
     assertEquals(rowsOf(dbA, "test_backup_restore_state_token_dup"), rowsOf(dbB, "test_backup_restore_state_token_dup"))
 
     // ------------------------------------------------------------------------------------------------
