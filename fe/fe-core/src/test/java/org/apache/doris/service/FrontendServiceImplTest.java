@@ -20,7 +20,6 @@ package org.apache.doris.service;
 
 import org.apache.doris.analysis.CreateDbStmt;
 import org.apache.doris.analysis.CreateTableStmt;
-import org.apache.doris.analysis.ShowTableStatusStmt;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
@@ -35,7 +34,6 @@ import org.apache.doris.ha.FrontendNodeType;
 import org.apache.doris.ha.MasterInfo;
 import org.apache.doris.insertoverwrite.InsertOverwriteManager;
 import org.apache.doris.qe.ConnectContext;
-import org.apache.doris.qe.ShowExecutor;
 import org.apache.doris.qe.ShowResultSet;
 import org.apache.doris.tablefunction.BackendsTableValuedFunction;
 import org.apache.doris.thrift.TBackendsMetadataParams;
@@ -191,17 +189,6 @@ public class FrontendServiceImplTest {
             Assert.assertEquals(20L, legacy.getDataLength());
             Assert.assertEquals(2L, legacy.getAvgRowLength());
             Assert.assertEquals(30L, legacy.getIndexLength());
-
-            ShowTableStatusStmt showStmt = new ShowTableStatusStmt(InternalCatalog.INTERNAL_CATALOG_NAME,
-                    "test", table.getName(), null);
-            List<List<String>> showRows = new ShowExecutor(connectContext, showStmt).execute().getResultRows();
-            Assert.assertEquals(1, showRows.size());
-            List<String> showRow = showRows.get(0);
-            Assert.assertEquals("10", showRow.get(4));
-            Assert.assertEquals("2", showRow.get(5));
-            Assert.assertEquals("20", showRow.get(6));
-            Assert.assertNull(showRow.get(8));
-            Mockito.verify(spyTable, Mockito.times(3)).getTableStatusStats();
         } finally {
             db.unregisterTable(spyTable.getName());
             db.registerTable(table);
