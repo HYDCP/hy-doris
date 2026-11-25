@@ -120,7 +120,8 @@ public:
     Result<std::vector<PendingRowsetGuard>> convert_rowset_ids(
             const std::string& clone_dir, int64_t tablet_id, int64_t replica_id, int64_t table_id,
             int64_t partition_id, int32_t schema_hash, bool reset_restore_stage = false,
-            const RestoreStagePB* restore_stage = nullptr);
+            const RestoreStagePB* restore_stage = nullptr,
+            std::string_view meta_file_suffix = ".hdr");
 
 private:
     Status _calc_snapshot_id_path(const TabletSharedPtr& tablet, int64_t timeout_s,

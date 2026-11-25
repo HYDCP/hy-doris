@@ -307,6 +307,29 @@ DECLARE_mInt32(download_low_speed_time);
 DECLARE_mBool(enable_batch_download);
 // whether to check md5sum when download
 DECLARE_mBool(enable_download_md5sum_check);
+// whether to check the downloaded tablet snapshot of a restore against the manifest recorded
+// at backup time: the set of files and the size of each file.
+DECLARE_mBool(restore_manifest_check);
+// whether to also check the SHA-256 of each file against the manifest, if the manifest has it.
+// It reads all the files once, including the files reused locally instead of downloading.
+DECLARE_mBool(restore_manifest_digest_check);
+// number of RESTORE_DIGEST tasks (logical digest of a tablet, see olap/restore_digest) run at the
+// same time on this BE
+DECLARE_Int32(restore_digest_task_concurrency);
+// worker threads of one logical digest computation of a tablet (see olap/restore_digest), used when
+// the request does not carry a value
+DECLARE_mInt32(restore_digest_threads);
+// max number of entries of the in-memory logical digest cache, 0 disables the cache
+DECLARE_mInt64(restore_digest_cache_capacity);
+// max memory (MB) of the decomposed digests kept in the logical digest cache, 0 does not cache them
+DECLARE_mInt64(restore_digest_cache_decomposed_mb);
+// max number of extra scans a decomposed digest may need, a tablet that needs more has none
+DECLARE_mBool(restore_digest_prefix_enabled);
+DECLARE_mInt32(restore_digest_prefix_max_scans);
+// unique merge on read: the number of most recent rowset boundary versions for which a whole digest
+// is computed, 0 disables the decomposed digest of merge on read tablets
+DECLARE_mInt32(restore_digest_mor_prefix_boundaries);
+DECLARE_mBool(enable_restore_digest_http_api);
 // how long (seconds) the snapshot of the local source of a tablet lives in the snapshot dir, see config.cpp
 DECLARE_mInt32(restore_local_source_snapshot_timeout_s);
 // download binlog meta timeout

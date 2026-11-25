@@ -205,7 +205,7 @@ Status SnapshotManager::release_snapshot(const string& snapshot_path) {
 Result<std::vector<PendingRowsetGuard>> SnapshotManager::convert_rowset_ids(
         const std::string& clone_dir, int64_t tablet_id, int64_t replica_id, int64_t table_id,
         int64_t partition_id, int32_t schema_hash, bool reset_restore_stage,
-        const RestoreStagePB* restore_stage) {
+        const RestoreStagePB* restore_stage, std::string_view meta_file_suffix) {
     SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_mem_tracker);
     std::vector<PendingRowsetGuard> guards;
     // check clone dir existed
@@ -217,7 +217,7 @@ Result<std::vector<PendingRowsetGuard>> SnapshotManager::convert_rowset_ids(
     }
 
     // load original tablet meta
-    auto cloned_meta_file = fmt::format("{}/{}.hdr", clone_dir, tablet_id);
+    auto cloned_meta_file = fmt::format("{}/{}{}", clone_dir, tablet_id, meta_file_suffix);
     TabletMetaPB cloned_tablet_meta_pb;
     RETURN_IF_ERROR_RESULT(TabletMeta::load_from_file(cloned_meta_file, &cloned_tablet_meta_pb));
 
@@ -494,7 +494,7 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
                     { copy_files = local_source; });
     LocalSourceStats source_stats;
     if (request.__isset.restore_incremental && request.restore_incremental && !local_source) {
-        // the empty snapshot dir of a tablet loaded by the snapshot task itself: no rowset, no tablet meta
+        // the dir to download the increment of the incremental restore into: no rowset, no tablet meta
         *snapshot_path = snapshot_id;
         return Status::OK();
     }

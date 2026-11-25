@@ -1,0 +1,258 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#include "http/action/restore_digest_action.h"
+
+#include <fmt/format.h>
+
+#include <algorithm>
+#include <string>
+
+#include "common/config.h"
+#include "common/logging.h"
+#include "common/status.h"
+#include "http/http_channel.h"
+#include "http/http_headers.h"
+#include "http/http_request.h"
+#include "http/http_status.h"
+#include "io/fs/file_reader.h"
+#include "io/fs/local_file_system.h"
+#include "olap/data_dir.h"
+#include "olap/olap_define.h"
+#include "olap/restore_digest/restore_digest.h"
+#include "olap/storage_engine.h"
+#include "runtime/memory/mem_tracker_limiter.h"
+#include "runtime/thread_context.h"
+
+namespace doris {
+
+namespace {
+const std::string TABLET_ID = "tablet_id";
+const std::string HEADER_JSON = "application/json";
+} // namespace
+
+RestoreDigestAction::RestoreDigestAction(ExecEnv* exec_env, StorageEngine& engine,
+                                         TPrivilegeHier::type hier, TPrivilegeType::type type)
+        : HttpHandlerWithAuth(exec_env, hier, type), _engine(engine) {}
+
+Status RestoreDigestAction::check_prefix_file(const std::vector<std::string>& store_paths,
+                                              const std::string& path, int64_t max_bytes,
+                                              std::string* real_path, int64_t* size) {
+    const auto& fs = io::global_local_filesystem();
+    std::string real;
+    if (!fs->canonicalize(path, &real).ok()) {
+        return Status::InvalidArgument("prefix_file {} does not exist", path);
+    }
+    bool under_snapshot = false;
+    for (const auto& store : store_paths) {
+        std::string root;
+        if (!fs->canonicalize(store, &root).ok()) {
+            continue;
+        }
+        const std::string dir = fmt::format("{}/{}/", root, SNAPSHOT_PREFIX);
+        if (real.size() > dir.size() && real.compare(0, dir.size(), dir) == 0) {
+            under_snapshot = true;
+            break;
+        }
+    }
+    if (!under_snapshot) {
+        return Status::InvalidArgument(
+                "prefix_file {} is not under the snapshot dir of a store of this BE", path);
+    }
+    bool is_dir = false;
+    RETURN_IF_ERROR(fs->is_directory(real, &is_dir));
+    if (is_dir) {
+        return Status::InvalidArgument("prefix_file {} is a directory", path);
+    }
+    int64_t bytes = 0;
+    RETURN_IF_ERROR(fs->file_size(real, &bytes));
+    if (bytes > max_bytes) {
+        return Status::InvalidArgument("prefix_file {} has {} bytes, more than the limit {}", path,
+                                       bytes, max_bytes);
+    }
+    *real_path = real;
+    *size = bytes;
+    return Status::OK();
+}
+
+// Debug: composes the digest at `version` from a decomposed digest file (rdigest) on this BE,
+// after checking the file against `root`. version = -1 lists the boundaries instead.
+void RestoreDigestAction::handle_prefix_file(HttpRequest* req, int64_t tablet_id, int64_t version,
+                                             const std::string& path, const std::string& root) {
+    std::vector<std::string> store_paths;
+    for (auto* store : _engine.get_stores()) {
+        store_paths.push_back(store->path());
+    }
+    std::string real_path;
+    int64_t file_bytes = 0;
+    Status st = check_prefix_file(store_paths, path, kMaxPrefixFileBytes, &real_path, &file_bytes);
+    if (!st.ok()) {
+        req->add_output_header(HttpHeaders::CONTENT_TYPE, HEADER_JSON.c_str());
+        std::string escaped;
+        for (char c : st.to_string()) {
+            if (c == '"' || c == '\\') {
+                escaped.push_back('\\');
+            }
+            escaped.push_back(c == '\n' ? ' ' : c);
+        }
+        HttpChannel::send_reply(
+                req, HttpStatus::BAD_REQUEST,
+                fmt::format("{{\"status\":\"BAD_PREFIX_FILE\",\"msg\":\"{}\"}}", escaped));
+        return;
+    }
+    std::string content;
+    {
+        io::FileReaderSPtr reader;
+        st = io::global_local_filesystem()->open_file(real_path, &reader);
+        if (st.ok()) {
+            // the size checked above, not the one of the reader, so a file growing meanwhile is not read past it
+            content.resize(std::min<int64_t>(reader->size(), file_bytes));
+            size_t bytes_read = 0;
+            st = reader->read_at(0, Slice(content.data(), content.size()), &bytes_read);
+            static_cast<void>(reader->close());
+        }
+    }
+    RestoreDigestDecomposed decomposed;
+    if (st.ok()) {
+        st = RestoreDigestDecomposed::parse(content, root, tablet_id, &decomposed);
+    }
+    RestoreDigest digest;
+    if (st.ok() && version >= 0) {
+        st = decomposed.compose(version, &digest);
+    }
+    req->add_output_header(HttpHeaders::CONTENT_TYPE, HEADER_JSON.c_str());
+    if (!st.ok()) {
+        std::string msg = st.to_string();
+        std::string escaped;
+        for (char c : msg) {
+            if (c == '"' || c == '\\') {
+                escaped.push_back('\\');
+            }
+            escaped.push_back(c == '\n' ? ' ' : c);
+        }
+        HttpChannel::send_reply(
+                req,
+                st.is<ErrorCode::NOT_IMPLEMENTED_ERROR>() ? HttpStatus::NOT_IMPLEMENTED
+                                                          : HttpStatus::INTERNAL_SERVER_ERROR,
+                fmt::format("{{\"status\":\"{}\",\"msg\":\"{}\"}}",
+                            st.is<ErrorCode::NOT_IMPLEMENTED_ERROR>() ? "NOT_COMPOSABLE" : "ERROR",
+                            escaped));
+        return;
+    }
+    if (version >= 0) {
+        HttpChannel::send_reply(req, HttpStatus::OK, digest.to_json());
+        return;
+    }
+    std::string boundaries;
+    for (const auto& rs : decomposed.rowsets) {
+        boundaries += fmt::format("{}[{},{}]", boundaries.empty() ? "" : ",", rs.start_version,
+                                  rs.end_version);
+    }
+    std::string marks;
+    for (const auto& mark : decomposed.marks) {
+        marks += fmt::format("{}{}", marks.empty() ? "" : ",", mark.mark_version);
+    }
+    HttpChannel::send_reply(
+            req, HttpStatus::OK,
+            fmt::format("{{\"base_version\":{},\"root\":\"{}\",\"rows\":{},\"mow\":{},"
+                        "\"bytes\":{},\"rowsets\":[{}],\"mark_versions\":[{}]}}",
+                        decomposed.base_version, decomposed.root, decomposed.rows,
+                        decomposed.mow ? "true" : "false", content.size(), boundaries, marks));
+}
+
+void RestoreDigestAction::handle(HttpRequest* req) {
+    if (!config::enable_restore_digest_http_api) {
+        HttpChannel::send_reply(
+                req, HttpStatus::FORBIDDEN,
+                "the restore digest API is off, see enable_restore_digest_http_api");
+        return;
+    }
+    const std::string& tablet_id_str = req->param(TABLET_ID);
+    const std::string& version_str = req->param("version");
+    int64_t tablet_id = 0;
+    int64_t version = 0;
+    try {
+        tablet_id = std::stoll(tablet_id_str);
+        version = std::stoll(version_str);
+    } catch (...) {
+        HttpChannel::send_reply(req, HttpStatus::BAD_REQUEST,
+                                "parameters tablet_id and version are required integers");
+        return;
+    }
+    const std::string& prefix_file = req->param("prefix_file");
+    if (!prefix_file.empty()) {
+        handle_prefix_file(req, tablet_id, version, prefix_file, req->param("root"));
+        return;
+    }
+    int threads = 1;
+    const std::string& threads_str = req->param("threads");
+    if (!threads_str.empty()) {
+        try {
+            threads = std::stoi(threads_str);
+        } catch (...) {
+            HttpChannel::send_reply(req, HttpStatus::BAD_REQUEST,
+                                    "parameter threads must be an integer");
+            return;
+        }
+        threads = std::clamp(threads, 1, 64);
+    }
+    LOG(INFO) << "restore digest begin, tablet_id=" << tablet_id << ", version=" << version
+              << ", threads=" << threads;
+
+    RestoreDigest digest;
+    Status st;
+    {
+        auto mem_tracker = MemTrackerLimiter::create_shared(
+                MemTrackerLimiter::Type::OTHER,
+                "RestoreDigest#tabletId=" + std::to_string(tablet_id));
+        SCOPED_ATTACH_TASK(mem_tracker);
+        st = compute_tablet_restore_digest(_engine, tablet_id, version, &digest, threads);
+    }
+    if (st.ok()) {
+        LOG(INFO) << "restore digest done, tablet_id=" << tablet_id << ", version=" << version
+                  << ", rows=" << digest.rows << ", root=" << digest.root
+                  << ", elapsed_ms=" << digest.elapsed_ms;
+        req->add_output_header(HttpHeaders::CONTENT_TYPE, HEADER_JSON.c_str());
+        HttpChannel::send_reply(req, HttpStatus::OK, digest.to_json());
+        return;
+    }
+    LOG(WARNING) << "restore digest failed, tablet_id=" << tablet_id << ", version=" << version
+                 << ", status=" << st;
+    HttpStatus code = st.is<ErrorCode::NOT_FOUND>() ? HttpStatus::NOT_FOUND
+                      : st.is<ErrorCode::NOT_IMPLEMENTED_ERROR>()
+                              ? HttpStatus::NOT_IMPLEMENTED
+                              : HttpStatus::INTERNAL_SERVER_ERROR;
+    std::string code_name = st.is<ErrorCode::NOT_IMPLEMENTED_ERROR>() ? "NOT_SUPPORTED" : "ERROR";
+    std::string msg = st.to_string();
+    // minimal JSON escaping of the message
+    std::string escaped;
+    for (char c : msg) {
+        if (c == '"' || c == '\\') {
+            escaped.push_back('\\');
+            escaped.push_back(c);
+        } else if (c == '\n') {
+            escaped += "\\n";
+        } else {
+            escaped.push_back(c);
+        }
+    }
+    req->add_output_header(HttpHeaders::CONTENT_TYPE, HEADER_JSON.c_str());
+    HttpChannel::send_reply(
+            req, code, fmt::format("{{\"status\":\"{}\",\"msg\":\"{}\"}}", code_name, escaped));
+}
+
+} // namespace doris

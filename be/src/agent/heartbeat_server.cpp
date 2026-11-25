@@ -53,10 +53,10 @@ class TProcessor;
 namespace doris {
 
 namespace {
-// The version of the restore reuse protocol this BE understands: the local source snapshot and the load of a kept
-// partition by the snapshot task (1, TSnapshotRequest.restore_local_source and restore_kept_load). An old BE reports
-// none.
-constexpr int32_t kRestoreReuseCapability = 1;
+// The version of the restore reuse protocol this BE understands: the RESTORE_DIGEST task, the local source snapshot
+// and the incremental download (1), the version 2 digest of the unique merge on write tables (2), the load of a
+// kept partition by the snapshot task (3, TSnapshotRequest.restore_kept_load). An old BE reports none.
+constexpr int32_t kRestoreReuseCapability = 3;
 } // namespace
 
 HeartbeatServer::HeartbeatServer(ClusterInfo* cluster_info)
