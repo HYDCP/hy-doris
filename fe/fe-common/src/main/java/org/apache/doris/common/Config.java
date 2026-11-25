@@ -2268,7 +2268,7 @@ public class Config extends ConfigBase {
 
     @ConfField(description = {"External Catalog 中，Database 和 Table 的实例缓存的最大数量。",
             "Max cache number of database and table instance in external catalog."})
-    public static long max_meta_object_cache_num = 1000;
+    public static long max_meta_object_cache_num = 5000;
 
     @ConfField(description = {"Hive分区表缓存的最大数量",
             "Max cache number of hive partition table"})
