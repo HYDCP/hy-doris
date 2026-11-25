@@ -20,6 +20,7 @@ package org.apache.doris.qe;
 import org.apache.doris.analysis.SetStmt;
 import org.apache.doris.analysis.ShowVariablesStmt;
 import org.apache.doris.common.CaseSensibility;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ExceptionChecker;
 import org.apache.doris.common.FeConstants;
@@ -241,6 +242,27 @@ public class SessionVariablesTest extends TestWithFeService {
         SetExecutor invalidSetExecutor = new SetExecutor(connectContext, setStmt);
         ExceptionChecker.expectThrowsWithMsg(DdlException.class,
                 "insertVisibleTimeoutReturnMode value is invalid", invalidSetExecutor::execute);
+    }
+
+    @Test
+    public void testSchemaScanFromMasterFeDefault() throws Exception {
+        String originalDeployMode = Config.deploy_mode;
+        String originalCloudUniqueId = Config.cloud_unique_id;
+        try {
+            Config.deploy_mode = "";
+            Config.cloud_unique_id = "";
+            SessionVariable localSession = new SessionVariable();
+            Assertions.assertFalse(localSession.enableSchemaScanFromMasterFe);
+
+            localSession.readFromJson("{\"enable_schema_scan_from_master_fe\":true}");
+            Assertions.assertTrue(localSession.enableSchemaScanFromMasterFe);
+
+            Config.deploy_mode = "cloud";
+            Assertions.assertTrue(new SessionVariable().enableSchemaScanFromMasterFe);
+        } finally {
+            Config.deploy_mode = originalDeployMode;
+            Config.cloud_unique_id = originalCloudUniqueId;
+        }
     }
 
     @Test
