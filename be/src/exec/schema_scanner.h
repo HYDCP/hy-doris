@@ -24,6 +24,7 @@
 
 #include <condition_variable>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,7 @@ struct SchemaScannerCommonParam {
     int64_t thread_id;
     const std::string* catalog = nullptr;
     std::set<TNetworkAddress> fe_addr_list;
+    std::set<std::string> required_columns;
 };
 
 // scanner parameter from frontend

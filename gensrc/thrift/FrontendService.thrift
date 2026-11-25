@@ -336,6 +336,9 @@ struct TGetTablesParams {
   6: optional string type
   7: optional string catalog
   8: optional string table
+  // Field 9 is reserved for downstream current_roles.
+  // If required_columns is unset, return the full table status.
+  10: optional set<string> required_columns
 }
 
 struct TTableStatus {

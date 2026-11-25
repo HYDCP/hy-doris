@@ -189,6 +189,7 @@ Status SchemaScanOperatorX::open(RuntimeState* state) {
                                          _dest_tuple_desc->slots()[i]->col_name(),
                                          type_to_string(_dest_tuple_desc->slots()[i]->type().type));
         }
+        _common_scanner_param->required_columns.insert(columns_desc[j].name);
     }
 
     _tuple_idx = 0;
