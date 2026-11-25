@@ -2632,15 +2632,13 @@ public class SessionVariable implements Serializable, Writable {
             })
     public String enableSqlConvertorFeatures = "";
 
-    // The default value is true,
-    // which throughs reducing rpc call from follower node to meta service to improve query performance
-    // for getting version is memory operation in master node,
-    // but it will slightly increase the pressure on the FE master.
+    // Cloud followers may need Meta Service RPCs to refresh partition versions.
+    // In local mode, serve table metadata from the connected FE to distribute scan load.
     @VariableMgr.VarAttr(name = ENABLE_SCHEMA_SCAN_FROM_MASTER_FE, description = {
             "在 follower 节点查询时，是否允许从 master 节点扫描 information_schema.tables 的结果",
             "Whether to allow scanning information_schema.tables from the master node"
     })
-    public boolean enableSchemaScanFromMasterFe = true;
+    public boolean enableSchemaScanFromMasterFe = Config.isCloudMode();
 
     @VariableMgr.VarAttr(name = SHOW_COLUMN_COMMENT_IN_DESCRIBE, needForward = true,
             description = {
