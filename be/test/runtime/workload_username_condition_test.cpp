@@ -45,4 +45,19 @@ TEST(WorkloadUsernameConditionTest, RequiresUsernameAndOtherMetric) {
     EXPECT_FALSE(policy.is_match(&query));
 }
 
+TEST(WorkloadUsernameConditionTest, SharedGroupCommitHasNoPolicyUsername) {
+    std::vector<std::unique_ptr<WorkloadCondition>> conditions;
+    conditions.push_back(std::make_unique<WorkloadConditionUsername>(EQUAL, "admin"));
+    std::vector<std::unique_ptr<WorkloadAction>> actions;
+    actions.push_back(std::make_unique<WorkloadActionCancelQuery>());
+    WorkloadSchedPolicy policy;
+    policy.init(1, "admin_only", 0, true, 0, {}, std::move(conditions), std::move(actions));
+    for (auto source : {QuerySource::INTERNAL_FRONTEND, QuerySource::STREAM_LOAD,
+                        QuerySource::GROUP_COMMIT_LOAD}) {
+        WorkloadQueryInfo query {};
+        query.set_username(source, "admin");
+        EXPECT_EQ(policy.is_match(&query), source != QuerySource::GROUP_COMMIT_LOAD);
+    }
+}
+
 } // namespace doris

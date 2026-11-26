@@ -1317,8 +1317,8 @@ void FragmentMgr::get_runtime_query_info(std::vector<WorkloadQueryInfo>* query_i
                         workload_query_info.query_id = print_id(iter->first);
                         workload_query_info.tquery_id = iter->first;
                         if (q_ctx->set_rsc_info) {
-                            workload_query_info.metric_map.emplace(WorkloadMetricType::USERNAME,
-                                                                   q_ctx->user);
+                            workload_query_info.set_username(q_ctx->get_query_source(),
+                                                             q_ctx->user);
                         }
                         workload_query_info.wg_id = q_ctx->workload_group() == nullptr
                                                             ? -1

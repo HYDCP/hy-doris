@@ -19,12 +19,21 @@
 
 #include <map>
 
+#include "runtime/query_source.h"
 #include "runtime/workload_management/workload_condition.h"
 
 namespace doris {
 
 class WorkloadQueryInfo {
 public:
+    void set_username(QuerySource source, const std::string& user) {
+        // Group Commit can combine different users in a transaction. Its admin identity
+        // is only used for internal authentication of the shared plan.
+        if (source != QuerySource::GROUP_COMMIT_LOAD) {
+            metric_map.emplace(WorkloadMetricType::USERNAME, user);
+        }
+    }
+
     std::map<WorkloadMetricType, std::string> metric_map;
     TUniqueId tquery_id;
     std::string query_id;
