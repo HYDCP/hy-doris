@@ -128,6 +128,7 @@ public class NativeInsertStmt extends InsertStmt {
     private final Map<String, Expr> exprByName = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
 
     protected Table targetTable;
+    private Long ctasTargetTableId;
 
     private DatabaseIf db;
     private long transactionId;
@@ -423,12 +424,18 @@ public class NativeInsertStmt extends InsertStmt {
         }
     }
 
+    public void setCtasTargetTableId(long tableId) {
+        ctasTargetTableId = tableId;
+    }
+
     protected void initTargetTable(Analyzer analyzer) throws AnalysisException {
         if (targetTable == null) {
             DatabaseIf db = analyzer.getEnv().getCatalogMgr()
                     .getCatalog(tblName.getCtl()).getDbOrAnalysisException(tblName.getDb());
             if (db instanceof Database) {
-                targetTable = (Table) db.getTableOrAnalysisException(tblName.getTbl());
+                targetTable = ctasTargetTableId == null
+                        ? (Table) db.getTableOrAnalysisException(tblName.getTbl())
+                        : (Table) db.getTableOrAnalysisException(ctasTargetTableId.longValue());
             } else if (db instanceof JdbcExternalDatabase) {
                 JdbcExternalTable jdbcTable = (JdbcExternalTable) db.getTableOrAnalysisException(tblName.getTbl());
                 targetTable = jdbcTable.getJdbcTable();

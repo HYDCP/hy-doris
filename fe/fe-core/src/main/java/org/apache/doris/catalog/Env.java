@@ -4370,6 +4370,15 @@ public class Env {
                 stmt.isSetIfExists(), stmt.isMustTemporary(), stmt.isForceDrop());
     }
 
+    public void rollbackCtas(CreateTableStmt createTable, boolean ifExists) throws DdlException {
+        OlapTable createdTable = createTable.getCreatedOlapTable();
+        if (createdTable != null) {
+            getInternalCatalog().rollbackCreatedOlapTable(createdTable);
+        } else {
+            dropTable(new DropTableStmt(ifExists, createTable.isTemp(), createTable.getDbTbl(), true));
+        }
+    }
+
     public void replayDropTable(Database db, long tableId, boolean isForceDrop,
                                 Long recycleTime) throws MetaNotFoundException {
         getInternalCatalog().replayDropTable(db, tableId, isForceDrop, recycleTime);
