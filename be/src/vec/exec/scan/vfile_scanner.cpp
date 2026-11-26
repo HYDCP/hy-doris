@@ -74,6 +74,7 @@
 #include "vec/exec/format/table/trino_connector_jni_reader.h"
 #include "vec/exec/format/text/text_reader.h"
 #include "vec/exec/format/wal/wal_reader.h"
+#include "vec/exec/scan/file_scan_io_statistics.h"
 #include "vec/exec/scan/vscan_node.h"
 #include "vec/exprs/vexpr.h"
 #include "vec/exprs/vexpr_context.h"
@@ -893,6 +894,11 @@ void VFileScanner::_truncate_char_or_varchar_column(Block* block, int idx, int l
     Block::erase_useless_column(block, num_columns_without_result);
 }
 
+static TFileType::type file_type_for_range(const TFileRangeDesc& range,
+                                           const TFileScanRangeParams& params) {
+    return range.__isset.file_type ? range.file_type : params.file_type;
+}
+
 Status VFileScanner::_get_next_reader() {
     while (true) {
         if (_cur_reader) {
@@ -904,7 +910,16 @@ Status VFileScanner::_get_next_reader() {
         _src_block_init = false;
         bool has_next = _first_scan_range;
         if (!_first_scan_range) {
-            RETURN_IF_ERROR(_split_source->get_next(&has_next, &_current_range));
+            TFileRangeDesc next_range;
+            RETURN_IF_ERROR(_split_source->get_next(&has_next, &next_range));
+            if (has_next) {
+                if (file_type_for_range(next_range, *_params) !=
+                    file_type_for_range(_current_range, *_params)) {
+                    // The scheduler can read several ranges before publishing its counters.
+                    update_realtime_counters();
+                }
+                _current_range = std::move(next_range);
+            }
         }
         _first_scan_range = false;
         if (!has_next || _should_stop) {
@@ -1590,25 +1605,19 @@ void VFileScanner::update_realtime_counters() {
         _query_statistics->add_scan_bytes(_file_reader_stats->read_bytes);
     }
 
-    if (_file_cache_statistics->bytes_read_from_local == 0 &&
-        _file_cache_statistics->bytes_read_from_remote == 0) {
-        if (_query_statistics) {
-            _query_statistics->add_scan_bytes_from_remote_storage(_file_reader_stats->read_bytes);
-        }
-        DorisMetrics::instance()->query_scan_bytes_from_local->increment(
-                _file_reader_stats->read_bytes);
-    } else {
-        if (_query_statistics) {
-            _query_statistics->add_scan_bytes_from_local_storage(
-                    _file_cache_statistics->bytes_read_from_local);
-            _query_statistics->add_scan_bytes_from_remote_storage(
-                    _file_cache_statistics->bytes_read_from_remote);
-        }
-        DorisMetrics::instance()->query_scan_bytes_from_local->increment(
-                _file_cache_statistics->bytes_read_from_local);
-        DorisMetrics::instance()->query_scan_bytes_from_remote->increment(
-                _file_cache_statistics->bytes_read_from_remote);
+    // Peer bytes are cumulative for the scanner profile. Only classify the new reads here.
+    const auto peer_cache_bytes =
+            _file_cache_statistics->bytes_read_from_peer - _reported_peer_cache_bytes;
+    _reported_peer_cache_bytes = _file_cache_statistics->bytes_read_from_peer;
+    const auto scan_bytes = classify_file_scan_bytes(file_type_for_range(_current_range, *_params),
+                                                     _file_reader_stats->read_bytes,
+                                                     *_file_cache_statistics, peer_cache_bytes);
+    if (_query_statistics) {
+        _query_statistics->add_scan_bytes_from_local_storage(scan_bytes.local);
+        _query_statistics->add_scan_bytes_from_remote_storage(scan_bytes.remote);
     }
+    DorisMetrics::instance()->query_scan_bytes_from_local->increment(scan_bytes.local);
+    DorisMetrics::instance()->query_scan_bytes_from_remote->increment(scan_bytes.remote);
 
     COUNTER_UPDATE(_file_read_bytes_counter, _file_reader_stats->read_bytes);
 
