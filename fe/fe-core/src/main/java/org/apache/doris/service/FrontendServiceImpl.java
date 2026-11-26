@@ -60,6 +60,7 @@ import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.AuthenticationException;
 import org.apache.doris.common.CaseSensibility;
+import org.apache.doris.common.ClientPool;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.DuplicatedRequestException;
@@ -1255,15 +1256,88 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             proxyQueryIdToConnCtx.put(params.getQueryId(), context);
             clearCallback = () -> proxyQueryIdToConnCtx.remove(params.getQueryId());
         }
-        TMasterOpResult result = processor.proxyExecute(params);
-        if (QueryState.MysqlStateType.ERR.name().equalsIgnoreCase(result.getStatus())) {
-            context.getState().setError(result.getStatus());
-        } else {
-            context.getState().setOk();
+        TMasterOpResult result;
+        try {
+            result = processor.proxyExecute(params);
+            if (QueryState.MysqlStateType.ERR.name().equalsIgnoreCase(result.getStatus())) {
+                context.getState().setError(result.getStatus());
+            } else {
+                context.getState().setOk();
+            }
+        } finally {
+            ConnectContext.remove();
+            clearCallback.run();
+            if (params.isSetTempTableOriginConnectionId()) {
+                try {
+                    cleanupLateTemporaryTables(fe, params.getTempTableOriginConnectionId(), context);
+                } catch (RuntimeException e) {
+                    LOG.warn("Could not finish temporary table cleanup for {}", context.getSessionId(), e);
+                }
+            }
         }
-        ConnectContext.remove();
-        clearCallback.run();
+        if (params.isSetTempTableOriginConnectionId()) {
+            result.setMaxJournalId(Env.getCurrentEnv().getMaxJournalId());
+        }
         return result;
+    }
+
+    void cleanupLateTemporaryTables(Frontend origin, int connectionId, ConnectContext proxy) {
+        Map<Long, Long> tables = proxy.snapshotTemporaryTables();
+        if (tables.isEmpty() || !isTemporaryTableOriginClosed(origin, connectionId, proxy.getSessionId())) {
+            return;
+        }
+
+        Env env = Env.getCurrentEnv();
+        if (!env.isMaster()) {
+            return;
+        }
+        InternalCatalog catalog = env.getInternalCatalog();
+        for (Map.Entry<Long, Long> entry : tables.entrySet()) {
+            long tableId = entry.getKey();
+            Database db = catalog.getDbNullable(entry.getValue().longValue());
+            if (db != null) {
+                try {
+                    catalog.dropTemporaryTable(db, tableId, proxy.getSessionId());
+                } catch (DdlException e) {
+                    LOG.warn("Could not clean late temporary table {} for disconnected session {}",
+                            tableId, proxy.getSessionId(), e);
+                }
+            }
+        }
+    }
+
+    boolean isTemporaryTableOriginClosed(Frontend origin, int connectionId, String sessionId) {
+        TNetworkAddress address = new TNetworkAddress(origin.getHost(), origin.getRpcPort());
+        FrontendService.Client client = null;
+        boolean transportOk = false;
+        try {
+            client = ClientPool.frontendPool.borrowObject(address, 1000);
+            Env env = Env.getCurrentEnv();
+            TFrontendReportAliveSessionRequest request = new TFrontendReportAliveSessionRequest(
+                    env.getClusterId(), env.getToken()).setConnectionId(connectionId);
+            TFrontendReportAliveSessionResult result = client.getAliveSessions(request);
+            transportOk = true;
+            return confirmsTemporaryTableOriginClosed(result, connectionId, sessionId);
+        } catch (Exception e) {
+            LOG.warn("Could not verify the origin connection {} on FE {} for temporary tables",
+                    connectionId, address, e);
+            return false;
+        } finally {
+            if (client != null) {
+                if (transportOk) {
+                    ClientPool.frontendPool.returnObject(address, client);
+                } else {
+                    ClientPool.frontendPool.invalidateObject(address, client);
+                }
+            }
+        }
+    }
+
+    static boolean confirmsTemporaryTableOriginClosed(TFrontendReportAliveSessionResult result,
+            int connectionId, String sessionId) {
+        return result.getStatus() == TStatusCode.OK && result.isSetSessionIdList()
+                && result.isSetCheckedConnectionId() && result.getCheckedConnectionId() == connectionId
+                && !result.getSessionIdList().contains(sessionId);
     }
 
     private List<String> getTableNames(String dbName, List<Long> tableIds) throws UserException {
@@ -2420,7 +2494,15 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                 result.setMsg("invalid token: " + Env.getCurrentEnv().getToken());
             } else {
                 result.setMsg("success");
-                result.setSessionIdList(env.getAllAliveSessionIds());
+                if (request.isSetConnectionId()) {
+                    ConnectContext context = ExecuteEnv.getInstance().getScheduler()
+                            .getConnectionForTemporaryTableCheck(request.getConnectionId());
+                    result.setCheckedConnectionId(request.getConnectionId());
+                    result.setSessionIdList(context == null || !context.isOpenForTemporaryTableCleanup()
+                            ? Collections.emptyList() : Collections.singletonList(context.getSessionId()));
+                } else {
+                    result.setSessionIdList(env.getAllAliveSessionIds());
+                }
             }
         } else {
             result.setStatus(TStatusCode.ILLEGAL_STATE);

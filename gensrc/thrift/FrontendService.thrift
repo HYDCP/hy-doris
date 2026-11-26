@@ -609,6 +609,7 @@ struct TMasterOpRequest {
 
     // temporary table
     1002: optional string sessionId
+    1003: optional i32 tempTableOriginConnectionId
 }
 
 struct TColumnDefinition {
@@ -970,12 +971,14 @@ struct TFrontendPingFrontendRequest {
 struct TFrontendReportAliveSessionRequest {
    1: required i32 clusterId
    2: required string token
+   3: optional i32 connectionId
 }
 
 struct TFrontendReportAliveSessionResult {
    1: required Status.TStatusCode status
    2: required string msg
    3: required list<string> sessionIdList
+   4: optional i32 checkedConnectionId
 }
 
 struct TDiskInfo {

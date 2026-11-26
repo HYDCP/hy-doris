@@ -865,11 +865,13 @@ public class Env {
     }
 
     public void registerTempTableAndSession(long dbId, Table table) {
-        if (ConnectContext.get() != null) {
-            ConnectContext.get().addTemporaryTable(dbId, table.getId());
+        String sessionId = Util.getTempTableSessionId(table.getName());
+        ConnectContext context = ConnectContext.get();
+        if (context != null && sessionId.equals(context.getSessionId())) {
+            context.addTemporaryTable(dbId, table.getId());
         }
 
-        refreshSession(Util.getTempTableSessionId(table.getName()));
+        refreshSession(sessionId);
     }
 
     public void unregisterTempTable(Table table) {
@@ -4368,6 +4370,15 @@ public class Env {
         }
         catalogIf.dropTable(stmt.getDbName(), stmt.getTableName(), stmt.isView(), stmt.isMaterializedView(),
                 stmt.isSetIfExists(), stmt.isMustTemporary(), stmt.isForceDrop());
+    }
+
+    public void rollbackCtas(CreateTableStmt createTable, boolean ifExists) throws DdlException {
+        OlapTable createdTable = createTable.getCreatedOlapTable();
+        if (createdTable != null) {
+            getInternalCatalog().rollbackCreatedOlapTable(createdTable);
+        } else {
+            dropTable(new DropTableStmt(ifExists, createTable.isTemp(), createTable.getDbTbl(), true));
+        }
     }
 
     public void replayDropTable(Database db, long tableId, boolean isForceDrop,

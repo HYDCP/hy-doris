@@ -17,13 +17,18 @@
 
 package org.apache.doris.qe;
 
+import org.apache.doris.analysis.TableName;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.FeNameFormat;
+import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.qe.QueryState.MysqlStateType;
+import org.apache.doris.thrift.TMasterOpRequest;
+import org.apache.doris.thrift.TMasterOpResult;
+import org.apache.doris.thrift.TTxnParams;
 import org.apache.doris.transaction.TransactionEntry;
 
 import mockit.Expectations;
@@ -126,6 +131,8 @@ class ConnectContextTempTableTest {
         ConnectContext ctx = new ConnectContext();
         ctx.addTemporaryTable(10L, 11L);
         ctx.beginStatementExecution();
+        ctx.onConnectionUnregistering();
+        Assertions.assertTrue(ctx.isOpenForTemporaryTableCleanup());
         ctx.cleanup();
         new Verifications() {
             {
@@ -136,6 +143,7 @@ class ConnectContextTempTableTest {
 
         ctx.addTemporaryTable(10L, 12L);
         ctx.endStatementExecution();
+        Assertions.assertFalse(ctx.isOpenForTemporaryTableCleanup());
         ctx.cleanup();
         Assertions.assertThrows(DdlException.class, ctx::beginStatementExecution);
 
@@ -172,20 +180,10 @@ class ConnectContextTempTableTest {
         List<String> sentSql = new ArrayList<>();
         new MockUp<MasterOpExecutor>() {
             @Mock
-            public void execute(Invocation invocation) {
+            public void executeTemporaryTableDrop(Invocation invocation) throws DdlException {
                 MasterOpExecutor operation = invocation.getInvokedInstance();
                 sentSql.add(operation.originStmt.originStmt);
-            }
-        };
-        new MockUp<FEOpExecutor>() {
-            @Mock
-            public int getStatusCode() {
-                return 1105;
-            }
-
-            @Mock
-            public String getErrMsg() {
-                return "injected forwarded error";
+                throw new DdlException("injected forwarded error");
             }
         };
 
@@ -200,9 +198,66 @@ class ConnectContextTempTableTest {
     void rejectsResetAfterUncertainCreate() {
         mockLocalCatalog(false);
         ConnectContext ctx = new ConnectContext();
-        ctx.markTemporaryTableDdlUncertain();
+        ctx.markTemporaryTableDdlUncertain(new TableName("internal", "stage", "tmp"));
         DdlException error = Assertions.assertThrows(DdlException.class, ctx::resetTemporaryTables);
         Assertions.assertTrue(error.getMessage().contains("unknown"));
+    }
+
+    @Test
+    void followerRetainsTransactionAfterMasterRejectsRollback() {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.setThreadLocalInfo();
+        TransactionEntry txn = new TransactionEntry();
+        txn.setTxnConf(new TTxnParams().setNeedTxn(true).setTxnId(-1));
+        Deencapsulation.setField(txn, "isTransactionBegan", true);
+        ctx.setTxnEntry(txn);
+        ctx.addTemporaryTable(10L, 11L);
+        new MockUp<FEOpExecutor>() {
+            @Mock
+            protected TMasterOpRequest buildStmtForwardParams() {
+                return new TMasterOpRequest();
+            }
+
+            @Mock
+            protected TMasterOpResult forward(TMasterOpRequest request) {
+                return new TMasterOpResult().setStatusCode(1105).setErrMessage("injected remote rollback failure");
+            }
+        };
+        try {
+            new MysqlConnectProcessor(ctx).handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.ERR, ctx.getState().getStateType());
+            Assertions.assertSame(txn, ctx.getTxnEntry());
+            new Verifications() {
+                {
+                    catalog.getDbNullable(anyLong);
+                    times = 0;
+                }
+            };
+        } finally {
+            ConnectContext.remove();
+        }
+    }
+
+    @Test
+    void followerDisconnectChecksMasterForCreateAbsentFromLocalReplay() {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.markTemporaryTableDdlUncertain(new TableName("internal", "stage", "late"));
+        List<String> sentSql = new ArrayList<>();
+        new MockUp<MasterOpExecutor>() {
+            @Mock
+            public void executeTemporaryTableDrop(Invocation invocation) {
+                MasterOpExecutor operation = invocation.getInvokedInstance();
+                sentSql.add(operation.originStmt.originStmt);
+            }
+        };
+        ctx.cleanup();
+        Assertions.assertEquals(1, sentSql.size());
+        Assertions.assertEquals("DROP TEMPORARY TABLE IF EXISTS `internal`.`stage`.`"
+                + ctx.getSessionId() + FeNameFormat.TEMPORARY_TABLE_SIGN + "late` FORCE", sentSql.get(0));
     }
 
     @Test

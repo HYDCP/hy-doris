@@ -348,7 +348,7 @@ public class TransactionEntry {
                 MasterOpExecutor masterOpExecutor = new MasterOpExecutor(originStmt, ConnectContext.get(),
                         RedirectStatus.NO_FORWARD, false);
                 LOG.info("forward rollback to Master for txn_id={}", transactionId);
-                masterOpExecutor.execute();
+                masterOpExecutor.executeCheckingSqlStatus();
                 return transactionId;
             }
         } else if (isInsertValuesTxnBegan()) {

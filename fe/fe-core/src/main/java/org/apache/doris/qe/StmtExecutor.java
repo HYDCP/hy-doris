@@ -1332,11 +1332,15 @@ public class StmtExecutor {
         }
         masterOpExecutor.setMoreStmtExists(moreStmtExists);
         TableName tempTableTarget = getForwardedTemporaryTableTarget();
+        if (tempTableTarget != null) {
+            tempTableTarget.analyze(new Analyzer(context.getEnv(), context));
+            masterOpExecutor.trackTemporaryTableCreation();
+        }
         try {
             masterOpExecutor.execute();
         } catch (Exception e) {
             if (tempTableTarget != null) {
-                context.markTemporaryTableDdlUncertain();
+                context.markTemporaryTableDdlUncertain(tempTableTarget);
                 try {
                     new MasterOpExecutor(context).syncJournal();
                     recordForwardedTemporaryTable(tempTableTarget);
@@ -3390,6 +3394,10 @@ public class StmtExecutor {
         // after success create table insert data
         try {
             parsedStmt = ctasStmt.getInsertStmt();
+            OlapTable createdTable = ctasStmt.getCreateTableStmt().getCreatedOlapTable();
+            if (createdTable != null) {
+                ((NativeInsertStmt) parsedStmt).setCtasTargetTableId(createdTable.getId());
+            }
             parsedStmt.setUserInfo(context.getCurrentUserIdentity());
             execute();
             if (MysqlStateType.ERR.equals(context.getState().getStateType())) {
@@ -3405,10 +3413,8 @@ public class StmtExecutor {
 
     private void handleCtasRollback(CreateTableStmt createTable) {
         if (context.getSessionVariable().isDropTableIfCtasFailed()) {
-            // insert error drop table
-            DropTableStmt dropTableStmt = new DropTableStmt(true, createTable.isTemp(), createTable.getDbTbl(), true);
             try {
-                DdlExecutor.execute(context.getEnv(), dropTableStmt);
+                context.getEnv().rollbackCtas(createTable, true);
             } catch (Exception ex) {
                 LOG.warn("CTAS drop table error, stmt={}", parsedStmt.toSql(), ex);
                 context.getState().setError(ErrorCode.ERR_UNKNOWN_ERROR, "Unexpected exception: " + ex.getMessage());

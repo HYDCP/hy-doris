@@ -905,7 +905,7 @@ public class InternalCatalog implements CatalogIf<Database> {
         costTimes.put("1:dbWriteLock", watch.getSplitTime());
         try {
             Table table = mustTemporary ? db.getTemporaryTableNullable(tableName) : db.getTableNullable(tableName);
-            if (mustTemporary && table != null) {
+            if (table != null && table.isTemporary()) {
                 ConnectContext context = ConnectContext.get();
                 // Preserve administrator cleanup by internal name. Other sessions may only drop their own tables.
                 if (context != null && !Util.getTempTableSessionId(table.getName()).equals(context.getSessionId())
@@ -984,6 +984,19 @@ public class InternalCatalog implements CatalogIf<Database> {
         costTimes.put("6:total", watch.getTime());
         LOG.info("finished dropping table: {} from db: {}, is view: {}, is force: {}, cost: {}",
                 tableName, dbName, isView, force, costTimes);
+    }
+
+    public void rollbackCreatedOlapTable(OlapTable table) throws DdlException {
+        Database db = getDbNullable(table.getQualifiedDbName());
+        if (db != null && db.writeLockIfExist()) {
+            try {
+                if (db.getTableNullable(table.getId()) == table) {
+                    dropTableInternal(db, table, false, true, null, null);
+                }
+            } finally {
+                db.writeUnlock();
+            }
+        }
     }
 
     public void dropTemporaryTable(Database db, long tableId, String sessionId) throws DdlException {
@@ -3401,6 +3414,9 @@ public class InternalCatalog implements CatalogIf<Database> {
             }
         }
 
+        if (!tableHasExist) {
+            stmt.setCreatedOlapTable(olapTable);
+        }
         return tableHasExist;
     }
 

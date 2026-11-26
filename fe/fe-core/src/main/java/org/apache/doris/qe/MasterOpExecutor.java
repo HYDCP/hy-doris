@@ -19,6 +19,7 @@ package org.apache.doris.qe;
 
 import org.apache.doris.analysis.RedirectStatus;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.thrift.TGroupCommitInfo;
 import org.apache.doris.thrift.TMasterOpRequest;
@@ -35,6 +36,7 @@ import org.apache.logging.log4j.Logger;
 public class MasterOpExecutor extends FEOpExecutor {
     private static final Logger LOG = LogManager.getLogger(MasterOpExecutor.class);
     private final int journalWaitTimeoutMs;
+    private boolean trackTemporaryTableCreation;
 
     public MasterOpExecutor(OriginStatement originStmt, ConnectContext ctx, RedirectStatus status, boolean isQuery) {
         super(new TNetworkAddress(ctx.getEnv().getMasterHost(), ctx.getEnv().getMasterRpcPort()),
@@ -57,6 +59,29 @@ public class MasterOpExecutor extends FEOpExecutor {
     public void execute() throws Exception {
         super.execute();
         waitOnReplaying();
+    }
+
+    public void executeCheckingSqlStatus() throws Exception {
+        super.execute(true, true);
+        waitOnReplaying();
+    }
+
+    public void executeTemporaryTableDrop() throws Exception {
+        super.execute(true, false);
+        waitOnReplaying();
+    }
+
+    public void trackTemporaryTableCreation() {
+        trackTemporaryTableCreation = true;
+    }
+
+    @Override
+    protected TMasterOpRequest buildStmtForwardParams() throws AnalysisException {
+        TMasterOpRequest params = super.buildStmtForwardParams();
+        if (trackTemporaryTableCreation && ctx.getConnectScheduler() != null) {
+            params.setTempTableOriginConnectionId(ctx.getConnectionId());
+        }
+        return params;
     }
 
     @Override

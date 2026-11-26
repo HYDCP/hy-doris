@@ -18,15 +18,16 @@
 package org.apache.doris.nereids.trees.plans.commands;
 
 import org.apache.doris.analysis.CreateTableStmt;
-import org.apache.doris.analysis.DropTableStmt;
 import org.apache.doris.analysis.StmtType;
-import org.apache.doris.analysis.TableName;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.nereids.NereidsPlanner;
 import org.apache.doris.nereids.analyzer.UnboundResultSink;
+import org.apache.doris.nereids.analyzer.UnboundTableSink;
 import org.apache.doris.nereids.analyzer.UnboundTableSinkCreator;
 import org.apache.doris.nereids.annotation.Developing;
 import org.apache.doris.nereids.exceptions.AnalysisException;
@@ -174,26 +175,30 @@ public class CreateTableCommand extends Command implements NeedAuditEncryption, 
 
         query = UnboundTableSinkCreator.createUnboundTableSink(createTableInfo.getTableNameParts(),
                 ImmutableList.of(), ImmutableList.of(), ImmutableList.of(), query);
+        OlapTable createdTable = createTableStmt.getCreatedOlapTable();
+        if (createdTable != null) {
+            query = ((UnboundTableSink<?>) query).withTargetTableId(createdTable.getId());
+        }
         try {
+            if (DebugPointUtil.isEnable("CreateTableCommand.beforeCtasInsert")) {
+                throw new AnalysisException("injected CTAS insert failure");
+            }
             if (!FeConstants.runningUnitTest) {
                 new InsertIntoTableCommand(query, Optional.empty(), Optional.empty(),
                         Optional.empty(), true, Optional.empty()).run(ctx, executor);
             }
             if (ctx.getState().getStateType() == MysqlStateType.ERR) {
-                handleFallbackFailedCtas(ctx);
+                handleFallbackFailedCtas(ctx, createTableStmt);
             }
         } catch (Exception e) {
-            handleFallbackFailedCtas(ctx);
+            handleFallbackFailedCtas(ctx, createTableStmt);
             throw new AnalysisException("Failed to execute CTAS Reason: " + e.getMessage(), e);
         }
     }
 
-    void handleFallbackFailedCtas(ConnectContext ctx) {
+    void handleFallbackFailedCtas(ConnectContext ctx, CreateTableStmt createTableStmt) {
         try {
-            Env.getCurrentEnv().dropTable(new DropTableStmt(
-                    createTableInfo.isTemp(), createTableInfo.isTemp(),
-                    new TableName(createTableInfo.getCtlName(),
-                            createTableInfo.getDbName(), createTableInfo.getTableName()), true));
+            Env.getCurrentEnv().rollbackCtas(createTableStmt, createTableStmt.isTemp());
         } catch (Exception e) {
             // TODO: refactor it with normal error process.
             ctx.getState().setError(ErrorCode.ERR_UNKNOWN_ERROR, e.getMessage());

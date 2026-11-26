@@ -27,6 +27,7 @@ import org.apache.doris.analysis.RedirectStatus;
 import org.apache.doris.analysis.ResourceTypeEnum;
 import org.apache.doris.analysis.SetVar;
 import org.apache.doris.analysis.StringLiteral;
+import org.apache.doris.analysis.TableName;
 import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.analysis.VariableExpr;
 import org.apache.doris.catalog.Database;
@@ -42,6 +43,7 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.FeNameFormat;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.Status;
 import org.apache.doris.common.UserException;
@@ -96,6 +98,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -254,7 +257,7 @@ public class ConnectContext {
     // These fields are guarded by this context's monitor. Match temporary tables by ID across replay and cleanup.
     private final Map<Long, Long> temporaryTableIdsToDbIds = new HashMap<>();
     private int activeStatements;
-    private boolean uncertainTempTableDdl;
+    private final Set<TableName> uncertainTempTableTargets = new HashSet<>();
     private final ReentrantLock tempTableCleanupLock = new ReentrantLock();
 
     // internal call like `insert overwrite` need skipAuth
@@ -931,7 +934,7 @@ public class ConnectContext {
         tempTableCleanupLock.lock();
         try {
             Map<Long, Long> snapshot;
-            boolean uncertain;
+            Set<TableName> uncertain;
             synchronized (this) {
                 if (activeStatements != 0) {
                     if (strict) {
@@ -940,15 +943,15 @@ public class ConnectContext {
                     return;
                 }
                 snapshot = new HashMap<>(temporaryTableIdsToDbIds);
-                uncertain = uncertainTempTableDdl;
+                uncertain = new HashSet<>(uncertainTempTableTargets);
             }
-            if (snapshot.isEmpty() && !uncertain) {
+            if (snapshot.isEmpty() && uncertain.isEmpty()) {
                 return;
             }
 
             Env currentEnv = Env.getCurrentEnv();
             InternalCatalog catalog = currentEnv.getInternalCatalog();
-            DdlException failure = uncertain
+            DdlException failure = strict && !uncertain.isEmpty()
                     ? new DdlException("The result of a forwarded temporary table statement is unknown") : null;
             for (Map.Entry<Long, Long> entry : snapshot.entrySet()) {
                 long tableId = entry.getKey();
@@ -972,6 +975,18 @@ public class ConnectContext {
                     }
                 }
             }
+            if (!strict) {
+                for (TableName target : uncertain) {
+                    try {
+                        cleanupUnconfirmedTemporaryTable(currentEnv, catalog, target);
+                        synchronized (this) {
+                            uncertainTempTableTargets.remove(target);
+                        }
+                    } catch (Exception e) {
+                        LOG.warn("Failed to clean unconfirmed temporary table {} for session {}", target, sessionId, e);
+                    }
+                }
+            }
             if (failure != null) {
                 if (strict) {
                     throw failure;
@@ -991,17 +1006,38 @@ public class ConnectContext {
         if (!table.isTemporary() || !sessionId.equals(Util.getTempTableSessionId(table.getName()))) {
             throw new DdlException("Table " + tableId + " is not a temporary table of the closing session");
         }
-        String sql = String.format("DROP TEMPORARY TABLE IF EXISTS `internal`.`%s`.`%s` FORCE",
-                db.getFullName().replace("`", "``"), table.getName().replace("`", "``"));
-        MasterOpExecutor operation = new MasterOpExecutor(new OriginStatement(sql, 0), this,
-                RedirectStatus.FORWARD_WITH_SYNC, false);
-        operation.execute();
-        if (operation.getStatusCode() != 0) {
-            throw new DdlException(operation.getErrMsg());
-        }
+        forwardTemporaryTableDrop(db.getFullName(), table.getName());
         if (db.getTableNullable(tableId) != null) {
             throw new DdlException("Temporary table " + tableId + " is still present after forwarded DROP");
         }
+    }
+
+    private void cleanupUnconfirmedTemporaryTable(Env env, InternalCatalog catalog, TableName target)
+            throws Exception {
+        if (!InternalCatalog.INTERNAL_CATALOG_NAME.equals(target.getCtl())) {
+            return;
+        }
+        String innerName = sessionId + FeNameFormat.TEMPORARY_TABLE_SIGN + target.getTbl();
+        if (!env.isMaster()) {
+            // The create may still be absent in the local journal. Check directly at the Master.
+            forwardTemporaryTableDrop(target.getDb(), innerName);
+            return;
+        }
+        Database db = catalog.getDbNullable(target.getDb());
+        if (db != null) {
+            Table table = db.getTemporaryTableNullable(innerName);
+            if (table != null) {
+                catalog.dropTemporaryTable(db, table.getId(), sessionId);
+            }
+        }
+    }
+
+    private void forwardTemporaryTableDrop(String dbName, String innerName) throws Exception {
+        String sql = String.format("DROP TEMPORARY TABLE IF EXISTS `internal`.`%s`.`%s` FORCE",
+                dbName.replace("`", "``"), innerName.replace("`", "``"));
+        MasterOpExecutor operation = new MasterOpExecutor(new OriginStatement(sql, 0), this,
+                RedirectStatus.FORWARD_WITH_SYNC, false);
+        operation.executeTemporaryTableDrop();
     }
 
     synchronized void beginStatementExecution() throws DdlException {
@@ -1011,10 +1047,24 @@ public class ConnectContext {
         activeStatements++;
     }
 
+    public synchronized void onConnectionUnregistering() {
+        isKilled = true;
+        if (activeStatements != 0 && connectScheduler != null) {
+            connectScheduler.retainClosingConnection(this);
+        }
+    }
+
+    public synchronized boolean isOpenForTemporaryTableCleanup() {
+        return !isKilled || activeStatements != 0;
+    }
+
     void endStatementExecution() {
         boolean cleanup;
         synchronized (this) {
             cleanup = --activeStatements == 0 && isKilled;
+            if (cleanup && connectScheduler != null) {
+                connectScheduler.releaseClosingConnection(this);
+            }
         }
         if (cleanup) {
             deleteTempTable();
@@ -1706,7 +1756,11 @@ public class ConnectContext {
                 entry.getValue() == db.getId() && db.getTableNullable(entry.getKey().longValue()) == null);
     }
 
-    synchronized void markTemporaryTableDdlUncertain() {
-        uncertainTempTableDdl = true;
+    synchronized void markTemporaryTableDdlUncertain(TableName target) {
+        uncertainTempTableTargets.add(target);
+    }
+
+    public synchronized Map<Long, Long> snapshotTemporaryTables() {
+        return new HashMap<>(temporaryTableIdsToDbIds);
     }
 }

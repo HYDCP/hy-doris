@@ -53,6 +53,7 @@ public class UnboundTableSink<CHILD_TYPE extends Plan> extends UnboundLogicalSin
     private final TPartialUpdateNewRowPolicy partialUpdateNewKeyPolicy;
     private final DMLCommandType dmlCommandType;
     private final boolean autoDetectPartition;
+    private final Optional<Long> targetTableId;
 
     public UnboundTableSink(List<String> nameParts, List<String> colNames, List<String> hints,
             List<String> partitions, CHILD_TYPE child) {
@@ -68,15 +69,8 @@ public class UnboundTableSink<CHILD_TYPE extends Plan> extends UnboundLogicalSin
             boolean isPartialUpdate, TPartialUpdateNewRowPolicy partialUpdateNewKeyPolicy,
             DMLCommandType dmlCommandType, Optional<GroupExpression> groupExpression,
             Optional<LogicalProperties> logicalProperties, CHILD_TYPE child) {
-        super(nameParts, PlanType.LOGICAL_UNBOUND_OLAP_TABLE_SINK, ImmutableList.of(), groupExpression,
-                logicalProperties, colNames, dmlCommandType, child);
-        this.hints = Utils.copyRequiredList(hints);
-        this.temporaryPartition = temporaryPartition;
-        this.partitions = Utils.copyRequiredList(partitions);
-        this.autoDetectPartition = false;
-        this.isPartialUpdate = isPartialUpdate;
-        this.partialUpdateNewKeyPolicy = partialUpdateNewKeyPolicy;
-        this.dmlCommandType = dmlCommandType;
+        this(nameParts, colNames, hints, temporaryPartition, partitions, false, isPartialUpdate,
+                partialUpdateNewKeyPolicy, dmlCommandType, groupExpression, logicalProperties, child);
     }
 
     /**
@@ -87,15 +81,35 @@ public class UnboundTableSink<CHILD_TYPE extends Plan> extends UnboundLogicalSin
             boolean isPartialUpdate, TPartialUpdateNewRowPolicy partialUpdateNewKeyPolicy,
             DMLCommandType dmlCommandType, Optional<GroupExpression> groupExpression,
             Optional<LogicalProperties> logicalProperties, CHILD_TYPE child) {
+        this(nameParts, colNames, hints, temporaryPartition, partitions, isAutoDetectPartition, isPartialUpdate,
+                partialUpdateNewKeyPolicy, dmlCommandType, groupExpression, logicalProperties, Optional.empty(), child);
+    }
+
+    private UnboundTableSink(List<String> nameParts, List<String> colNames, List<String> hints,
+            boolean temporaryPartition, List<String> partitions, boolean isAutoDetectPartition,
+            boolean isPartialUpdate, TPartialUpdateNewRowPolicy partialUpdateNewKeyPolicy,
+            DMLCommandType dmlCommandType, Optional<GroupExpression> groupExpression,
+            Optional<LogicalProperties> logicalProperties, Optional<Long> targetTableId, CHILD_TYPE child) {
         super(nameParts, PlanType.LOGICAL_UNBOUND_OLAP_TABLE_SINK, ImmutableList.of(), groupExpression,
                 logicalProperties, colNames, dmlCommandType, child);
         this.hints = Utils.copyRequiredList(hints);
         this.temporaryPartition = temporaryPartition;
         this.partitions = Utils.copyRequiredList(partitions);
         this.autoDetectPartition = isAutoDetectPartition;
+        this.targetTableId = targetTableId;
         this.isPartialUpdate = isPartialUpdate;
         this.partialUpdateNewKeyPolicy = partialUpdateNewKeyPolicy;
         this.dmlCommandType = dmlCommandType;
+    }
+
+    public Optional<Long> getTargetTableId() {
+        return targetTableId;
+    }
+
+    public UnboundTableSink<CHILD_TYPE> withTargetTableId(long tableId) {
+        return new UnboundTableSink<>(nameParts, colNames, hints, temporaryPartition, partitions, autoDetectPartition,
+                isPartialUpdate, partialUpdateNewKeyPolicy, dmlCommandType, groupExpression, Optional.empty(),
+                Optional.of(tableId), child());
     }
 
     public boolean isTemporaryPartition() {
@@ -131,7 +145,7 @@ public class UnboundTableSink<CHILD_TYPE extends Plan> extends UnboundLogicalSin
         Preconditions.checkArgument(children.size() == 1, "UnboundOlapTableSink only accepts one child");
         return new UnboundTableSink<>(nameParts, colNames, hints, temporaryPartition, partitions, autoDetectPartition,
                 isPartialUpdate, partialUpdateNewKeyPolicy, dmlCommandType, groupExpression, Optional.empty(),
-                        children.get(0));
+                targetTableId, children.get(0));
     }
 
     @Override
@@ -156,19 +170,20 @@ public class UnboundTableSink<CHILD_TYPE extends Plan> extends UnboundLogicalSin
         return Objects.equals(nameParts, that.nameParts)
                 && Objects.equals(colNames, that.colNames)
                 && Objects.equals(hints, that.hints)
-                && Objects.equals(partitions, that.partitions);
+                && Objects.equals(partitions, that.partitions)
+                && Objects.equals(targetTableId, that.targetTableId);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(nameParts, colNames, hints, partitions);
+        return Objects.hash(nameParts, colNames, hints, partitions, targetTableId);
     }
 
     @Override
     public Plan withGroupExpression(Optional<GroupExpression> groupExpression) {
         return new UnboundTableSink<>(nameParts, colNames, hints, temporaryPartition, partitions, autoDetectPartition,
                 isPartialUpdate, partialUpdateNewKeyPolicy, dmlCommandType, groupExpression,
-                        Optional.of(getLogicalProperties()), child());
+                Optional.of(getLogicalProperties()), targetTableId, child());
     }
 
     @Override
@@ -176,7 +191,7 @@ public class UnboundTableSink<CHILD_TYPE extends Plan> extends UnboundLogicalSin
             Optional<LogicalProperties> logicalProperties, List<Plan> children) {
         return new UnboundTableSink<>(nameParts, colNames, hints, temporaryPartition, partitions, autoDetectPartition,
                 isPartialUpdate, partialUpdateNewKeyPolicy, dmlCommandType, groupExpression, logicalProperties,
-                        children.get(0));
+                targetTableId, children.get(0));
     }
 
     @Override

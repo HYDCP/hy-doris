@@ -59,6 +59,7 @@ import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.literal.NullLiteral;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.commands.info.DMLCommandType;
+import org.apache.doris.nereids.trees.plans.commands.insert.InsertUtils;
 import org.apache.doris.nereids.trees.plans.logical.LogicalHiveTableSink;
 import org.apache.doris.nereids.trees.plans.logical.LogicalIcebergTableSink;
 import org.apache.doris.nereids.trees.plans.logical.LogicalJdbcTableSink;
@@ -621,10 +622,7 @@ public class BindSink implements AnalysisRuleFactory {
     }
 
     private Pair<Database, OlapTable> bind(CascadesContext cascadesContext, UnboundTableSink<? extends Plan> sink) {
-        List<String> tableQualifier = RelationUtil.getQualifierName(cascadesContext.getConnectContext(),
-                sink.getNameParts());
-        Pair<DatabaseIf<?>, TableIf> pair = RelationUtil.getDbAndTable(tableQualifier,
-                cascadesContext.getConnectContext().getEnv());
+        Pair<DatabaseIf<?>, TableIf> pair = InsertUtils.getTargetDbAndTable(sink, cascadesContext.getConnectContext());
         if (!(pair.second instanceof OlapTable)) {
             throw new AnalysisException("the target table of insert into is not an OLAP table");
         }

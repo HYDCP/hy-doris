@@ -55,6 +55,7 @@ public class FlightSqlConnectPoolMgr extends ConnectPoolMgr {
 
     @Override
     public void unregisterConnection(ConnectContext ctx) {
+        ctx.onConnectionUnregistering();
         ctx.closeTxn();
         if (connectionMap.remove(ctx.getConnectionId()) != null) {
             numberConnection.decrementAndGet();

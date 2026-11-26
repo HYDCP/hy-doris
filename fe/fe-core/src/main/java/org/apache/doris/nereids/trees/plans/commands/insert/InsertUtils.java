@@ -19,6 +19,7 @@ package org.apache.doris.nereids.trees.plans.commands.insert;
 
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
+import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.GeneratedColumnInfo;
 import org.apache.doris.catalog.KeysType;
@@ -27,6 +28,7 @@ import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FormatOptions;
+import org.apache.doris.common.Pair;
 import org.apache.doris.datasource.hive.HMSExternalTable;
 import org.apache.doris.datasource.jdbc.JdbcExternalTable;
 import org.apache.doris.nereids.CascadesContext;
@@ -551,8 +553,25 @@ public class InsertUtils {
      * get target table from names.
      */
     public static TableIf getTargetTable(Plan plan, ConnectContext ctx) {
-        List<String> tableQualifier = getTargetTableQualified(plan, ctx);
-        return RelationUtil.getTable(tableQualifier, ctx.getEnv());
+        return getTargetDbAndTable(plan, ctx).second;
+    }
+
+    /** Resolve a CTAS sink by its created table ID, or a regular INSERT sink by name. */
+    public static Pair<DatabaseIf<?>, TableIf> getTargetDbAndTable(Plan plan, ConnectContext ctx) {
+        List<String> qualifier = getTargetTableQualified(plan, ctx);
+        if (plan instanceof UnboundTableSink) {
+            Optional<Long> tableId = ((UnboundTableSink<?>) plan).getTargetTableId();
+            if (tableId.isPresent()) {
+                Database db = ctx.getEnv().getInternalCatalog().getDbNullable(qualifier.get(1));
+                if (db == null) {
+                    throw new AnalysisException("Database " + qualifier.get(1) + " does not exist");
+                }
+                Table table = db.getTableOrException(tableId.get().longValue(),
+                        id -> new AnalysisException("CTAS target table " + id + " no longer exists"));
+                return Pair.of(db, table);
+            }
+        }
+        return RelationUtil.getDbAndTable(qualifier, ctx.getEnv());
     }
 
     /**
