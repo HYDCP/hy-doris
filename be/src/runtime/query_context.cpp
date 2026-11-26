@@ -289,8 +289,14 @@ void QueryContext::set_pipeline_context(
 }
 
 void QueryContext::register_query_statistics(std::shared_ptr<QueryStatistics> qs) {
+    std::optional<TNetworkAddress> monitoring_fe_addr;
+    if (_query_options.__isset.report_query_statistics_to_coordinator &&
+        _query_options.report_query_statistics_to_coordinator) {
+        monitoring_fe_addr = coord_addr;
+    }
     _exec_env->runtime_query_statistics_mgr()->register_query_statistics(
-            print_id(_query_id), qs, current_connect_fe, _query_options.query_type);
+            print_id(_query_id), std::move(qs), current_connect_fe, _query_options.query_type,
+            std::move(monitoring_fe_addr));
 }
 
 std::shared_ptr<QueryStatistics> QueryContext::get_query_statistics() {
@@ -301,12 +307,10 @@ std::shared_ptr<QueryStatistics> QueryContext::get_query_statistics() {
 void QueryContext::register_memory_statistics() {
     if (query_mem_tracker) {
         std::shared_ptr<QueryStatistics> qs = query_mem_tracker->get_query_statistics();
-        std::string query_id = print_id(_query_id);
         if (qs) {
-            _exec_env->runtime_query_statistics_mgr()->register_query_statistics(
-                    query_id, qs, current_connect_fe, _query_options.query_type);
+            register_query_statistics(std::move(qs));
         } else {
-            LOG(INFO) << " query " << query_id << " get memory query statistics failed ";
+            LOG(INFO) << " query " << print_id(_query_id) << " get memory query statistics failed ";
         }
     }
 }
@@ -314,9 +318,7 @@ void QueryContext::register_memory_statistics() {
 void QueryContext::register_cpu_statistics() {
     if (!_cpu_statistics) {
         _cpu_statistics = std::make_shared<QueryStatistics>();
-        _exec_env->runtime_query_statistics_mgr()->register_query_statistics(
-                print_id(_query_id), _cpu_statistics, current_connect_fe,
-                _query_options.query_type);
+        register_query_statistics(_cpu_statistics);
     }
 }
 

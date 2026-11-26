@@ -257,11 +257,13 @@ public class WorkloadRuntimeStatusMgr extends MasterDaemon {
 
     private void mergeProgress(TQueryStatistics dst, TQueryStatistics src, boolean firstReport) {
         if (src.isSetTotalTasksNum() && src.isSetFinishedTasksNum()
+                && src.total_tasks_num > 0 && src.finished_tasks_num >= 0
+                && src.finished_tasks_num <= src.total_tasks_num
                 && (firstReport || dst.isSetTotalTasksNum())) {
             dst.setTotalTasksNum(dst.total_tasks_num + src.total_tasks_num);
             dst.setFinishedTasksNum(dst.finished_tasks_num + src.finished_tasks_num);
         } else {
-            // An old BE report has no progress counters. Keep the query's progress unknown.
+            // Old BEs omit the counters. A new BE can report before its tasks are ready.
             dst.unsetTotalTasksNum();
             dst.unsetFinishedTasksNum();
         }

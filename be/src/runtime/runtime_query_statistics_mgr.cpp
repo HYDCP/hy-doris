@@ -346,14 +346,23 @@ void QueryStatisticsCtx::collect_query_statistics(TQueryStatistics* tq_s) {
     tq_s->__set_workload_group_id(_wg_id);
 }
 
-void RuntimeQueryStatisticsMgr::register_query_statistics(std::string query_id,
-                                                          std::shared_ptr<QueryStatistics> qs_ptr,
-                                                          TNetworkAddress fe_addr,
-                                                          TQueryType::type query_type) {
+void QueryStatisticsCtx::append_to_report(const std::string& query_id,
+                                          QueryStatisticsReports& reports) {
+    TQueryStatistics statistics;
+    collect_query_statistics(&statistics);
+    if (_monitoring_fe_addr && *_monitoring_fe_addr != _fe_addr) {
+        reports[*_monitoring_fe_addr].emplace(query_id, statistics);
+    }
+    reports[_fe_addr].emplace(query_id, std::move(statistics));
+}
+
+void RuntimeQueryStatisticsMgr::register_query_statistics(
+        std::string query_id, std::shared_ptr<QueryStatistics> qs_ptr, TNetworkAddress fe_addr,
+        TQueryType::type query_type, std::optional<TNetworkAddress> monitoring_fe_addr) {
     std::lock_guard<std::shared_mutex> write_lock(_qs_ctx_map_lock);
     if (_query_statistics_ctx_map.find(query_id) == _query_statistics_ctx_map.end()) {
-        _query_statistics_ctx_map[query_id] =
-                std::make_unique<QueryStatisticsCtx>(fe_addr, query_type);
+        _query_statistics_ctx_map[query_id] = std::make_unique<QueryStatisticsCtx>(
+                std::move(fe_addr), query_type, std::move(monitoring_fe_addr));
     }
     _query_statistics_ctx_map.at(query_id)->_qs_list.push_back(qs_ptr);
 }
@@ -361,8 +370,8 @@ void RuntimeQueryStatisticsMgr::register_query_statistics(std::string query_id,
 void RuntimeQueryStatisticsMgr::report_runtime_query_statistics() {
     int64_t be_id = ExecEnv::GetInstance()->cluster_info()->backend_id;
     // 1 get query statistics map
-    std::map<TNetworkAddress, std::map<std::string, TQueryStatistics>> fe_qs_map;
-    std::map<std::string, std::pair<bool, bool>> qs_status; // <finished, timeout>
+    QueryStatisticsReports fe_qs_map;
+    std::map<std::string, bool> finished_queries; // query_id -> expired
     {
         std::lock_guard<std::shared_mutex> write_lock(_qs_ctx_map_lock);
         int64_t current_time = MonotonicMillis();
@@ -372,27 +381,17 @@ void RuntimeQueryStatisticsMgr::report_runtime_query_statistics() {
             std::string query_id = iter->first;
             auto& qs_ctx_ptr = iter->second;
             bool is_query_finished = qs_ctx_ptr->_is_query_finished;
-            bool is_timeout_after_finish = false;
-            if (is_query_finished) {
-                is_timeout_after_finish =
-                        (current_time - qs_ctx_ptr->_query_finish_time) > conf_qs_timeout;
-            }
-
-            // external query not need to report to FE, so we can remove it directly.
+            // External queries have no FE to report to.
             if (qs_ctx_ptr->_query_type == TQueryType::EXTERNAL && is_query_finished) {
                 iter = _query_statistics_ctx_map.erase(iter);
             } else {
                 if (qs_ctx_ptr->_query_type != TQueryType::EXTERNAL) {
-                    if (fe_qs_map.find(qs_ctx_ptr->_fe_addr) == fe_qs_map.end()) {
-                        std::map<std::string, TQueryStatistics> tmp_map;
-                        fe_qs_map[qs_ctx_ptr->_fe_addr] = std::move(tmp_map);
+                    qs_ctx_ptr->append_to_report(query_id, fe_qs_map);
+                    if (is_query_finished) {
+                        finished_queries.emplace(
+                                query_id,
+                                current_time - qs_ctx_ptr->_query_finish_time > conf_qs_timeout);
                     }
-
-                    TQueryStatistics ret_t_qs;
-                    qs_ctx_ptr->collect_query_statistics(&ret_t_qs);
-                    fe_qs_map.at(qs_ctx_ptr->_fe_addr)[query_id] = ret_t_qs;
-                    qs_status[query_id] =
-                            std::make_pair(is_query_finished, is_timeout_after_finish);
                 }
 
                 iter++;
@@ -472,22 +471,15 @@ void RuntimeQueryStatisticsMgr::report_runtime_query_statistics() {
         }
     }
 
-    //  3 when query is finished and (last rpc is send success), remove finished query statistics
-    if (fe_qs_map.size() == 0) {
-        return;
-    }
-
-    {
+    // A finished query's last sample is needed by both the audit and monitoring FE.
+    if (!finished_queries.empty()) {
         std::lock_guard<std::shared_mutex> write_lock(_qs_ctx_map_lock);
-        for (auto& [addr, qs_map] : fe_qs_map) {
-            bool is_rpc_success = rpc_result[addr];
-            for (auto& [query_id, qs] : qs_map) {
-                auto& qs_status_pair = qs_status[query_id];
-                bool is_query_finished = qs_status_pair.first;
-                bool is_timeout_after_finish = qs_status_pair.second;
-                if ((is_rpc_success && is_query_finished) || is_timeout_after_finish) {
-                    _query_statistics_ctx_map.erase(query_id);
-                }
+        for (const auto& [query_id, expired] : finished_queries) {
+            const auto& ctx = _query_statistics_ctx_map.at(query_id);
+            if (expired ||
+                (rpc_result.at(ctx->_fe_addr) &&
+                 (!ctx->_monitoring_fe_addr || rpc_result.at(*ctx->_monitoring_fe_addr)))) {
+                _query_statistics_ctx_map.erase(query_id);
             }
         }
     }

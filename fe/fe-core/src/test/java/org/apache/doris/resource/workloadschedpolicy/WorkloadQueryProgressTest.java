@@ -52,6 +52,25 @@ class WorkloadQueryProgressTest {
         }
     }
 
+    @Test
+    void progressWaitsForTasksOnEveryBackend() {
+        for (long preparingBackendId : new long[] {1L, 2L}) {
+            WorkloadRuntimeStatusMgr manager = new WorkloadRuntimeStatusMgr();
+            report(manager, preparingBackendId, new TQueryStatistics().setTotalTasksNum(0).setFinishedTasksNum(0));
+            report(manager, 3L - preparingBackendId,
+                    new TQueryStatistics().setTotalTasksNum(5).setFinishedTasksNum(5));
+
+            TQueryStatistics merged = manager.buildQueryStatisticsSnapshot().getStatistics().get("query");
+            Assertions.assertFalse(merged.isSetTotalTasksNum());
+            Assertions.assertFalse(merged.isSetFinishedTasksNum());
+
+            report(manager, preparingBackendId, new TQueryStatistics().setTotalTasksNum(10).setFinishedTasksNum(0));
+            merged = manager.buildQueryStatisticsSnapshot().getStatistics().get("query");
+            Assertions.assertEquals(15, merged.getTotalTasksNum());
+            Assertions.assertEquals(5, merged.getFinishedTasksNum());
+        }
+    }
+
     private void report(WorkloadRuntimeStatusMgr manager, long backendId, TQueryStatistics statistics) {
         manager.updateBeQueryStats(new TReportWorkloadRuntimeStatusParams()
                 .setBackendId(backendId).setQueryStatisticsMap(ImmutableMap.of("query", statistics)));
