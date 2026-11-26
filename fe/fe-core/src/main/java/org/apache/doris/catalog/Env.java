@@ -4375,7 +4375,7 @@ public class Env {
     public void rollbackCtas(CreateTableStmt createTable, boolean ifExists) throws DdlException {
         Table createdTable = createTable.getCreatedTable();
         if (createdTable != null) {
-            getInternalCatalog().rollbackCreatedTable(createdTable);
+            getInternalCatalog().rollbackCreatedTable(createTable.getCreatedTableDbId(), createdTable);
         } else if (InternalCatalog.INTERNAL_CATALOG_NAME.equals(createTable.getDbTbl().getCtl())) {
             throw new DdlException("Cannot roll back internal CTAS without the created table identity");
         } else {

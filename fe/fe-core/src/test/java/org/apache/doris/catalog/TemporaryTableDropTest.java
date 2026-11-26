@@ -47,7 +47,7 @@ class TemporaryTableDropTest {
         Database db = new Database(7L, "db");
         Mockito.when(env.getInternalCatalog()).thenReturn(catalog);
         Mockito.when(catalog.getDbOrDdlException("db")).thenReturn(db);
-        Mockito.when(catalog.getDbNullable("db")).thenReturn(db);
+        Mockito.when(catalog.getDbNullable(7L)).thenReturn(db);
         Mockito.when(env.getNextId()).thenReturn(9L);
         JdbcResource resource = Mockito.mock(JdbcResource.class);
         Mockito.when(resource.getType()).thenReturn(Resource.ResourceType.JDBC);
@@ -55,7 +55,7 @@ class TemporaryTableDropTest {
         Mockito.when(resource.getProperty(JdbcResource.JDBC_URL)).thenReturn("jdbc:mysql://localhost/test");
         Mockito.when(env.getResourceMgr().getResource("test_resource")).thenReturn(resource);
         Mockito.doCallRealMethod().when(catalog).createTable(Mockito.any());
-        Mockito.doCallRealMethod().when(catalog).rollbackCreatedTable(Mockito.any());
+        Mockito.doCallRealMethod().when(catalog).rollbackCreatedTable(Mockito.anyLong(), Mockito.any());
         Mockito.doCallRealMethod().when(catalog).unprotectDropTable(Mockito.any(), Mockito.any(),
                 Mockito.anyBoolean(), Mockito.anyBoolean(), Mockito.anyLong());
         Mockito.doCallRealMethod().when(env).rollbackCtas(Mockito.any(), Mockito.anyBoolean());
@@ -75,6 +75,8 @@ class TemporaryTableDropTest {
             Assertions.assertSame(db.getTableNullable(9L), stmt.getCreatedTable());
             Assertions.assertSame(temp, db.getTableNullable("mixed"));
 
+            // RENAME may update the name index while CTAS is rolling back. The database ID stays valid.
+            db.setNameWithLock("renamed_db");
             env.rollbackCtas(stmt, false);
             Assertions.assertSame(temp, db.getTableNullable(8L));
             Assertions.assertNull(db.getTableNullable(9L));
