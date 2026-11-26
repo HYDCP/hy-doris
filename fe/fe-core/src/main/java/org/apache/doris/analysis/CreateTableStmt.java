@@ -84,6 +84,7 @@ public class CreateTableStmt extends DdlStmt implements NotFallbackInParser {
     private boolean isExternal;
     private boolean isTemp;
     private Table createdTable;
+    private long createdTableDbId;
     protected TableName tableName;
     protected List<ColumnDef> columnDefs;
     private List<IndexDef> indexDefs;
@@ -237,7 +238,12 @@ public class CreateTableStmt extends DdlStmt implements NotFallbackInParser {
         return createdTable;
     }
 
-    public void setCreatedTable(Table table) {
+    public long getCreatedTableDbId() {
+        return createdTableDbId;
+    }
+
+    public void setCreatedTable(long dbId, Table table) {
+        createdTableDbId = dbId;
         createdTable = table;
     }
 

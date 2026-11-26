@@ -986,8 +986,8 @@ public class InternalCatalog implements CatalogIf<Database> {
                 tableName, dbName, isView, force, costTimes);
     }
 
-    public void rollbackCreatedTable(Table table) throws DdlException {
-        Database db = getDbNullable(table.getQualifiedDbName());
+    public void rollbackCreatedTable(long dbId, Table table) throws DdlException {
+        Database db = getDbNullable(dbId);
         if (db != null && db.writeLockIfExist()) {
             try {
                 if (db.getTableNullable(table.getId()) == table) {
@@ -3399,7 +3399,7 @@ public class InternalCatalog implements CatalogIf<Database> {
         }
 
         if (!tableHasExist) {
-            stmt.setCreatedTable(olapTable);
+            stmt.setCreatedTable(db.getId(), olapTable);
         }
         return tableHasExist;
     }
@@ -3493,7 +3493,7 @@ public class InternalCatalog implements CatalogIf<Database> {
         if (Boolean.TRUE.equals(result.second)) {
             return true;
         }
-        stmt.setCreatedTable(table);
+        stmt.setCreatedTable(db.getId(), table);
         LOG.info("successfully create table[{}-{}]", table.getName(), table.getId());
         return false;
     }
