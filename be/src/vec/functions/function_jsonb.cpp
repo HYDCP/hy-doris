@@ -453,9 +453,11 @@ public:
         }
 
         ColumnPtr jsonb_data_column = nullptr;
+        bool data_const = false;
         const NullMap* data_null_map = nullptr;
         // prepare jsonb data column
-        jsonb_data_column = unpack_if_const(block.get_by_position(arguments[0]).column).first;
+        std::tie(jsonb_data_column, data_const) =
+                unpack_if_const(block.get_by_position(arguments[0]).column);
         if (block.get_by_position(arguments[0]).column->is_nullable()) {
             const auto* nullable = check_and_get_column<ColumnNullable>(jsonb_data_column);
             jsonb_data_column = nullable->get_nested_column_ptr();
@@ -492,17 +494,17 @@ public:
         if (jsonb_path_column) {
             if (path_const) {
                 st = inner_loop_impl<true, true>(input_rows_count, *dst_arr, dst_nested_column,
-                                                 res_null_map, *col_from_string, data_null_map,
-                                                 jsonb_path_col, path_null_map);
+                                                 res_null_map, *col_from_string, data_const,
+                                                 data_null_map, jsonb_path_col, path_null_map);
             } else {
                 st = inner_loop_impl<true, false>(input_rows_count, *dst_arr, dst_nested_column,
-                                                  res_null_map, *col_from_string, data_null_map,
-                                                  jsonb_path_col, path_null_map);
+                                                  res_null_map, *col_from_string, data_const,
+                                                  data_null_map, jsonb_path_col, path_null_map);
             }
         } else {
             st = inner_loop_impl<false, false>(input_rows_count, *dst_arr, dst_nested_column,
-                                               res_null_map, *col_from_string, data_null_map,
-                                               jsonb_path_col, path_null_map);
+                                               res_null_map, *col_from_string, data_const,
+                                               data_null_map, jsonb_path_col, path_null_map);
         }
         if (!st.ok()) {
             return st;
@@ -518,7 +520,7 @@ private:
                                                 ColumnNullable& dst_nested_column,
                                                 NullMap& res_null_map,
                                                 const ColumnString& col_from_string,
-                                                const NullMap* jsonb_data_nullmap,
+                                                bool data_const, const NullMap* jsonb_data_nullmap,
                                                 const ColumnString* jsonb_path_column,
                                                 const NullMap* path_null_map) {
         // if path is const, we just need to parse it once
@@ -549,8 +551,8 @@ private:
                 }
             }
             // extract jsonb keys
-            size_t l_off = loffsets[i - 1];
-            size_t l_size = loffsets[i] - l_off;
+            size_t l_off = loffsets[index_check_const(i, data_const) - 1];
+            size_t l_size = loffsets[index_check_const(i, data_const)] - l_off;
             if (l_size == 0) {
                 res_null_map[i] = 1;
                 dst_arr.insert_default();
@@ -831,7 +833,7 @@ public:
             const std::vector<const ColumnString*>& rdata_columns, // here we can support more paths
             const std::vector<bool>& path_const, ColumnString::Chars& res_data,
             ColumnString::Offsets& res_offsets, NullMap& null_map, bool& is_invalid_json_path) {
-        size_t input_rows_count = json_data_const ? rdata_columns.size() : loffsets.size();
+        const size_t input_rows_count = null_map.size();
         res_offsets.resize(input_rows_count);
 
         auto writer = std::make_unique<JsonbWriter>();
@@ -1392,8 +1394,10 @@ struct JsonbLengthUtil {
         MutableColumnPtr res = return_type->create_column();
 
         for (size_t i = 0; i < input_rows_count; ++i) {
-            if (jsonb_data_column->is_null_at(i) || path_column->is_null_at(i) ||
-                (jsonb_data_column->get_data_at(i).size == 0)) {
+            const auto jsonb_index = index_check_const(i, jsonb_data_const);
+            if (jsonb_data_column->is_null_at(jsonb_index) ||
+                path_column->is_null_at(index_check_const(i, is_const)) ||
+                (jsonb_data_column->get_data_at(jsonb_index).size == 0)) {
                 null_map->get_data()[i] = 1;
                 res->insert_data(nullptr, 0);
                 continue;
@@ -1409,7 +1413,7 @@ struct JsonbLengthUtil {
                                              path_value.size));
                 }
             }
-            auto jsonb_value = jsonb_data_column->get_data_at(i);
+            auto jsonb_value = jsonb_data_column->get_data_at(jsonb_index);
             // doc is NOT necessary to be deleted since JsonbDocument will not allocate memory
             JsonbDocument* doc = nullptr;
             RETURN_IF_ERROR(JsonbDocument::checkAndCreateDocument(jsonb_value.data,
