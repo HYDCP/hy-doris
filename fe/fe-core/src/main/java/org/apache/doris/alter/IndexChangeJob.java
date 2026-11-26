@@ -24,6 +24,7 @@ import org.apache.doris.catalog.Index;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.catalog.Tablet;
@@ -359,8 +360,9 @@ public class IndexChangeJob implements Writable {
         // and the job will be in RUNNING state forever.
         Database db = Env.getCurrentInternalCatalog()
                 .getDbOrException(dbId, s -> new AlterCancelException("Database " + s + " does not exist"));
+        OlapTable tbl;
         try {
-            db.getTableOrMetaException(tableId, TableType.OLAP);
+            tbl = (OlapTable) db.getTableOrMetaException(tableId, TableType.OLAP);
         } catch (MetaNotFoundException e) {
             throw new AlterCancelException(e.getMessage());
         }
@@ -387,11 +389,18 @@ public class IndexChangeJob implements Writable {
             return;
         }
 
-        this.jobState = JobState.FINISHED;
-        this.finishedTimeMs = System.currentTimeMillis();
+        // write the edit log with the write lock of the table held, as the state token changes with it
+        tbl.writeLockOrAlterCancelException();
+        try {
+            onFinished(tbl);
+            this.jobState = JobState.FINISHED;
+            this.finishedTimeMs = System.currentTimeMillis();
 
-        if (!FeConstants.runningUnitTest) {
-            Env.getCurrentEnv().getEditLog().logIndexChangeJob(this);
+            if (!FeConstants.runningUnitTest) {
+                Env.getCurrentEnv().getEditLog().logIndexChangeJob(this);
+            }
+        } finally {
+            tbl.writeUnlock();
         }
         LOG.info("inverted index job finished: {}", jobId);
     }
@@ -410,17 +419,69 @@ public class IndexChangeJob implements Writable {
         jobState = JobState.CANCELLED;
         this.errMsg = errMsg;
         this.finishedTimeMs = System.currentTimeMillis();
-        if (!FeConstants.runningUnitTest) {
-            Env.getCurrentEnv().getEditLog().logIndexChangeJob(this);
+        // the database or the table may have been dropped, which is a reason to cancel
+        OlapTable tbl = getTableNullable();
+        if (tbl == null) {
+            logCancelledJob();
+        } else {
+            // write the edit log with the write lock of the table held, as the state token changes with it
+            tbl.writeLock();
+            try {
+                onCancelled(tbl);
+                logCancelledJob();
+            } finally {
+                tbl.writeUnlock();
+            }
         }
         LOG.info("cancel index job {}, err: {}", jobId, errMsg);
         return true;
+    }
+
+    private void logCancelledJob() {
+        if (!FeConstants.runningUnitTest) {
+            Env.getCurrentEnv().getEditLog().logIndexChangeJob(this);
+        }
     }
 
     private void cancelInternal() {
         // clear tasks if has
         AgentTaskQueue.removeBatchTask(invertedIndexBatchTask, TTaskType.ALTER_INVERTED_INDEX);
         // TODO maybe delete already build index files
+    }
+
+    private OlapTable getTableNullable() {
+        Database db = Env.getCurrentInternalCatalog().getDbNullable(dbId);
+        if (db == null) {
+            return null;
+        }
+        return (OlapTable) db.getTableNullable(tableId);
+    }
+
+    /**
+     * The tasks wrote or deleted the inverted index files of the rowsets of the partition on every replica and the
+     * version stays the same: the state token no longer names the files, see PartitionStateToken. The caller holds
+     * the write lock of the table, on the master and on replay. The partition may have been dropped after the tasks
+     * finished; RECOVER PARTITION invalidates its token.
+     */
+    private void onFinished(OlapTable tbl) {
+        Partition partition = tbl.getPartition(partitionId);
+        if (partition != null) {
+            PartitionStateToken.invalidate(partition);
+        }
+    }
+
+    /**
+     * Tasks that ran changed the inverted index files of the replicas they reached, and the cancel does not undo
+     * them: the replicas of the partition may differ, so the partition is tainted, see PartitionStateToken. Tainted
+     * in any state: the tasks are sent when WAITING_TXN passes to RUNNING, which is not logged, and a new master
+     * sends the tasks of a job again, so neither a follower nor a new master can tell whether some ran. The caller
+     * holds the write lock of the table, on the master and on replay. The partition may have been dropped.
+     */
+    private void onCancelled(OlapTable tbl) {
+        Partition partition = tbl.getPartition(partitionId);
+        if (partition != null) {
+            PartitionStateToken.taint(partition);
+        }
     }
 
     public void replay(IndexChangeJob replayedJob) {
@@ -452,7 +513,15 @@ public class IndexChangeJob implements Writable {
     }
 
     private void replayRunningJob(IndexChangeJob replayedJob) {
-        // do nothing, finish inverted index task
+        OlapTable tbl = getTableNullable();
+        if (tbl != null) {
+            tbl.writeLock();
+            try {
+                onFinished(tbl);
+            } finally {
+                tbl.writeUnlock();
+            }
+        }
         this.jobState = JobState.FINISHED;
         this.finishedTimeMs = replayedJob.finishedTimeMs;
         LOG.info("replay finished inverted index job: {} table id: {}", jobId, tableId);
@@ -463,6 +532,15 @@ public class IndexChangeJob implements Writable {
      */
     private void replayCancelled(IndexChangeJob replayedJob) {
         cancelInternal();
+        OlapTable tbl = getTableNullable();
+        if (tbl != null) {
+            tbl.writeLock();
+            try {
+                onCancelled(tbl);
+            } finally {
+                tbl.writeUnlock();
+            }
+        }
 
         this.jobState = JobState.CANCELLED;
         this.errMsg = replayedJob.errMsg;

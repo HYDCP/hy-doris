@@ -2954,6 +2954,19 @@ public class Config extends ConfigBase {
             "The number of concurrent restore tasks per be"})
     public static int restore_task_concurrency_per_be = 5000;
 
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "master 是否跟踪分区的状态令牌（见 PartitionStateToken）：可见的事务给它写的每个分区一个令牌，"
+                    + "CCR 增量在延续本地状态时沿用源版本的令牌，恢复沿用备份的令牌。只改变元数据。"
+                    + "只在 master 记录事务日志时读取，回放时不读。为 false（默认）时不写任何新的元数据"
+                    + "（没有新的日志类型，备份里没有令牌），可以回滚到没有这个功能的 FE。",
+            "Whether the master tracks the state token of the partitions (see PartitionStateToken): a transaction "
+                    + "made visible gives each partition it writes a token, a CCR increment adopts the token of the "
+                    + "source version when it continues the local state, and a restore adopts the token of the "
+                    + "backup. It only changes the metadata. Read only when the master logs a transaction, never on "
+                    + "replay. If false (the default) nothing new is persisted (no new kind of log, no token in a "
+                    + "backup), so the frontends can be rolled back to a version without it."})
+    public static boolean restore_state_token_track = false;
+
     @ConfField(mutable = true, description = {"执行 agent task 时，BE心跳超过多长时间，认为BE不可用",
             "The time after which BE is considered unavailable if the heartbeat is not received"})
     public static int agent_task_be_unavailable_heartbeat_timeout_second = 300;

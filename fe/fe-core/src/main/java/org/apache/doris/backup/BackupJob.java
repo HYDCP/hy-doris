@@ -32,6 +32,7 @@ import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.Table;
+import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.catalog.View;
 import org.apache.doris.common.Config;
@@ -576,6 +577,10 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                 continue;
             }
             hasValidTables = true;
+            if (tbl.getType() == TableType.OLAP) {
+                // a partition whose state token was invalidated gets a new one before the versions are taken
+                env.namePartitionsWithoutStateToken(db, (OlapTable) tbl);
+            }
             tbl.readLock();
             try {
                 switch (tbl.getType()) {

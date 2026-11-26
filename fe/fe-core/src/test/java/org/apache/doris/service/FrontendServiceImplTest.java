@@ -20,6 +20,7 @@ package org.apache.doris.service;
 
 import org.apache.doris.analysis.CreateDbStmt;
 import org.apache.doris.analysis.CreateTableStmt;
+import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
@@ -39,6 +40,7 @@ import org.apache.doris.tablefunction.BackendsTableValuedFunction;
 import org.apache.doris.thrift.TBackendsMetadataParams;
 import org.apache.doris.thrift.TBeginTxnRequest;
 import org.apache.doris.thrift.TBeginTxnResult;
+import org.apache.doris.thrift.TCcrPartitionSource;
 import org.apache.doris.thrift.TCommitTxnRequest;
 import org.apache.doris.thrift.TCommitTxnResult;
 import org.apache.doris.thrift.TCreatePartitionRequest;
@@ -73,6 +75,7 @@ import org.apache.doris.thrift.TShowUserRequest;
 import org.apache.doris.thrift.TShowUserResult;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TTableStatus;
+import org.apache.doris.transaction.TransactionState;
 import org.apache.doris.utframe.UtFrameUtils;
 
 import com.google.common.collect.Sets;
@@ -85,6 +88,7 @@ import org.junit.Test;
 import org.junit.rules.ExpectedException;
 import org.mockito.Mockito;
 
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -536,5 +540,35 @@ public class FrontendServiceImplTest {
         TShowUserRequest request = new TShowUserRequest();
         TShowUserResult result = impl.showUser(request);
         System.out.println(result);
+    }
+
+    @Test
+    public void testCcrSourceWithEmptyTokenIsIgnored() throws Exception {
+        boolean orig = Config.restore_state_token_track;
+        Config.restore_state_token_track = true;
+        try {
+            FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+            TCommitTxnRequest request = new TCommitTxnRequest();
+            request.setTxnId(100L);
+            request.setUser("root");
+            TCcrPartitionSource written = new TCcrPartitionSource();
+            written.setTargetPartitionId(1L);
+            written.setPrevToken("empty");
+            written.setToken("aaaa");
+            // a write never leaves EMPTY as the token of the source
+            TCcrPartitionSource bogus = new TCcrPartitionSource();
+            bogus.setTargetPartitionId(2L);
+            bogus.setPrevToken("bbbb");
+            bogus.setToken("empty");
+            request.setCcrPartitionSources(Arrays.asList(written, bogus));
+            TransactionState transactionState = new TransactionState();
+            Method method = FrontendServiceImpl.class.getDeclaredMethod("acceptCcrPartitionSources",
+                    TCommitTxnRequest.class, TransactionState.class, UserIdentity.class);
+            method.setAccessible(true);
+            method.invoke(impl, request, transactionState, UserIdentity.ROOT);
+            Assert.assertEquals(Collections.singleton(1L), transactionState.getCcrPartitionSources().keySet());
+        } finally {
+            Config.restore_state_token_track = orig;
+        }
     }
 }

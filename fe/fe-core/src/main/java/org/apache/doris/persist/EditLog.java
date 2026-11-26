@@ -1038,6 +1038,11 @@ public class EditLog {
                     env.replaySetPartitionVersion(log);
                     break;
                 }
+                case OperationType.OP_SET_PARTITION_STATE_TOKEN: {
+                    PartitionStateTokenLog log = (PartitionStateTokenLog) journal.getData();
+                    env.replaySetPartitionStateToken(log);
+                    break;
+                }
                 case OperationType.OP_ALTER_ROUTINE_LOAD_JOB: {
                     AlterRoutineLoadJobOperationLog log = (AlterRoutineLoadJobOperationLog) journal.getData();
                     env.getRoutineLoadManager().replayAlterRoutineLoadJob(log);
@@ -2208,6 +2213,10 @@ public class EditLog {
 
     public void logSetPartitionVersion(SetPartitionVersionOperationLog log) {
         logEdit(OperationType.OP_SET_PARTITION_VERSION, log);
+    }
+
+    public void logSetPartitionStateToken(PartitionStateTokenLog log) {
+        logEdit(OperationType.OP_SET_PARTITION_STATE_TOKEN, log);
     }
 
     public void logGlobalVariableV2(GlobalVarPersistInfo info) {

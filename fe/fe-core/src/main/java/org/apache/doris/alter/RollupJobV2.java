@@ -634,6 +634,10 @@ public class RollupJobV2 extends AlterJobV2 implements GsonPostProcessable {
     }
 
     private void onFinished(OlapTable tbl) {
+        // the job built the data of a new index of the partitions and the versions stay the same: the state tokens do
+        // not name that data (an index dropped and built again under its name with another definition has the same
+        // structure)
+        tbl.invalidatePartitionStateTokens();
         for (Partition partition : tbl.getPartitions()) {
             MaterializedIndex rollupIndex = partition.getIndex(rollupIndexId);
             Preconditions.checkNotNull(rollupIndex, rollupIndexId);

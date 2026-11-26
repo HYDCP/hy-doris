@@ -39,6 +39,12 @@ public class PartitionCommitInfo implements Writable {
     private long versionTime;
     @SerializedName(value = "isTempPartition")
     private boolean isTempPartition;
+    // The state token of the partition before and after this version, see PartitionStateToken. Null if the master
+    // did not track the tokens: the partition then keeps no explicit token for this version.
+    @SerializedName(value = "ptk")
+    private String prevStateToken;
+    @SerializedName(value = "stk")
+    private String stateToken;
 
     public PartitionCommitInfo() {
 
@@ -75,6 +81,19 @@ public class PartitionCommitInfo implements Writable {
 
     public long getVersion() {
         return version;
+    }
+
+    public String getPrevStateToken() {
+        return prevStateToken;
+    }
+
+    public String getStateToken() {
+        return stateToken;
+    }
+
+    public void setStateTokens(String prevStateToken, String stateToken) {
+        this.prevStateToken = prevStateToken;
+        this.stateToken = stateToken;
     }
 
     public long getVersionTime() {

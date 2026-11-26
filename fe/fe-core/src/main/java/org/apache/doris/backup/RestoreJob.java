@@ -43,6 +43,7 @@ import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Partition.PartitionState;
 import org.apache.doris.catalog.PartitionInfo;
 import org.apache.doris.catalog.PartitionItem;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.catalog.PartitionType;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Replica.ReplicaState;
@@ -98,6 +99,7 @@ import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Multimap;
+import com.google.common.collect.Sets;
 import com.google.common.collect.Table.Cell;
 import com.google.gson.annotations.JsonAdapter;
 import com.google.gson.annotations.SerializedName;
@@ -197,6 +199,12 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     @SerializedName("si")
     @JsonAdapter(GsonUtils.GuavaTableTypeAdapterFactory.class)
     protected com.google.common.collect.Table<Long, Long, SnapshotInfo> snapshotInfos = HashBasedTable.create();
+
+    // whether the master tracked the state tokens when it committed the job: the restored partitions adopt the
+    // tokens of the backup only then, see stampStateToken. Set on the master before the stamp, persisted with the
+    // finished job for the replay.
+    @SerializedName("stt")
+    private boolean stampStateTokens;
 
     // the meta version is used when reading backup meta from file.
     // we do not persist this field, because this is just a temporary solution.
@@ -581,6 +589,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             return;
         }
         Preconditions.checkNotNull(backupMeta);
+
+        // The backup meta carries the state token of the source partitions, which must not be inherited.
+        clearRestoreLineageInBackupMeta();
 
         // Check the olap table state.
         //
@@ -996,6 +1007,12 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         if (!status.ok()) {
             return;
         }
+
+        // The data of the existing partitions to overwrite is about to change. Their state token must not outlive
+        // the data it stands for, e.g. if the job is cancelled after some tablets are moved in COMMITTING.
+        // This is persisted with the DOWNLOAD edit log (replayed by replayCheckAndPrepareMeta), which is
+        // written before any tablet data is moved, and the token is written again in allTabletCommitted.
+        invalidateRestoreLineageOfOverwrittenPartitions(db);
 
         // check and restore resources
         checkAndRestoreResources();
@@ -1605,6 +1622,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             return;
         }
 
+        invalidateRestoreLineageOfOverwrittenPartitions(db);
+        clearTaintOfDownloadedPartitions(db);
+
         // replay set all existing tables's state to RESTORE
         for (String tableName : jobInfo.backupOlapTableObjects.keySet()) {
             Table tbl = db.getTableNullable(jobInfo.getAliasByOriginNameIfSet(tableName));
@@ -1721,7 +1741,27 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             snapshotFinishedTime = System.currentTimeMillis();
             state = RestoreJobState.DOWNLOAD;
 
-            env.getEditLog().logRestoreJob(this);
+            // the taint of the partitions to download is cleared with the log, under the locks of their tables
+            Database db = env.getInternalCatalog().getDbNullable(dbId);
+            List<Table> locked = Lists.newArrayList();
+            if (db != null) {
+                for (long tblId : Sets.newTreeSet(restoredVersionInfo.rowKeySet())) {
+                    Table tbl = db.getTableNullable(tblId);
+                    if (tbl != null && tbl.writeLockIfExist()) {
+                        locked.add(tbl);
+                    }
+                }
+            }
+            try {
+                if (db != null) {
+                    clearTaintOfDownloadedPartitions(db);
+                }
+                env.getEditLog().logRestoreJob(this);
+            } finally {
+                for (int i = locked.size() - 1; i >= 0; i--) {
+                    locked.get(i).writeUnlock();
+                }
+            }
             LOG.info("finished making snapshots. {}", this);
             return;
         }
@@ -2133,6 +2173,12 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             }
         }
 
+        if (!isReplay) {
+            // persisted with the job finished, see stampStateToken
+            stampStateTokens = Config.restore_state_token_track;
+        }
+        stampRestoreLineage(db, System.currentTimeMillis());
+
         // Drop the exists but non-restored table/partitions.
         if (isCleanTables || isCleanPartitions) {
             Status st = dropAllNonRestoredTableAndPartitions(db);
@@ -2299,6 +2345,192 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         return info;
     }
 
+    /**
+     * Invalidate the state token of the existing partitions that this job overwrites in place (non-atomic
+     * restore, see restoredVersionInfo). Partitions and tables created by this job are dropped if the job is
+     * cancelled, and atomic restore does not touch the origin table before it is replaced, so they are not
+     * invalidated here. Only the state token in this version, the restore lineage is added by the logical
+     * verification, which keeps the name of the method.
+     */
+    @VisibleForTesting
+    void invalidateRestoreLineageOfOverwrittenPartitions(Database db) {
+        for (long tblId : restoredVersionInfo.rowKeySet()) {
+            Table tbl = db.getTableNullable(tblId);
+            if (!(tbl instanceof OlapTable)) {
+                continue;
+            }
+            OlapTable olapTbl = (OlapTable) tbl;
+            if (!olapTbl.writeLockIfExist()) {
+                continue;
+            }
+            try {
+                for (long partId : restoredVersionInfo.row(tblId).keySet()) {
+                    Partition part = olapTbl.getPartition(partId);
+                    if (part != null) {
+                        // the data of the partition is being replaced: it has no state until the job stamps it.
+                        // A taint is kept until the download is logged, see clearTaintOfDownloadedPartitions.
+                        PartitionStateToken.invalidate(part);
+                    }
+                }
+            } finally {
+                olapTbl.writeUnlock();
+            }
+        }
+    }
+
+    /**
+     * Clear the state tokens the backup meta carries, which must not be inherited: the restored partitions adopt
+     * the tokens of the job info (stampStateToken). Only the state token in this version, the restore source and the
+     * restore lineage are added by the logical verification, which keeps the name of the method.
+     */
+    @VisibleForTesting
+    void clearRestoreLineageInBackupMeta() {
+        for (String tableName : jobInfo.backupOlapTableObjects.keySet()) {
+            Table remoteTbl = backupMeta.getTable(tableName);
+            if (!(remoteTbl instanceof OlapTable)) {
+                continue;
+            }
+            for (Partition remotePart : ((OlapTable) remoteTbl).getAllPartitions()) {
+                remotePart.setStateToken(null);
+            }
+        }
+    }
+
+    /**
+     * Write the state token of all partitions restored by this job, both the existing partitions that
+     * are overwritten and the newly created partitions and tables (stampStateToken). The token is always taken from
+     * the job info of this job, and never inherited from the backup meta. Called on both master and replay. Only the
+     * state token in this version, restoreTime is not read: the restore lineage is added by the logical verification,
+     * which keeps the name and the signature of the method.
+     */
+    @VisibleForTesting
+    void stampRestoreLineage(Database db, long restoreTime) {
+        for (Map.Entry<String, BackupOlapTableInfo> tblEntry : jobInfo.backupOlapTableObjects.entrySet()) {
+            Table tbl = db.getTableNullable(jobInfo.getAliasByOriginNameIfSet(tblEntry.getKey()));
+            if (tbl == null || tbl.getType() != TableType.OLAP) {
+                continue;
+            }
+            OlapTable olapTbl = (OlapTable) tbl;
+            if (!olapTbl.writeLockIfExist()) {
+                continue;
+            }
+            try {
+                BackupOlapTableInfo tblInfo = tblEntry.getValue();
+                for (Map.Entry<String, BackupPartitionInfo> partEntry : tblInfo.partitions.entrySet()) {
+                    Partition part = olapTbl.getPartition(partEntry.getKey(), false);
+                    if (part == null) {
+                        continue;
+                    }
+                    stampStateToken(olapTbl, part, partEntry.getValue());
+                }
+            } finally {
+                olapTbl.writeUnlock();
+            }
+        }
+    }
+
+    /**
+     * The state token of a partition this job restored, see PartitionStateToken. Called on the master and on replay
+     * with the write lock of the table; everything it reads is persisted with the job or replayed before it.
+     * <ul>
+     * <li>If the master did not track the tokens (restore_state_token_track) when it committed the job, no name
+     * is given: the partitions are invalidated. A cluster that does not track the tokens gives no names.</li>
+     * <li>A tainted partition stays tainted. The taint of a partition that is downloaded as a whole was cleared when
+     * the download was logged (clearTaintOfDownloadedPartitions), so a taint here came later, or is the one of a
+     * partition that keeps its local data (kept, or the base of an incremental append), whose replicas the restore
+     * did not replace. Taint wins in any order of the taint and of this, so the master, which may run this before
+     * the operation that taints and log it after, and a follower, which replays the operation first, agree.</li>
+     * <li>A partition that is not at the version of the backup, which is the version the job set (a load made
+     * visible in between): invalidated, the name of the backup would be bound to other data.</li>
+     * <li>Otherwise it is the backup partition and adopts its token, bound to the version this frontend has for it.
+     * A backup partition without a token leaves none, and the partition is EMPTY only if it was restored at the
+     * initial version, as the empty partition of the backup.</li>
+     * </ul>
+     */
+    private void stampStateToken(OlapTable olapTbl, Partition part, BackupPartitionInfo partInfo) {
+        if (PartitionStateToken.isTainted(part)) {
+            LOG.info("restore: partition {} is tainted, it keeps the taint, job: {}", part.getId(), jobId);
+            return;
+        }
+        if (!stampStateTokens) {
+            // the master did not track the tokens when it committed the job: no name
+            PartitionStateToken.invalidate(part);
+            return;
+        }
+        if (part.getVisibleVersion() != partInfo.version) {
+            LOG.info("restore: partition {} is at version {}, not at the version {} of the backup, no state token, "
+                    + "job: {}", part.getId(), part.getVisibleVersion(), partInfo.version, jobId);
+            PartitionStateToken.invalidate(part);
+            return;
+        }
+        String token = partInfo.stateToken;
+        part.setStateToken(token == null ? null : new PartitionStateToken(token, part.getVisibleVersion(),
+                part.getVisibleVersionTime()));
+    }
+
+    /**
+     * Non-atomic restore: the partitions in restoredVersionInfo that are downloaded as a whole get all their
+     * replicas from the backup, so their taint is cleared
+     * (invalid until stampStateToken). Done where the DOWNLOAD state is logged, with the write locks of the tables
+     * held until it is logged on the master, and on the replay of that log: an operation that taints is ordered
+     * before or after it the same way on every frontend. If the job is cancelled from then on, the partitions are
+     * tainted again (taintOverwrittenPartitions), as their tablets may be in part moved.
+     */
+    @VisibleForTesting
+    void clearTaintOfDownloadedPartitions(Database db) {
+        for (long tblId : restoredVersionInfo.rowKeySet()) {
+            Table tbl = db.getTableNullable(tblId);
+            if (!(tbl instanceof OlapTable) || !tbl.writeLockIfExist()) {
+                continue;
+            }
+            try {
+                for (long partId : restoredVersionInfo.row(tblId).keySet()) {
+                    Partition part = ((OlapTable) tbl).getPartition(partId);
+                    if (part != null && PartitionStateToken.isTainted(part)) {
+                        part.setStateToken(PartitionStateToken.invalid());
+                    }
+                }
+            } finally {
+                tbl.writeUnlock();
+            }
+        }
+    }
+
+    /**
+     * Non-atomic restore cancelled after the DOWNLOAD state was logged: in COMMITTING a part of the tablets of a
+     * partition may be moved to the backup data (or appended) and the others not, so the replicas of the partitions
+     * the job overwrites do not agree: taint them (see PartitionStateToken). From DOWNLOAD on, the master and the
+     * followers have the same restoredVersionInfo, and a follower has the job in DOWNLOAD or COMMIT (COMMITTING is
+     * not logged), so both taint the same partitions. An atomic restore does not touch the table it replaces, and
+     * its restoredVersionInfo is empty.
+     */
+    @VisibleForTesting
+    void taintOverwrittenPartitions(Database db) {
+        for (long tblId : restoredVersionInfo.rowKeySet()) {
+            Table tbl = db.getTableNullable(tblId);
+            if (!(tbl instanceof OlapTable) || !tbl.writeLockIfExist()) {
+                continue;
+            }
+            try {
+                for (long partId : restoredVersionInfo.row(tblId).keySet()) {
+                    Partition part = ((OlapTable) tbl).getPartition(partId);
+                    if (part != null) {
+                        PartitionStateToken.taint(part);
+                    }
+                }
+            } finally {
+                tbl.writeUnlock();
+            }
+        }
+        LOG.info("restore job {} is cancelled after the download began, taint the partitions it overwrites: {}",
+                jobId, restoredVersionInfo.cellSet().size());
+    }
+
+    private static boolean isAfterDownloadLogged(RestoreJobState state) {
+        return state == RestoreJobState.DOWNLOAD || state == RestoreJobState.DOWNLOADING
+                || state == RestoreJobState.COMMIT || state == RestoreJobState.COMMITTING;
+    }
+
     private String getRestoreObjs() {
         Preconditions.checkState(jobInfo != null);
         return jobInfo.getInfo();
@@ -2349,6 +2581,13 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     break;
                 default:
                     break;
+            }
+        }
+
+        if (isAfterDownloadLogged(state)) {
+            Database db = env.getInternalCatalog().getDbNullable(dbId);
+            if (db != null) {
+                taintOverwrittenPartitions(db);
             }
         }
 
