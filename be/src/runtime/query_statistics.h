@@ -82,6 +82,7 @@ public:
 
     int64_t get_scan_rows() { return scan_rows; }
     int64_t get_scan_bytes() { return scan_bytes; }
+    int64_t get_scan_bytes_from_remote_storage() const { return _scan_bytes_from_remote_storage; }
     int64_t get_current_used_memory_bytes() { return current_used_memory_bytes; }
 
 private:

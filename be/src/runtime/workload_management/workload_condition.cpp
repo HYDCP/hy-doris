@@ -45,10 +45,9 @@ bool WorkloadConditionScanRows::eval(std::string str_val) {
 
 // scan bytes
 WorkloadConditionScanBytes::WorkloadConditionScanBytes(WorkloadCompareOperator op,
-                                                       std::string str_val) {
-    _op = op;
-    _scan_bytes = std::stol(str_val);
-}
+                                                       std::string str_val,
+                                                       WorkloadMetricType metric_type)
+        : _metric_type(metric_type), _scan_bytes(std::stol(str_val)), _op(op) {}
 
 // todo(wb): need handle invalid input value
 bool WorkloadConditionScanBytes::eval(std::string str_val) {

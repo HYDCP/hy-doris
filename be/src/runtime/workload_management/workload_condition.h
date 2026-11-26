@@ -23,7 +23,13 @@
 
 namespace doris {
 
-enum WorkloadMetricType { QUERY_TIME, SCAN_ROWS, SCAN_BYTES, QUERY_MEMORY_BYTES };
+enum WorkloadMetricType {
+    QUERY_TIME,
+    SCAN_ROWS,
+    SCAN_BYTES,
+    QUERY_MEMORY_BYTES,
+    SCAN_BYTES_FROM_REMOTE_STORAGE
+};
 
 class WorkloadCondition {
 public:
@@ -63,13 +69,13 @@ private:
 
 class WorkloadConditionScanBytes : public WorkloadCondition {
 public:
-    WorkloadConditionScanBytes(WorkloadCompareOperator op, std::string str_val);
+    WorkloadConditionScanBytes(WorkloadCompareOperator op, std::string str_val,
+                               WorkloadMetricType metric_type = WorkloadMetricType::SCAN_BYTES);
     bool eval(std::string str_val) override;
-    WorkloadMetricType get_workload_metric_type() override {
-        return WorkloadMetricType::SCAN_BYTES;
-    }
+    WorkloadMetricType get_workload_metric_type() override { return _metric_type; }
 
 private:
+    const WorkloadMetricType _metric_type;
     int64_t _scan_bytes;
     WorkloadCompareOperator _op;
 };
@@ -101,6 +107,9 @@ public:
             return std::make_unique<WorkloadConditionScanRows>(op, str_val);
         } else if (TWorkloadMetricType::type::BE_SCAN_BYTES == metric_name) {
             return std::make_unique<WorkloadConditionScanBytes>(op, str_val);
+        } else if (TWorkloadMetricType::type::BE_SCAN_BYTES_FROM_REMOTE_STORAGE == metric_name) {
+            return std::make_unique<WorkloadConditionScanBytes>(
+                    op, str_val, WorkloadMetricType::SCAN_BYTES_FROM_REMOTE_STORAGE);
         } else if (TWorkloadMetricType::type::QUERY_BE_MEMORY_BYTES == metric_name) {
             return std::make_unique<WorkloadConditionQueryMemory>(op, str_val);
         }
