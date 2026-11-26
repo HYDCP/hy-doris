@@ -4360,6 +4360,12 @@ public class Env {
     public void dropTable(DropTableStmt stmt) throws DdlException {
         CatalogIf<?> catalogIf = catalogMgr.getCatalogOrException(stmt.getCatalogName(),
                 catalog -> new DdlException(("Unknown catalog " + catalog)));
+        if (stmt.isMustTemporary() && !(catalogIf instanceof InternalCatalog)) {
+            if (!stmt.isSetIfExists()) {
+                ErrorReport.reportDdlException(ErrorCode.ERR_UNKNOWN_TABLE, stmt.getTableName(), stmt.getDbName());
+            }
+            return;
+        }
         catalogIf.dropTable(stmt.getDbName(), stmt.getTableName(), stmt.isView(), stmt.isMaterializedView(),
                 stmt.isSetIfExists(), stmt.isMustTemporary(), stmt.isForceDrop());
     }

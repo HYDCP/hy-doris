@@ -904,7 +904,15 @@ public class InternalCatalog implements CatalogIf<Database> {
         watch.split();
         costTimes.put("1:dbWriteLock", watch.getSplitTime());
         try {
-            Table table = db.getTableNullable(tableName);
+            Table table = mustTemporary ? db.getTemporaryTableNullable(tableName) : db.getTableNullable(tableName);
+            if (mustTemporary && table != null) {
+                ConnectContext context = ConnectContext.get();
+                // Preserve administrator cleanup by internal name. Other sessions may only drop their own tables.
+                if (context != null && !Util.getTempTableSessionId(table.getName()).equals(context.getSessionId())
+                        && !Env.getCurrentEnv().getAccessManager().checkGlobalPriv(context, PrivPredicate.ADMIN)) {
+                    table = null;
+                }
+            }
             if (table == null) {
                 if (ifExists) {
                     LOG.info("drop table[{}] which does not exist", tableName);
@@ -965,9 +973,6 @@ public class InternalCatalog implements CatalogIf<Database> {
             if (table.isTemporary()) {
                 dropTableInternal(db, table, false, true, watch, costTimes);
             } else {
-                if (mustTemporary) {
-                    ErrorReport.reportDdlException(ErrorCode.ERR_UNKNOWN_TABLE, tableName, dbName);
-                }
                 dropTableInternal(db, table, isView, force, watch, costTimes);
             }
         } catch (UserException e) {

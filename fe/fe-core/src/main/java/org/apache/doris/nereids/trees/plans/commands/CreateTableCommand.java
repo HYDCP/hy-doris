@@ -190,7 +190,8 @@ public class CreateTableCommand extends Command implements NeedAuditEncryption, 
 
     void handleFallbackFailedCtas(ConnectContext ctx) {
         try {
-            Env.getCurrentEnv().dropTable(new DropTableStmt(false, false,
+            Env.getCurrentEnv().dropTable(new DropTableStmt(
+                    createTableInfo.isTemp(), createTableInfo.isTemp(),
                     new TableName(createTableInfo.getCtlName(),
                             createTableInfo.getDbName(), createTableInfo.getTableName()), true));
         } catch (Exception e) {

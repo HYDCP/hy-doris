@@ -25,6 +25,7 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.FeMetaVersion;
+import org.apache.doris.common.FeNameFormat;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
@@ -58,6 +59,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
@@ -84,6 +86,8 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
     private static final Logger LOG = LogManager.getLogger(Database.class);
 
     private static final String TRANSACTION_QUOTA_SIZE = "transactionQuotaSize";
+    private static final String LOWER_CASE_TEMPORARY_TABLE_SIGN =
+            FeNameFormat.TEMPORARY_TABLE_SIGN.toLowerCase(Locale.ROOT);
 
     @SerializedName(value = "id")
     private long id;
@@ -432,7 +436,7 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
         boolean isTableExist = false;
         table.setQualifiedDbName(fullQualifiedName);
         String tableName = table.getName();
-        if (Env.isStoredTableNamesLowerCase()) {
+        if (Env.isStoredTableNamesLowerCase() && !table.isTemporary()) {
             tableName = tableName.toLowerCase();
         }
         if (isTableExist(tableName)) {
@@ -463,7 +467,7 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
         Table olapTable = (Table) table;
         olapTable.setQualifiedDbName(fullQualifiedName);
         String tableName = olapTable.getName();
-        if (Env.isStoredTableNamesLowerCase()) {
+        if (Env.isStoredTableNamesLowerCase() && !olapTable.isTemporary()) {
             tableName = tableName.toLowerCase();
         }
         if (isTableExist(tableName)) {
@@ -609,23 +613,29 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
      */
     @Override
     public Table getTableNullable(String tableName) {
-        if (Env.isStoredTableNamesLowerCase()) {
-            tableName = tableName.toLowerCase();
-        }
-        if (Env.isTableNamesCaseInsensitive()) {
-            tableName = lowerCaseToTableName.get(tableName.toLowerCase());
-            if (tableName == null) {
+        Table temporaryTable = getTemporaryTableNullable(tableName);
+        return temporaryTable == null ? getNonTempTableNullable(tableName) : temporaryTable;
+    }
+
+    public Table getTemporaryTableNullable(String tableName) {
+        boolean ignoreCase = Env.isTableNamesCaseInsensitive() || Env.isStoredTableNamesLowerCase();
+        String innerName = tableName;
+        if (!Util.isTempTable(tableName) && !(ignoreCase && tableName.contains(LOWER_CASE_TEMPORARY_TABLE_SIGN))) {
+            innerName = Util.generateTempTableInnerName(tableName);
+            if (innerName.equals(tableName)) {
                 return null;
             }
         }
 
-        // return temp table first
-        Table table = nameToTable.get(Util.generateTempTableInnerName(tableName));
-        if (table == null) {
-            table = nameToTable.get(tableName);
+        // Look up the session's internal name independently of the permanent table's name and casing.
+        if (ignoreCase) {
+            innerName = lowerCaseToTableName.get(innerName.toLowerCase());
+            if (innerName == null) {
+                return null;
+            }
         }
-
-        return table;
+        Table table = nameToTable.get(innerName);
+        return table != null && table.isTemporary() ? table : null;
     }
 
     /**
