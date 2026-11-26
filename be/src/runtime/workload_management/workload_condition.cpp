@@ -19,6 +19,14 @@
 
 namespace doris {
 
+WorkloadConditionUsername::WorkloadConditionUsername(WorkloadCompareOperator op,
+                                                     std::string username)
+        : _op(op), _username(std::move(username)) {}
+
+bool WorkloadConditionUsername::eval(std::string str_val) {
+    return WorkloadCompareUtils::compare_string(_op, std::move(str_val), _username);
+}
+
 // query time
 WorkloadConditionQueryTime::WorkloadConditionQueryTime(WorkloadCompareOperator op,
                                                        std::string str_val) {

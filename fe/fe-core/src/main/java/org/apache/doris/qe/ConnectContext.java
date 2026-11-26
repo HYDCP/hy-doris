@@ -71,6 +71,7 @@ import org.apache.doris.statistics.ColumnStatistic;
 import org.apache.doris.statistics.Histogram;
 import org.apache.doris.system.Backend;
 import org.apache.doris.task.LoadTaskInfo;
+import org.apache.doris.thrift.TResourceInfo;
 import org.apache.doris.thrift.TResultSinkType;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TUniqueId;
@@ -655,6 +656,14 @@ public class ConnectContext {
     // for USER() function
     public UserIdentity getUserIdentity() {
         return UserIdentity.createAnalyzedUserIdentWithIp(qualifiedUser, remoteIP);
+    }
+
+    public TResourceInfo getResourceInfo() {
+        UserIdentity identity = getCurrentUserIdentity();
+        if (identity == null || Strings.isNullOrEmpty(identity.getQualifiedUser())) {
+            return null;
+        }
+        return new TResourceInfo(identity.getQualifiedUser(), "");
     }
 
     public UserIdentity getCurrentUserIdentity() {

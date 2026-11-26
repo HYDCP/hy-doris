@@ -106,7 +106,7 @@ public class WorkloadSchedPolicyMgr extends MasterDaemon implements Writable, Gs
     public static final ImmutableSet<WorkloadMetricType> BE_METRIC_SET
             = new ImmutableSet.Builder<WorkloadMetricType>().add(WorkloadMetricType.BE_SCAN_ROWS)
             .add(WorkloadMetricType.BE_SCAN_BYTES).add(WorkloadMetricType.QUERY_TIME)
-            .add(WorkloadMetricType.QUERY_BE_MEMORY_BYTES).build();
+            .add(WorkloadMetricType.QUERY_BE_MEMORY_BYTES).add(WorkloadMetricType.USERNAME).build();
 
     // used for convert fe type to thrift type
     public static final ImmutableMap<WorkloadMetricType, TWorkloadMetricType> METRIC_MAP
@@ -114,7 +114,8 @@ public class WorkloadSchedPolicyMgr extends MasterDaemon implements Writable, Gs
             .put(WorkloadMetricType.QUERY_TIME, TWorkloadMetricType.QUERY_TIME)
             .put(WorkloadMetricType.BE_SCAN_ROWS, TWorkloadMetricType.BE_SCAN_ROWS)
             .put(WorkloadMetricType.BE_SCAN_BYTES, TWorkloadMetricType.BE_SCAN_BYTES)
-            .put(WorkloadMetricType.QUERY_BE_MEMORY_BYTES, TWorkloadMetricType.QUERY_BE_MEMORY_BYTES).build();
+            .put(WorkloadMetricType.QUERY_BE_MEMORY_BYTES, TWorkloadMetricType.QUERY_BE_MEMORY_BYTES)
+            .put(WorkloadMetricType.USERNAME, TWorkloadMetricType.USERNAME).build();
     public static final ImmutableMap<WorkloadActionType, TWorkloadActionType> ACTION_MAP
             = new ImmutableMap.Builder<WorkloadActionType, TWorkloadActionType>()
             .put(WorkloadActionType.MOVE_QUERY_TO_GROUP, TWorkloadActionType.MOVE_QUERY_TO_GROUP)
@@ -194,10 +195,19 @@ public class WorkloadSchedPolicyMgr extends MasterDaemon implements Writable, Gs
         List<WorkloadConditionMeta> originConditions = createStmt.getConditions();
         List<WorkloadCondition> policyConditionList = new ArrayList<>();
         for (WorkloadConditionMeta cm : originConditions) {
+            if (cm.metricName == WorkloadMetricType.USERNAME) {
+                // Apply the new rules to DDL only. Historical conditions must survive metadata replay.
+                if (cm.op != WorkloadConditionOperator.EQUAL) {
+                    throw new UserException("username only support EQUAL operator");
+                }
+                if (cm.value == null || cm.value.trim().isEmpty()) {
+                    throw new UserException("username can not be empty");
+                }
+            }
             WorkloadCondition cond = WorkloadCondition.createWorkloadCondition(cm);
             policyConditionList.add(cond);
         }
-        boolean feCondition = checkPolicyCondition(policyConditionList);
+        Boolean feCondition = checkPolicyCondition(policyConditionList);
 
         // 2 create action
         List<WorkloadActionMeta> originActions = createStmt.getActions();
@@ -209,7 +219,7 @@ public class WorkloadSchedPolicyMgr extends MasterDaemon implements Writable, Gs
         }
 
         boolean feAction = checkPolicyAction(policyActionList);
-        if (feAction != feCondition) {
+        if (feCondition != null && feAction != feCondition) {
             throw new UserException("action and metric must run in FE together or run in BE together");
         }
 
@@ -248,7 +258,7 @@ public class WorkloadSchedPolicyMgr extends MasterDaemon implements Writable, Gs
         }
     }
 
-    private boolean checkPolicyCondition(List<WorkloadCondition> conditionList) throws UserException {
+    private Boolean checkPolicyCondition(List<WorkloadCondition> conditionList) throws UserException {
         if (conditionList.size() > Config.workload_max_condition_num_in_policy) {
             throw new UserException(
                     "condition num in a policy can not exceed " + Config.workload_max_condition_num_in_policy);
@@ -256,19 +266,18 @@ public class WorkloadSchedPolicyMgr extends MasterDaemon implements Writable, Gs
         boolean containsFeMetric = false;
         boolean containsBeMetric = false;
         for (WorkloadCondition cond : conditionList) {
-            if (FE_METRIC_SET.contains(cond.getMetricType())) {
-                containsFeMetric = true;
-            }
-            if (BE_METRIC_SET.contains(cond.getMetricType())) {
-                containsBeMetric = true;
-            }
+            boolean onFe = FE_METRIC_SET.contains(cond.getMetricType());
+            boolean onBe = BE_METRIC_SET.contains(cond.getMetricType());
+            containsFeMetric |= onFe && !onBe;
+            containsBeMetric |= onBe && !onFe;
             if (containsFeMetric && containsBeMetric) {
                 throw new UserException(
                         "one policy can not contains fe and be metric, FE metric list is " + FE_METRIC_SET
                                 + ", BE metric list is " + BE_METRIC_SET);
             }
         }
-        return containsFeMetric;
+        // Shared metrics alone can run wherever the action runs.
+        return containsFeMetric || containsBeMetric ? containsFeMetric : null;
     }
 
     private boolean checkPolicyAction(List<WorkloadAction> actionList) throws UserException {

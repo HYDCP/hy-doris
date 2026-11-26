@@ -341,6 +341,10 @@ public class StreamLoadPlanner {
         fragment.finalize(null);
 
         TPipelineFragmentParams params = new TPipelineFragmentParams();
+        ConnectContext context = ConnectContext.get();
+        if (context != null) {
+            params.setResourceInfo(context.getResourceInfo());
+        }
         params.setProtocolVersion(PaloInternalServiceVersion.V1);
         params.setFragment(fragment.toThrift());
 
