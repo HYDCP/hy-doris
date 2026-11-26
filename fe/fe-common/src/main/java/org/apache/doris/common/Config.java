@@ -2984,6 +2984,100 @@ public class Config extends ConfigBase {
     public static int restore_task_concurrency_per_be = 5000;
 
     @ConfField(mutable = true, masterOnly = true, description = {
+            "是否开启恢复的分区级复用：非原子恢复时，状态令牌与备份中的分区相同的本地分区保留本地数据"
+                    + "（见 restore_reuse_trust_state_token），跳过它的快照、下载和移动。默认关闭，关闭时恢复的行为与原来相同。",
+            "Whether to enable partition level reuse of restore: for a non-atomic restore, a local partition whose "
+                    + "state token equals the one of the partition in the backup keeps its local data (see "
+                    + "restore_reuse_trust_state_token), and its snapshot, download and move are skipped. Disabled by "
+                    + "default, the restore behaves as before if disabled."})
+    public static boolean enable_restore_partition_reuse = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "分区级复用是否考虑 Unique 读时合并表。这类表有隐藏状态（同一个 key 被覆盖的旧版本）"
+                    + "。默认 false：整体下载。为 true 时它们与其他表一样参与复用，只用于实验。"
+                    + "对 Unique 写时合并表无效，见 restore_reuse_mow。",
+            "Whether the unique merge-on-read tables, which have a hidden state (the overwritten versions of a key), "
+                    + "are considered by partition level reuse. False by default: they are downloaded. If true, they "
+                    + "are considered as the other tables, for experiments only. It has no effect on the unique "
+                    + "merge-on-write tables, see restore_reuse_mow."})
+    public static boolean restore_reuse_allow_hidden_state_models = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "分区级复用是否考虑没有 sequence 列的 Unique 写时合并表。默认 false：整体下载。"
+                    + "有 sequence 列（或 sequence 映射）的表永远不复用，与 "
+                    + "restore_reuse_allow_hidden_state_models 的取值无关。",
+            "Whether the unique merge-on-write tables without a sequence column are considered by partition level "
+                    + "reuse. False by default: they are downloaded. A table with a sequence column (or a sequence "
+                    + "mapping) is never reused, whatever the value of restore_reuse_allow_hidden_state_models."})
+    public static boolean restore_reuse_mow = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "原子恢复的本地来源快照任务或保留分区的移动任务失败多少次后取消恢复作业。BE 标明不可重试的错误（前缀 "
+                    + "[RESTORE_NOT_RETRYABLE]）会立即取消作业，拿不到 tablet 锁不计入失败次数。"
+                    + "恢复的其他任务仍与原来一样不限次数地重发。",
+            "The number of failures of a local source snapshot task or a move task of a kept partition of an atomic "
+                    + "restore after which the restore job is cancelled. An error which the backend says can not be "
+                    + "retried (with the prefix [RESTORE_NOT_RETRYABLE]) cancels the job at once, a failure to obtain "
+                    + "the tablet locks is not counted. The other tasks of the restore are resent without a limit as "
+                    + "before."})
+    public static int restore_local_source_task_max_retry = 10;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "参与分区级复用的分区的最小大小（单副本的本地数据量，字节），更小的分区直接下载。默认 0，"
+                    + "所有分区都参与。",
+            "The minimum size (local data size of a single replica, in bytes) of a partition to be considered for "
+                    + "partition level reuse, smaller partitions are downloaded. 0 by default, every partition is "
+                    + "considered."})
+    public static long restore_reuse_min_partition_bytes = 0;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "分区级复用是否也用于原子恢复（还需要打开 "
+                    + "enable_restore_partition_reuse）：被替换的表中状态令牌与备份相同的分区，"
+                    + "用被替换表 tablet 的本地快照（硬链接，跨盘时拷贝）放进暂存表，而不是下载。只用于 schema 没有变化、"
+                    + "且暂存副本与被替换表的副本一一绑定的表。这样的分区如果在替换表之前版本变了，恢复失败（被替换的表不受影响）"
+                    + "。默认关闭，关闭时原子恢复的行为与原来相同。",
+            "Whether partition level reuse also works for an atomic restore (needs enable_restore_partition_reuse "
+                    + "too): the partitions of the table being replaced whose state token equals the one of the backup "
+                    + "are made into the staging table by a local snapshot (hard "
+                    + "links, or a copy on another disk) of the tablets of the table being replaced instead of a "
+                    + "download. Only for a table whose schema is not changed and whose staging replicas are bound to "
+                    + "the replicas of the table being replaced. If the version of such a partition changed before the "
+                    + "tables are replaced, the restore fails (the table being replaced is not touched). Disabled by "
+                    + "default, the atomic restore behaves as before if disabled."})
+    public static boolean enable_restore_atomic_reuse = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "带分区级复用的原子恢复（enable_restore_atomic_reuse）：快照任务是否直接把保留分区的本地数据装"
+                    + "载进暂存 tablet（在 BE 的快照线程池上），让提交阶段的移动任务只做核对。为 false 时由移动任务装载，"
+                    + "它的线程池每个 BE 只有一个线程；两种方式下，保留分区的移动失败都最多重试 "
+                    + "restore_local_source_task_max_retry 次。旧版本的 BE 会忽略它，"
+                    + "仍由移动任务装载。在发送快照任务时读取，修改不影响正在运行的作业。",
+            "Atomic restore with partition level reuse (enable_restore_atomic_reuse): whether the snapshot task loads "
+                    + "the local data of a kept partition into the staging tablet at once (on the snapshot worker pool "
+                    + "of the backend), so that the move task of the commit only checks it. If false the move task "
+                    + "loads it, on the pool of one thread per backend; a failed move of a kept partition is retried "
+                    + "up to restore_local_source_task_max_retry times either way. A backend of an old version ignores "
+                    + "it and loads by the move. Read when the snapshot tasks are sent, a running job is not affected "
+                    + "by a change."})
+    public static boolean restore_reuse_kept_load_at_snapshot = true;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "恢复作业是否只在每个 follower FE（包括 master，不包括 observer）"
+                    + "和每个存活的 BE 都在心跳里汇报了相应能力时，才使用分区级复用（本地来源快照）"
+                    + "。旧版本的节点不会汇报，这时作业与原来一样下载全部数据，并记录原因 MIXED_VERSIONS。"
+                    + "只在作业开始决定复用时检查一次。为 false 时跳过检查：作业可能发出旧版本 BE 不认识的任务，"
+                    + "也可能被旧版本 FE 接手，导致作业失败或卡住。只用于实验。",
+            "Whether a restore job uses partition level reuse (the local source snapshot) only if every follower "
+                    + "frontend (the master included, the observers "
+                    + "excluded) and every alive backend reports the capability of it in the heartbeat. A node of an "
+                    + "old version does not report it, then the job downloads all the data as before and the reason "
+                    + "MIXED_VERSIONS is recorded. It is checked once, when the job starts to decide the reuse. If "
+                    + "false, the check is skipped: a restore job may then send tasks that an old backend does not "
+                    + "know, and be taken over by an old frontend, which fails the job or makes it wait. For "
+                    + "experiments only."})
+    public static boolean restore_reuse_require_capability = true;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
             "master 是否跟踪分区的状态令牌（见 PartitionStateToken）：可见的事务给它写的每个分区一个令牌，"
                     + "CCR 增量在延续本地状态时沿用源版本的令牌，恢复沿用备份的令牌。只改变元数据。"
                     + "只在 master 记录事务日志时读取，回放时不读。为 false（默认）时不写任何新的元数据"
@@ -3000,6 +3094,18 @@ public class Config extends ConfigBase {
                     + "included, is alive and replays it. To roll back after such a log was written, switch it off "
                     + "first and wait until the image of every frontend is past the last such log."})
     public static boolean restore_state_token_track = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "分区级复用在分区的状态令牌与备份分区的相同、版本相同、结构相同时，是否保留它"
+                    + "（KEPT_STATE_TOKEN）。证据是分区的历史而不是它的内容：依赖一个 tablet 的副本一致，"
+                    + "以及 CCR 按源的原样应用版本。默认关闭：这样的分区仍然下载，"
+                    + "只计入 SHOW RESTORE 的 ReuseEstimate 的 token_equal。",
+            "Whether partition level reuse keeps a partition when its state token equals the one of the backup "
+                    + "partition, the versions are equal and the schemas are the same (KEPT_STATE_TOKEN). The proof is "
+                    + "the history of the partition, not its content: it relies on the replicas of a tablet agreeing "
+                    + "and on CCR applying the versions of the source as they are. Off by default: such a partition is "
+                    + "still downloaded, and only counted in token_equal of the ReuseEstimate of SHOW RESTORE."})
+    public static boolean restore_reuse_trust_state_token = false;
 
     @ConfField(mutable = true, description = {"执行 agent task 时，BE心跳超过多长时间，认为BE不可用",
             "The time after which BE is considered unavailable if the heartbeat is not received"})

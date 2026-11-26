@@ -19,6 +19,7 @@ package org.apache.doris.task;
 
 import org.apache.doris.thrift.TMoveDirReq;
 import org.apache.doris.thrift.TResourceInfo;
+import org.apache.doris.thrift.TRestoreIncrementalRange;
 import org.apache.doris.thrift.TTaskType;
 
 public class DirMoveTask extends AgentTask {
@@ -27,6 +28,13 @@ public class DirMoveTask extends AgentTask {
     private String src;
     private int schemaHash;
     private boolean overwrite;
+    // Append the rowsets of the range to the tablet instead of replacing it, null for the plain restore.
+    private TRestoreIncrementalRange incrementalRange;
+    // The tablet was loaded from a local source by the atomic restore (the backend judges the task by the evidence).
+    private boolean localSourceLoaded = false;
+    // The tablet of a kept partition of the atomic restore: the snapshot task may have loaded it, then the backend
+    // only checks the evidence. Not sent to the backend, which tells the case by the snapshot dir.
+    private boolean localSourceKept = false;
 
     public DirMoveTask(TResourceInfo resourceInfo, long backendId, long signature, long jobId, long dbId,
             long tableId, long partitionId, long indexId, long tabletId, String src, int schemaHash,
@@ -52,6 +60,26 @@ public class DirMoveTask extends AgentTask {
 
     public boolean isOverwrite() {
         return overwrite;
+    }
+
+    public TRestoreIncrementalRange getIncrementalRange() {
+        return incrementalRange;
+    }
+
+    public void setLocalSourceLoaded(boolean localSourceLoaded) {
+        this.localSourceLoaded = localSourceLoaded;
+    }
+
+    public boolean isLocalSourceLoaded() {
+        return localSourceLoaded;
+    }
+
+    public void setLocalSourceKept(boolean localSourceKept) {
+        this.localSourceKept = localSourceKept;
+    }
+
+    public boolean isLocalSourceKept() {
+        return localSourceKept;
     }
 
     public TMoveDirReq toThrift() {

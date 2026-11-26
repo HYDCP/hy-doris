@@ -131,6 +131,15 @@ public class BackupHandlerTest {
             }
         };
 
+        // a restore job tells the handler of its env when its local source partitions change; the handler is a
+        // Thread, which jmockit can not mock as a cascaded instance: give the one of the test
+        new MockUp<Env>() {
+            @Mock
+            public BackupHandler getBackupHandler() {
+                return handler;
+            }
+        };
+
         db = CatalogMocker.mockDb();
         catalog = Deencapsulation.newInstance(InternalCatalog.class);
 

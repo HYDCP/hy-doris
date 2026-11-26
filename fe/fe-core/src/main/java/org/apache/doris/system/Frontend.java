@@ -67,6 +67,9 @@ public class Frontend implements Writable {
 
     private long processUUID = 0;
 
+    // The version of the restore reuse protocol the frontend reports in the heartbeat, 0 for an old frontend and
+    // before the first heartbeat. Only the master handles it, it is not persisted.
+    private volatile int restoreReuseCapability = 0;
     // PartitionStateToken#CAPABILITY if the frontend reported it in the last heartbeat, 0 for an old frontend, before
     // the first heartbeat and while the frontend does not answer it. Only the master handles it, it is not persisted.
     private volatile int partitionStateTokenCapability = 0;
@@ -173,6 +176,7 @@ public class Frontend implements Writable {
             isAlive = true;
             if (!isReplay) {
                 partitionStateTokenCapability = hbResponse.getPartitionStateTokenCapability();
+                restoreReuseCapability = hbResponse.getRestoreReuseCapability();
             }
             version = hbResponse.getVersion();
             queryPort = hbResponse.getQueryPort();
@@ -247,6 +251,15 @@ public class Frontend implements Writable {
     @VisibleForTesting
     public void setPartitionStateTokenCapability(int partitionStateTokenCapability) {
         this.partitionStateTokenCapability = partitionStateTokenCapability;
+    }
+
+    public int getRestoreReuseCapability() {
+        return restoreReuseCapability;
+    }
+
+    @VisibleForTesting
+    public void setRestoreReuseCapability(int restoreReuseCapability) {
+        this.restoreReuseCapability = restoreReuseCapability;
     }
 
     public void setHost(String host) {

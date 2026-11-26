@@ -117,6 +117,13 @@ public abstract class AgentTask {
         setErrorMsg(errMsg);
     }
 
+    // Takes back the last failed(), for a failure which is not counted.
+    public void revertFailed() {
+        if (this.failedTimes > 0) {
+            --this.failedTimes;
+        }
+    }
+
     public int getFailedTimes() {
         return this.failedTimes;
     }

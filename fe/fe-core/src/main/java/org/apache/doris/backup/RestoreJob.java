@@ -58,6 +58,7 @@ import org.apache.doris.catalog.View;
 import org.apache.doris.clone.DynamicPartitionScheduler;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
+import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.MarkedCountDownLatch;
 import org.apache.doris.common.MetaNotFoundException;
@@ -69,9 +70,13 @@ import org.apache.doris.common.util.DynamicPartitionUtil;
 import org.apache.doris.common.util.PropertyAnalyzer;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.ha.FrontendNodeType;
 import org.apache.doris.persist.gson.GsonPostProcessable;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.resource.Tag;
+import org.apache.doris.system.Backend;
+import org.apache.doris.system.Frontend;
+import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.task.AgentBatchTask;
 import org.apache.doris.task.AgentBoundedBatchTask;
 import org.apache.doris.task.AgentTask;
@@ -111,6 +116,7 @@ import java.io.ByteArrayInputStream;
 import java.io.DataInput;
 import java.io.DataInputStream;
 import java.io.IOException;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -200,11 +206,43 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     @JsonAdapter(GsonUtils.GuavaTableTypeAdapterFactory.class)
     protected com.google.common.collect.Table<Long, Long, SnapshotInfo> snapshotInfos = HashBasedTable.create();
 
+    // The outcome of partition level reuse: the partitions that keep their local data, and the reason of each
+    // decision. Null if partition level reuse is not enabled. Fixed when the replicas are created (it is in the edit
+    // log written when entering DOWNLOAD), kept after the job finishes.
+    @SerializedName("rru")
+    private RestoreReuseResult reuseResult;
     // whether the master tracked the state tokens when it committed the job: the restored partitions adopt the
     // tokens of the backup only then, see stampStateToken. Set on the master before the stamp, persisted with the
     // finished job for the replay.
     @SerializedName("stt")
     private boolean stampStateTokens;
+
+    // The ids of the staging partitions of an atomic restore whose data is loaded from a local source (kept or
+    // incrementally appended partitions): the tablet scheduler must not repair their replicas by clone while the job
+    // runs, a clone would replace the data the job loaded. Immutable, only replaced as a whole, so the tablet
+    // scheduler reads it without any lock. Built in finishVerifying (before the snapshot tasks are sent), empty
+    // before that and when the job is done, rebuilt from reuseResult when the job is replayed.
+    private volatile Set<Long> localSourceStagingPartitions = Collections.emptySet();
+
+    // The prefix of the error message of a backend which says that retrying the task cannot succeed.
+    public static final String RESTORE_NOT_RETRYABLE = "[RESTORE_NOT_RETRYABLE]";
+    // The version of the restore reuse protocol of this build, reported in the heartbeat of the frontend and the
+    // backend. A node of an old version reports none (0). 1: the local source snapshot and the load of a kept
+    // partition by the snapshot task (TSnapshotRequest.restore_local_source, restore_kept_load).
+    public static final int RESTORE_REUSE_CAPABILITY_REPORTED = 1;
+    // What partition level reuse needs of every node: 1, the local source snapshot, which an old node does not
+    // understand.
+    public static final int RESTORE_REUSE_CAPABILITY_MIN_REQUIRED = 1;
+    // The reason of downloading all the data when a node does not have the capability.
+    public static final String MIXED_VERSIONS = "MIXED_VERSIONS";
+    // The reason of downloading a partition whose state token equals the one of the backup, when the token is not
+    // trusted (restore_reuse_trust_state_token is false): only counted, see selectReuseCandidates.
+    private static final String TOKEN_NOT_TRUSTED = "TOKEN_NOT_TRUSTED";
+    // The working state of partition level reuse while PENDING and CREATING, never persisted: the job is redone
+    // from PENDING after a restart or a master switch.
+    private transient List<ReuseCandidate> reuseCandidates = Lists.newArrayList();
+    // What the backup meta carried before it was cleared: backup table name -> its table, for the structure checks.
+    private transient Map<String, BackupStamps> backupStamps = Maps.newHashMap();
 
     // the meta version is used when reading backup meta from file.
     // we do not persist this field, because this is just a temporary solution.
@@ -305,6 +343,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     public synchronized boolean finishTabletSnapshotTask(SnapshotTask task, TFinishTaskRequest request) {
+        if (task.isRestoreLocalSource() && task.getJobId() == jobId
+                && cancelOnLocalSourceTaskFailure(task, request, RestoreJobState.SNAPSHOTING)) {
+            return false;
+        }
         if (checkTaskStatus(task, task.getJobId(), request)) {
             return false;
         }
@@ -366,6 +408,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     public synchronized boolean finishDirMoveTask(DirMoveTask task, TFinishTaskRequest request) {
+        if ((task.getIncrementalRange() != null || task.isLocalSourceKept()) && task.isLocalSourceLoaded()
+                && task.getJobId() == jobId
+                && cancelOnLocalSourceTaskFailure(task, request, RestoreJobState.COMMITTING)) {
+            return false;
+        }
         if (checkTaskStatus(task, task.getJobId(), request)) {
             return false;
         }
@@ -379,6 +426,53 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
         taskErrMsg.remove(task.getSignature());
         nudgeIfIdle(unfinishedSignatureToId.isEmpty());
+        return true;
+    }
+
+    /**
+     * The failure of a task of the local source (the snapshot task which loads the local source into a staging
+     * tablet, the move task which appends the increment or confirms a kept tablet): other tasks are resent without
+     * end, but these cannot
+     * succeed forever if the tablet is not what the job expects, so the job is cancelled (an atomic restore leaves
+     * the original table alone) when
+     *  - the backend says that retrying is useless (the error has RESTORE_NOT_RETRYABLE), or
+     *  - the task failed more than Config.restore_local_source_task_max_retry times. A failure to obtain the tablet
+     *    locks is not counted: it is retried at once by design.
+     * The failure of the other tasks (whole snapshot, download, move) is not touched.
+     *
+     * @return true if the job is cancelled
+     */
+    private boolean cancelOnLocalSourceTaskFailure(AgentTask task, TFinishTaskRequest request,
+                                                   RestoreJobState expectedState) {
+        if (request.getTaskStatus().getStatusCode() == TStatusCode.OK) {
+            return false;
+        }
+        String errMsg = request.getTaskStatus().isSetErrorMsgs()
+                ? Joiner.on(",").join(request.getTaskStatus().getErrorMsgs()) : "";
+        if (request.getTaskStatus().getStatusCode() == TStatusCode.OBTAIN_LOCK_FAILED) {
+            // not counted
+            task.revertFailed();
+            return false;
+        }
+        boolean notRetryable = errMsg.contains(RESTORE_NOT_RETRYABLE);
+        if (!notRetryable && task.getFailedTimes() <= Config.restore_local_source_task_max_retry) {
+            return false;
+        }
+        taskErrMsg.put(task.getSignature(), errMsg);
+        if (state != expectedState) {
+            LOG.warn("ignore the failure of {} task {} in state {}: {}. {}", task.getTaskType(), task.getSignature(),
+                    state, errMsg, this);
+            return false;
+        }
+        LOG.warn("cancel restore job, {} task {} of tablet {} failed {} times on backend {}{}: {}. {}",
+                task.getTaskType(), task.getSignature(), task.getTabletId(), task.getFailedTimes(),
+                task.getBackendId(), notRetryable ? ", retrying is useless" : "", errMsg, this);
+        status = new Status(ErrCode.COMMON_ERROR, (notRetryable
+                ? "the backend " + task.getBackendId() + " cannot go on with tablet " + task.getTabletId()
+                : task.getTaskType() + " task of tablet " + task.getTabletId() + " failed "
+                        + task.getFailedTimes() + " times on backend " + task.getBackendId())
+                + ": " + errMsg);
+        cancelInternal(false);
         return true;
     }
 
@@ -622,6 +716,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
         Preconditions.checkNotNull(backupMeta);
 
+        // Must be done before any local partition is modified by this job.
+        captureBackupStamps();
         // The backup meta carries the state token of the source partitions, which must not be inherited.
         clearRestoreLineageInBackupMeta();
 
@@ -717,6 +813,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
         // the new tablets -> { local tablet, schema hash, storage medium }, used in atomic restore.
         Map<Long, TabletRef> tabletBases = new HashMap<>();
+        // the staging tables of atomic restore whose tablets are bound to the tablets of the table being replaced,
+        // by the name of the table in the backup
+        Map<String, OlapTable> atomicStaging = new HashMap<>();
 
         // Check and prepare meta objects.
 
@@ -911,6 +1010,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         if (!status.ok()) {
                             return;
                         }
+                        atomicStaging.put(tableName, remoteOlapTbl);
                     }
                     if (LOG.isDebugEnabled()) {
                         LOG.debug("put remote table {} to restoredTbls", remoteOlapTbl.getName());
@@ -1044,7 +1144,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         // the data it stands for, e.g. if the job is cancelled after some tablets are moved in COMMITTING.
         // This is persisted with the DOWNLOAD edit log (replayed by replayCheckAndPrepareMeta), which is
         // written before any tablet data is moved, and the token is written again in allTabletCommitted.
-        invalidateRestoreLineageOfOverwrittenPartitions(db);
+        // The candidates of partition level reuse keep their token until they are decided when the replicas are
+        // created, nothing local is changed before that.
+        Set<Pair<Long, Long>> candidateKeys = selectReuseCandidates(db, atomicStaging, tabletBases);
+        invalidateRestoreLineageOfOverwrittenPartitions(db, candidateKeys);
 
         // check and restore resources
         checkAndRestoreResources();
@@ -1199,6 +1302,12 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         LOG.info("finished to prepare meta. {}", this);
 
         if (jobInfo.content == null || jobInfo.content == BackupContent.ALL) {
+            if (!reuseCandidates.isEmpty()) {
+                // The snapshots of the partitions that keep their data are not needed, decide them first.
+                metaPreparedTime = System.currentTimeMillis();
+                finishVerifying(db);
+                return;
+            }
             prepareAndSendSnapshotTaskForOlapTable(db);
         }
 
@@ -1315,6 +1424,18 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     boolean isRestoreTask = true;
                     // We don't care the visible version in restore job, the end version is used.
                     long visibleVersion = -1L;
+                    // Atomic restore, a partition that keeps the data of the table being replaced, or its base: the
+                    // snapshot is made from the local tablet at this version (the one of the proof).
+                    RestoreReuseResult.Decision atomicDecision = getAtomicLocalDecision(tbl.getId(), part.getId());
+                    if (atomicDecision != null) {
+                        if (!entry.getValue().hasRefTabletId()) {
+                            status = new Status(ErrCode.COMMON_ERROR, "the tablet " + tablet.getId()
+                                    + " of the partition " + atomicDecision.tableName + "."
+                                    + atomicDecision.partitionName + " is not bound to a local tablet");
+                            return;
+                        }
+                        visibleVersion = atomicDecision.version;
+                    }
                     long beId = replica.getBackendIdWithoutException();
                     SnapshotTask task = new SnapshotTask(null, beId,
                             signature, jobId, db.getId(),
@@ -1322,6 +1443,13 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                             tbl.getSchemaHashByIndexId(index.getId()), timeoutMs, isRestoreTask);
                     if (entry.getValue().hasRefTabletId()) {
                         task.setRefTabletId(entry.getValue().getRefTabletId());
+                    }
+                    if (atomicDecision != null) {
+                        task.setRestoreLocalSource(true);
+                        if (atomicDecision.kept && Config.restore_reuse_kept_load_at_snapshot) {
+                            // loaded into the staging tablet by the snapshot task, the move only confirms it
+                            task.setRestoreKeptLoad(true);
+                        }
                     }
                     batchTask.addTask(task);
                     unfinishedSignatureToId.put(signature, tablet.getId());
@@ -1835,6 +1963,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             // We classify the snapshot info by backend
             ArrayListMultimap<Long, SnapshotInfo> beToSnapshots = ArrayListMultimap.create();
             for (SnapshotInfo info : infos) {
+                if (isKeptPartition(info.getTblId(), info.getPartitionId())) {
+                    // made from the local tablets by the snapshot task
+                    continue;
+                }
                 beToSnapshots.put(info.getBeId(), info);
             }
 
@@ -1942,6 +2074,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             // We classify the snapshot info by backend
             ArrayListMultimap<Long, SnapshotInfo> beToSnapshots = ArrayListMultimap.create();
             for (SnapshotInfo info : infos) {
+                if (isKeptPartition(info.getTblId(), info.getPartitionId())) {
+                    // made from the local tablets by the snapshot task
+                    continue;
+                }
                 beToSnapshots.put(info.getBeId(), info);
             }
 
@@ -2042,6 +2178,35 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         LOG.info("finished to send download tasks to BE. num: {}. {}", batchTask.getTaskNum(), this);
     }
 
+    /** The decision of the partition if it is restored by appending the increment, otherwise null. */
+    private RestoreReuseResult.Decision getIncrementalDecision(long tblId, long partId) {
+        return reuseResult == null ? null : reuseResult.getIncremental(tblId, partId);
+    }
+
+    private boolean isIncrementalPartition(long tblId, long partId) {
+        return getIncrementalDecision(tblId, partId) != null;
+    }
+
+    /** The partition (of the staging table) keeps the data of the table being replaced: nothing to download. */
+    private boolean isKeptPartition(long tblId, long partId) {
+        return reuseResult != null && reuseResult.getKept(tblId, partId) != null;
+    }
+
+    /**
+     * Atomic restore: the decision of the staging partition if its data is made from the local tablets of the table
+     * being replaced (kept, or the base of an incremental partition), otherwise null.
+     */
+    private RestoreReuseResult.Decision getAtomicLocalDecision(long tblId, long partId) {
+        if (reuseResult == null) {
+            return null;
+        }
+        RestoreReuseResult.Decision decision = reuseResult.getKept(tblId, partId);
+        if (decision == null) {
+            decision = reuseResult.getIncremental(tblId, partId);
+        }
+        return decision != null && decision.atomic ? decision : null;
+    }
+
     protected DownloadTask createDownloadTask(long beId, long signature, long jobId, long dbId,
                                               Map<String, String> srcToDest, FsBroker brokerAddr) {
         return new DownloadTask(null, beId, signature, jobId, dbId, srcToDest,
@@ -2109,6 +2274,13 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     protected void commit() {
+        // Fail before any tablet is moved if a partition that keeps its data was written.
+        Status keptStatus = checkKeptPartitions();
+        if (!keptStatus.ok()) {
+            status = keptStatus;
+            return;
+        }
+
         // Send task to move the download dir
         unfinishedSignatureToId.clear();
         taskProgress.clear();
@@ -2122,6 +2294,14 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             DirMoveTask task = new DirMoveTask(null, cell.getColumnKey(), signature, jobId, dbId, info.getTblId(),
                     info.getPartitionId(), info.getTabletId(), cell.getRowKey(), info.getTabletPath(),
                     info.getSchemaHash(), true /* need reload tablet header */);
+            RestoreReuseResult.Decision kept = getAtomicLocalDecision(info.getTblId(), info.getPartitionId());
+            if (kept != null && kept.kept) {
+                // The snapshot task may have loaded the tablet (restore_reuse_kept_load_at_snapshot), then the
+                // backend judges the move by the evidence of the load: its failure is converged. The request of the
+                // move is the same either way.
+                task.setLocalSourceKept(true);
+                task.setLocalSourceLoaded(true);
+            }
             batchTask.addTask(task);
             unfinishedSignatureToId.put(signature, info.getTabletId());
         }
@@ -2151,6 +2331,15 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         Database db = env.getInternalCatalog().getDbNullable(dbId);
         if (db == null) {
             return new Status(ErrCode.NOT_FOUND, "database " + dbId + " does not exist");
+        }
+
+        // The partitions that keep their local data must not have been written, or the restored data is not
+        // consistent with the backup. Never commit silently.
+        if (!isReplay) {
+            Status keptStatus = checkKeptPartitions();
+            if (!keptStatus.ok()) {
+                return keptStatus;
+            }
         }
 
         // replace the origin tables in atomic.
@@ -2205,6 +2394,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             }
         }
 
+        settleLocalSourceReplicaVersions(db);
+
         if (!isReplay) {
             // persisted with the job finished, see stampStateToken
             stampStateTokens = Config.restore_state_token_track;
@@ -2233,15 +2424,73 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
             finishedTime = System.currentTimeMillis();
             state = RestoreJobState.FINISHED;
-
+            clearLocalSourceStagingPartitions();
             env.getEditLog().logRestoreJob(this);
 
             // Only send release snapshot tasks after the job is finished.
             releaseSnapshots(savedSnapshotInfos, true);
         }
+        if (isReplay) {
+            clearLocalSourceStagingPartitions();
+        }
 
         LOG.info("job is finished. is replay: {}. {}", isReplay, this);
         return Status.OK;
+    }
+
+    /**
+     * The tablets of the atomic local source partitions (kept or incremental) are loaded from the local source, and the
+     * backend may have reported a lower version than the visible version of the staging partition while the job ran, so
+     * the replica carries a last failed version. All their loads and move tasks succeeded when the job gets here, so
+     * the replicas are at the visible version: set them there and clear the failed version, or the tablet scheduler
+     * repairs them (a clone) as soon as the protection of the job is gone. Done on replay as well, to keep the
+     * followers the same. The staging tables are the formal tables now, they are found by the recorded ids.
+     * The partitions to download and the non-atomic restore are not touched.
+     */
+    @VisibleForTesting
+    int settleLocalSourceReplicaVersions(Database db) {
+        if (reuseResult == null) {
+            return 0;
+        }
+        Map<Long, Set<Long>> partitionsByTable = Maps.newHashMap();
+        for (RestoreReuseResult.Decision decision : reuseResult.getDecisions()) {
+            if (decision.atomic && (decision.kept || decision.incremental)) {
+                partitionsByTable.computeIfAbsent(decision.stagingTableId, k -> Sets.newHashSet())
+                        .add(decision.stagingPartitionId);
+            }
+        }
+        int fixed = 0;
+        for (Map.Entry<Long, Set<Long>> entry : partitionsByTable.entrySet()) {
+            Table tbl = db.getTableNullable(entry.getKey());
+            if (!(tbl instanceof OlapTable) || !tbl.writeLockIfExist()) {
+                continue;
+            }
+            try {
+                OlapTable olapTbl = (OlapTable) tbl;
+                for (long partId : entry.getValue()) {
+                    Partition part = olapTbl.getPartition(partId);
+                    if (part == null) {
+                        continue;
+                    }
+                    long visibleVersion = part.getVisibleVersion();
+                    for (MaterializedIndex idx : part.getMaterializedIndices(IndexExtState.VISIBLE)) {
+                        for (Tablet tablet : idx.getTablets()) {
+                            for (Replica replica : tablet.getReplicas()) {
+                                if (replica.getVersion() < visibleVersion || replica.getLastFailedVersion() > 0) {
+                                    replica.updateVersionWithFailed(visibleVersion, -1L, visibleVersion);
+                                    fixed++;
+                                }
+                            }
+                        }
+                    }
+                }
+            } finally {
+                tbl.writeUnlock();
+            }
+        }
+        LOG.info("restore reuse: settled the version of {} replicas of the local source partitions, job: {}",
+                fixed, jobId);
+        return fixed;
     }
 
     private Status dropAllNonRestoredTableAndPartitions(Database db) {
@@ -2374,7 +2623,543 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
         info.add(status.toString());
         info.add(String.valueOf(timeoutMs / 1000));
+        if (!isBrief) {
+            // the reuse is off or its selection failed: nothing is kept, all the data is downloaded
+            info.add(Config.isCloudMode() ? FeConstants.null_string : new RestoreReuseShadowStats().toJson(
+                    reuseResult == null ? new RestoreReuseResult() : reuseResult));
+        }
         return info;
+    }
+
+    public RestoreReuseResult getReuseResult() {
+        return reuseResult;
+    }
+
+    private void clearReuseWorkingState() {
+        reuseCandidates.clear();
+    }
+
+    /**
+     * Whether every node which the reuse of this job depends on understands it: every follower frontend (the master
+     * included, the observers excluded: they never take over a job) and every alive backend must report
+     * the capability in the heartbeat. A node which has not been heard from since the master started counts as not
+     * having it. Nothing is checked if restore_reuse_require_capability is false.
+     *
+     * @return the first node without the capability, null if there is none
+     */
+    @VisibleForTesting
+    static String findNodeWithoutReuseCapability() {
+        return findNodeWithoutReuseCapability(RESTORE_REUSE_CAPABILITY_MIN_REQUIRED, true);
+    }
+
+    /**
+     * @param required the capability that every node must report
+     * @param unknownIsIncapable whether the failure to read the nodes is taken as a node without the capability (the
+     *         decision of the job), or as none (the estimate, which only records the reason)
+     */
+    private static String findNodeWithoutReuseCapability(int required, boolean unknownIsIncapable) {
+        if (!Config.restore_reuse_require_capability) {
+            return null;
+        }
+        if (DebugPointUtil.isEnable("RestoreJob.restoreReuseCapability.mixedVersions")) {
+            // a node of an old version, for the regression test
+            return "debug point";
+        }
+        try {
+            Env env = Env.getCurrentEnv();
+            SystemInfoService.HostInfo self = env.getSelfNode();
+            for (Frontend fe : env.getFrontends(FrontendNodeType.FOLLOWER)) {
+                // the host and the port: several frontends may run on a host
+                boolean isSelf = self != null && fe.getHost().equals(self.getHost())
+                        && fe.getEditLogPort() == self.getPort();
+                int capability = isSelf ? RESTORE_REUSE_CAPABILITY_REPORTED : fe.getRestoreReuseCapability();
+                if (capability < required) {
+                    return "frontend " + fe.getHost() + " (capability " + capability + ")";
+                }
+            }
+            for (Backend be : Env.getCurrentSystemInfo().getAllClusterBackendsNoException().values()) {
+                if (!be.isAlive()) {
+                    continue;
+                }
+                if (be.getRestoreReuseCapability() < required) {
+                    return "backend " + be.getHost() + " (capability " + be.getRestoreReuseCapability() + ")";
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            LOG.warn("failed to check the restore reuse capability of the nodes", e);
+            return unknownIsIncapable ? "unknown nodes" : null;
+        }
+    }
+
+    /**
+     * Select the existing partitions that may keep their local data, by the chain of conditions in
+     * {@link RestoreReuseJudge}. Only the partitions of the A1 branch (existing partition, see restoredVersionInfo)
+     * are looked at, so it must be called after the meta is prepared and before the state token of the overwritten
+     * partitions is invalidated. The candidates are kept in reuseCandidates, each decided here by its state token.
+     * Never fails the job: any problem selects nothing.
+     *
+     * @return the (table id, partition id) of the candidates
+     */
+    @VisibleForTesting
+    Set<Pair<Long, Long>> selectReuseCandidates(Database db) {
+        return selectReuseCandidates(db, Collections.emptyMap(), Collections.emptyMap());
+    }
+
+    /**
+     * @param atomicStaging atomic restore: the staging tables bound to the table being replaced, by the name of the
+     *         table in the backup. The candidates are the partitions of the table being replaced then.
+     * @param tabletBases atomic restore: the staging tablet to the tablet of the table being replaced
+     */
+    @VisibleForTesting
+    Set<Pair<Long, Long>> selectReuseCandidates(Database db, Map<String, OlapTable> atomicStaging,
+            Map<Long, TabletRef> tabletBases) {
+        reuseCandidates.clear();
+        reuseResult = null;
+        Set<Pair<Long, Long>> keys = Sets.newHashSet();
+        if (!Config.enable_restore_partition_reuse || Config.isCloudMode()
+                || (isAtomicRestore && !Config.enable_restore_atomic_reuse)
+                || !(jobInfo.content == null || jobInfo.content == BackupContent.ALL)) {
+            return keys;
+        }
+        String incapableNode = findNodeWithoutReuseCapability();
+        if (incapableNode != null) {
+            // Download all the data as before: no local source snapshot is sent.
+            RestoreReuseResult result = new RestoreReuseResult();
+            for (BackupOlapTableInfo tblInfo : jobInfo.backupOlapTableObjects.values()) {
+                for (int i = 0; i < tblInfo.partitions.size(); i++) {
+                    result.addRejected(MIXED_VERSIONS);
+                }
+            }
+            reuseResult = result;
+            LOG.info("restore reuse: {} does not have the capability of it, download all. job: {}", incapableNode,
+                    jobId);
+            return keys;
+        }
+        try {
+            RestoreReuseResult result = new RestoreReuseResult();
+            List<ReuseCandidate> candidates = Lists.newArrayList();
+            for (Map.Entry<String, BackupOlapTableInfo> tblEntry : jobInfo.backupOlapTableObjects.entrySet()) {
+                BackupOlapTableInfo tblInfo = tblEntry.getValue();
+                Table localTbl = db.getTableNullable(jobInfo.getAliasByOriginNameIfSet(tblEntry.getKey()));
+                if (localTbl == null || localTbl.getType() != TableType.OLAP) {
+                    continue;
+                }
+                OlapTable localOlapTbl = (OlapTable) localTbl;
+                OlapTable stagingTbl = isAtomicRestore ? atomicStaging.get(tblEntry.getKey()) : null;
+                localOlapTbl.readLock();
+                try {
+                    for (Map.Entry<String, BackupPartitionInfo> partEntry : tblInfo.partitions.entrySet()) {
+                        Partition localPart = localOlapTbl.getPartition(partEntry.getKey(), false);
+                        if (localPart == null) {
+                            continue;
+                        }
+                        // Atomic restore: the staging partition of the same name is the one to restore, and its
+                        // tablets must be bound to the local ones. Otherwise the partition of the restored
+                        // partitions (the A1 branch).
+                        Partition stagingPart = null;
+                        String atomicReject = null;
+                        if (isAtomicRestore) {
+                            atomicReject = stagingTbl == null ? "ATOMIC_NOT_BOUND_TABLE"
+                                    : checkAtomicBinding(localOlapTbl, localPart, stagingTbl, tabletBases);
+                            if (stagingTbl != null) {
+                                stagingPart = stagingTbl.getPartition(partEntry.getKey(), false);
+                            }
+                        } else if (!restoredVersionInfo.contains(localOlapTbl.getId(), localPart.getId())) {
+                            continue;
+                        }
+                        RestoreReuseJudge.Input in = buildReuseInput(tblEntry.getKey(), partEntry.getValue(),
+                                localOlapTbl, localPart);
+                        in.atomicReject = atomicReject;
+                        boolean tokenEqual = RestoreReuseJudge.tokenEqual(in);
+                        String tokenReject = RestoreReuseJudge.firstRejectByToken(in);
+                        if (tokenReject != null) {
+                            result.addRejected(tokenReject);
+                            if (tokenEqual) {
+                                LOG.info("restore reuse: partition {}.{} has the state token of the backup but is "
+                                        + "not kept by it: {}, job: {}", localOlapTbl.getName(), partEntry.getKey(),
+                                        tokenReject, jobId);
+                            }
+                            continue;
+                        }
+                        ReuseCandidate candidate = new ReuseCandidate();
+                        candidate.tableId = localOlapTbl.getId();
+                        candidate.partitionId = localPart.getId();
+                        candidate.tableName = localOlapTbl.getName();
+                        candidate.partitionName = partEntry.getKey();
+                        if (isAtomicRestore) {
+                            candidate.atomic = true;
+                            candidate.stagingTableId = stagingTbl.getId();
+                            candidate.stagingPartitionId = stagingPart.getId();
+                        }
+                        candidate.version = in.backupPartition.version;
+                        // the version isStillAtVersion checks the partition at
+                        candidate.digestVersion = in.backupPartition.version;
+                        candidate.bytes = in.getSingleReplicaBytes();
+                        candidate.bytesAllReplicas = RestoreReuseShadowStats.getAllReplicasLocalDataSize(localPart);
+                        candidate.tokenEqual = tokenEqual;
+                        if (Config.restore_reuse_trust_state_token) {
+                            candidate.decide(true, RestoreReuseResult.KEPT_STATE_TOKEN);
+                        } else {
+                            // Observation only: the partition would be kept if the state token were trusted, it is
+                            // downloaded, and counted in the token_equal of ReuseEstimate.
+                            candidate.decide(false, TOKEN_NOT_TRUSTED);
+                        }
+                        candidates.add(candidate);
+                    }
+                } finally {
+                    localOlapTbl.readUnlock();
+                }
+            }
+            reuseResult = result;
+            reuseCandidates = candidates;
+            for (ReuseCandidate candidate : candidates) {
+                keys.add(Pair.of(candidate.tableId, candidate.partitionId));
+            }
+            LOG.info("restore reuse: {} candidate partitions, trust the state token {}, not candidates: {}, job: {}",
+                    candidates.size(), Config.restore_reuse_trust_state_token, result.getRejected(), jobId);
+        } catch (Exception e) {
+            LOG.warn("failed to select the candidate partitions of restore reuse, download all. job: {}", jobId, e);
+            reuseCandidates.clear();
+            reuseResult = null;
+            keys.clear();
+        }
+        return keys;
+    }
+
+    /**
+     * Atomic restore: whether the staging partition of the same name is bound to the local partition, tablet by tablet
+     * and replica by replica, as bindLocalAndRemoteOlapTableReplicas does: the staging tablet has its local tablet
+     * as the base tablet, and each of its replicas is on the backend of the local replica at the same position.
+     * The data of the partition can be made from the local tablets only then. The caller holds the read lock of the
+     * local table.
+     *
+     * @return null if bound, otherwise the reason
+     */
+    @VisibleForTesting
+    static String checkAtomicBinding(OlapTable localTbl, Partition localPart, OlapTable stagingTbl,
+            Map<Long, TabletRef> tabletBases) {
+        Partition stagingPart = stagingTbl.getPartition(localPart.getName(), false);
+        if (stagingPart == null) {
+            return "ATOMIC_NOT_BOUND_PARTITION";
+        }
+        for (MaterializedIndex localIdx : localPart.getMaterializedIndices(IndexExtState.VISIBLE)) {
+            MaterializedIndex stagingIdx;
+            if (localIdx.getId() == localTbl.getBaseIndexId()) {
+                // the base index is named by the table, which is renamed to the temp name
+                stagingIdx = stagingPart.getBaseIndex();
+            } else {
+                Long stagingIdxId = stagingTbl.getIndexIdByName(localTbl.getIndexNameById(localIdx.getId()));
+                stagingIdx = stagingIdxId == null ? null : stagingPart.getIndex(stagingIdxId);
+            }
+            if (stagingIdx == null || stagingIdx.getTablets().size() != localIdx.getTablets().size()) {
+                return "ATOMIC_NOT_BOUND_INDEX";
+            }
+            for (int i = 0; i < localIdx.getTablets().size(); i++) {
+                Tablet localTablet = localIdx.getTablets().get(i);
+                Tablet stagingTablet = stagingIdx.getTablets().get(i);
+                TabletRef ref = tabletBases.get(stagingTablet.getId());
+                if (ref == null || ref.tabletId != localTablet.getId()) {
+                    return "ATOMIC_NOT_BOUND_TABLET";
+                }
+                List<Replica> localReplicas = localTablet.getReplicas();
+                List<Replica> stagingReplicas = stagingTablet.getReplicas();
+                if (localReplicas.isEmpty() || localReplicas.size() != stagingReplicas.size()) {
+                    return "ATOMIC_NOT_BOUND_REPLICA";
+                }
+                for (int j = 0; j < localReplicas.size(); j++) {
+                    if (localReplicas.get(j).getBackendIdWithoutException()
+                            != stagingReplicas.get(j).getBackendIdWithoutException()) {
+                        return "ATOMIC_NOT_BOUND_REPLICA";
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Fix the decisions: the partitions that keep their data are taken out of the restore (no file mapping, no
+     * restoredVersionInfo, so no snapshot, download or move task, and the state token is kept), and the state token
+     * of the other overwritten partitions is invalidated, then go on to SNAPSHOTING.
+     */
+    @VisibleForTesting
+    void finishVerifying(Database db) {
+        RestoreReuseResult result = reuseResult != null ? reuseResult : new RestoreReuseResult();
+        Set<Pair<Long, Long>> kept = Sets.newHashSet();
+        for (ReuseCandidate candidate : reuseCandidates) {
+            if ((candidate.kept || candidate.incremental) && !isStillAtVersion(db, candidate)) {
+                candidate.decide(false, RestoreReuseResult.DOWNLOAD_CHANGED);
+            }
+            result.addDecision(candidate.toDecision());
+            LOG.info("restore reuse: partition {}, job: {}", candidate.toDecision(), jobId);
+            if (candidate.kept && !candidate.atomic) {
+                kept.add(Pair.of(candidate.tableId, candidate.partitionId));
+                restoredVersionInfo.remove(candidate.tableId, candidate.partitionId);
+            }
+            // An atomic restore keeps the file mapping of a kept partition: its snapshot task makes the local snapshot
+            // of the staging tablets, only the download is skipped.
+        }
+        fileMapping.removePartitions(kept);
+        reuseResult = result;
+        // From now on the staging replicas are loaded from the local source, the tablet scheduler leaves them alone
+        // until the job is done.
+        setLocalSourceStagingPartitions(computeLocalSourceStagingPartitions(result));
+        // The data of the partitions to download is about to change.
+        invalidateRestoreLineageOfOverwrittenPartitions(db);
+        clearReuseWorkingState();
+        LOG.info("restore reuse: keep {} partitions ({} bytes of a single replica), append the increment to {}, "
+                + "download {} of the candidates, job: {}", result.getKeptPartitions(),
+                result.getKeptBytesSingleReplica(), result.getIncrementalPartitions(),
+                result.getDownloadedPartitions(), jobId);
+
+        prepareAndSendSnapshotTaskForOlapTable(db);
+        state = RestoreJobState.SNAPSHOTING;
+    }
+
+    /** The staging partitions whose data is loaded from a local source, see localSourceStagingPartitions. */
+    @VisibleForTesting
+    static Set<Long> computeLocalSourceStagingPartitions(RestoreReuseResult result) {
+        if (result == null) {
+            return Collections.emptySet();
+        }
+        Set<Long> partitions = Sets.newHashSet();
+        for (RestoreReuseResult.Decision decision : result.getDecisions()) {
+            if (decision.atomic && (decision.kept || decision.incremental)) {
+                partitions.add(decision.stagingPartitionId);
+            }
+        }
+        return partitions.isEmpty() ? Collections.emptySet() : Collections.unmodifiableSet(partitions);
+    }
+
+    /** Whether the replicas of the partition are protected from repair by the tablet scheduler. Takes no lock. */
+    public boolean isLocalSourceStagingPartition(long partitionId) {
+        return localSourceStagingPartitions.contains(partitionId);
+    }
+
+    @VisibleForTesting
+    Set<Long> getLocalSourceStagingPartitions() {
+        return localSourceStagingPartitions;
+    }
+
+    /** Replaces the set and tells the backup handler, which keeps the ids of the jobs with a non-empty set. */
+    private void setLocalSourceStagingPartitions(Set<Long> partitions) {
+        this.localSourceStagingPartitions = partitions;
+        BackupHandler handler = env == null ? null : env.getBackupHandler();
+        if (handler != null) {
+            handler.syncLocalSourceJob(this);
+        }
+    }
+
+    /** The job is done: the staging partitions are no longer protected. */
+    private void clearLocalSourceStagingPartitions() {
+        setLocalSourceStagingPartitions(Collections.emptySet());
+    }
+
+    private boolean isStillAtVersion(Database db, ReuseCandidate candidate) {
+        OlapTable tbl = (OlapTable) db.getTableNullable(candidate.tableId);
+        if (tbl == null) {
+            return false;
+        }
+        tbl.readLock();
+        try {
+            Partition part = tbl.getPartition(candidate.partitionId);
+            if (part == null || part.getVisibleVersion() != candidate.digestVersion) {
+                return false;
+            }
+            for (MaterializedIndex index : part.getMaterializedIndices(IndexExtState.VISIBLE)) {
+                for (Tablet tablet : index.getTablets()) {
+                    for (Replica replica : tablet.getReplicas()) {
+                        if (!RestoreReuseJudge.isReplicaHealthyAt(replica, candidate.digestVersion)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            return true;
+        } finally {
+            tbl.readUnlock();
+        }
+    }
+
+    /**
+     * The partitions that keep their local data must still be at the version of the backup, which no write is
+     * allowed to change while the table is in the RESTORE state. A different version means a write that should not
+     * have happened, the job fails with the reason rather than commit data that is not the backup.
+     */
+    @VisibleForTesting
+    Status checkKeptPartitions() {
+        if (reuseResult == null || (reuseResult.getKeptPartitions() == 0
+                && reuseResult.getIncrementalPartitions() == 0)) {
+            return Status.OK;
+        }
+        Database db = env.getInternalCatalog().getDbNullable(dbId);
+        if (db == null) {
+            return new Status(ErrCode.NOT_FOUND, "database " + dbId + " does not exist");
+        }
+        List<RestoreReuseResult.Decision> toCheck = Lists.newArrayList(reuseResult.getKeptDecisions());
+        toCheck.addAll(reuseResult.getIncrementalDecisions());
+        for (RestoreReuseResult.Decision decision : toCheck) {
+            Table tbl = db.getTableNullable(decision.tableId);
+            if (!(tbl instanceof OlapTable) || !tbl.writeLockIfExist()) {
+                return new Status(ErrCode.NOT_FOUND, "table " + decision.tableName + " of the kept partition "
+                        + decision.partitionName + " has been dropped");
+            }
+            try {
+                Partition part = ((OlapTable) tbl).getPartition(decision.partitionId);
+                if (part == null) {
+                    return new Status(ErrCode.NOT_FOUND, "the kept partition " + decision.tableName + "."
+                            + decision.partitionName + " has been dropped");
+                }
+                if (part.getVisibleVersion() != decision.version) {
+                    return new Status(ErrCode.COMMON_ERROR, "the visible version of the partition "
+                            + decision.tableName + "." + decision.partitionName + " that "
+                            + (decision.incremental ? "is restored by appending the increment" : "keeps its local data")
+                            + " changed from " + decision.version + " to " + part.getVisibleVersion()
+                            + " during the restore, the local data is not what was verified any more");
+                }
+                if (!stillHasKeptStateToken(db, decision, part)) {
+                    return new Status(ErrCode.COMMON_ERROR, "the state token of the partition "
+                            + decision.tableName + "." + decision.partitionName + " that keeps its local data by it"
+                            + " changed during the restore (" + PartitionStateToken.effective(part) + ", a change"
+                            + " that keeps the version), the local data is not what was verified any more");
+                }
+            } finally {
+                tbl.writeUnlock();
+            }
+        }
+        return Status.OK;
+    }
+
+    /**
+     * Whether a partition kept by its state token (KEPT_STATE_TOKEN) still has the token of the backup partition, as
+     * when it was judged: a change that keeps the version (a schema change or rollup job that finished, an admin
+     * operation on a replica) invalidates or taints the token, which the check of the version does not see. True for
+     * a decision of another reason. The caller holds the write lock of the table, and the backup table of the
+     * decision is found as the candidate was, by the name the restore gives it.
+     */
+    private boolean stillHasKeptStateToken(Database db, RestoreReuseResult.Decision decision, Partition part) {
+        if (!RestoreReuseResult.KEPT_STATE_TOKEN.equals(decision.reason)) {
+            return true;
+        }
+        String backupToken = null;
+        for (Map.Entry<String, BackupOlapTableInfo> tblEntry : jobInfo.backupOlapTableObjects.entrySet()) {
+            Table tbl = db.getTableNullable(jobInfo.getAliasByOriginNameIfSet(tblEntry.getKey()));
+            if (tbl != null && tbl.getId() == decision.tableId) {
+                backupToken = tblEntry.getValue().getPartInfo(decision.partitionName).stateToken;
+                break;
+            }
+        }
+        String localToken = PartitionStateToken.effective(part);
+        return localToken != null && localToken.equals(backupToken);
+    }
+
+    // A table in the backup meta, as the backup meta carried it.
+    static class BackupStamps {
+        OlapTable table;
+    }
+
+    /**
+     * Read the tables that the backup meta carries, before their state tokens are cleared, for the structure checks
+     * of the keep by the state token (RestoreReuseJudge#checkSameStructure). The restore source and the restore
+     * lineage of the backup meta are added by the logical verification.
+     */
+    @VisibleForTesting
+    void captureBackupStamps() {
+        backupStamps = Maps.newHashMap();
+        if (backupMeta == null) {
+            return;
+        }
+        for (String tableName : jobInfo.backupOlapTableObjects.keySet()) {
+            Table remoteTbl = backupMeta.getTable(tableName);
+            if (!(remoteTbl instanceof OlapTable)) {
+                continue;
+            }
+            OlapTable remoteOlap = (OlapTable) remoteTbl;
+            BackupStamps stamps = new BackupStamps();
+            stamps.table = remoteOlap;
+            backupStamps.put(tableName, stamps);
+        }
+    }
+
+    private RestoreReuseJudge.Input buildReuseInput(String backupTableName, BackupPartitionInfo partInfo,
+            OlapTable localTbl, Partition localPart) {
+        RestoreReuseJudge.Input in = new RestoreReuseJudge.Input();
+        in.atomicRestore = isAtomicRestore;
+        in.allowLoad = allowLoad;
+        in.cloudMode = Config.isCloudMode();
+        in.minPartitionBytes = Config.restore_reuse_min_partition_bytes;
+        in.backupPartition = partInfo;
+        in.localTable = localTbl;
+        in.localPartition = localPart;
+        in.localStateToken = PartitionStateToken.effective(localPart);
+        in.backupStateToken = partInfo.stateToken;
+        BackupStamps stamps = backupStamps.get(backupTableName);
+        if (stamps != null) {
+            in.backupOlapTable = stamps.table;
+        }
+        return in;
+    }
+
+    // A candidate partition of partition level reuse, not persisted.
+    @VisibleForTesting
+    static class ReuseCandidate {
+        long tableId;
+        long partitionId;
+        String tableName;
+        String partitionName;
+        // the version of the backup
+        long version;
+        long bytes;
+        long bytesAllReplicas;
+        // the version the partition must still be at when the decisions are fixed, see isStillAtVersion
+        long digestVersion;
+        // atomic restore: the staging table and partition the data goes to
+        boolean atomic = false;
+        long stagingTableId;
+        long stagingPartitionId;
+        // the outcome: restored incrementally, never in this version
+        boolean incremental = false;
+        // the local partition has the state token of the backup partition (whether or not it was kept by it)
+        boolean tokenEqual = false;
+        boolean decided = false;
+        boolean kept = false;
+        String reason;
+
+        void decide(boolean kept, String reason) {
+            this.decided = true;
+            this.kept = kept;
+            this.reason = reason;
+            this.incremental = false;
+        }
+
+        void decideIncremental() {
+            this.decided = true;
+            this.kept = false;
+            this.incremental = true;
+            this.reason = RestoreReuseResult.INCREMENTAL_VERIFIED;
+        }
+
+        RestoreReuseResult.Decision toDecision() {
+            RestoreReuseResult.Decision decision = new RestoreReuseResult.Decision();
+            decision.tableId = tableId;
+            decision.partitionId = partitionId;
+            decision.tableName = tableName;
+            decision.partitionName = partitionName;
+            // an incremental partition: the local version, and the backup in targetVersion
+            decision.version = incremental ? digestVersion : version;
+            decision.targetVersion = incremental ? version : 0;
+            decision.bytes = bytes;
+            decision.bytesAllReplicas = bytesAllReplicas;
+            decision.kept = kept;
+            decision.incremental = incremental;
+            decision.reason = reason;
+            decision.atomic = atomic;
+            decision.stagingTableId = stagingTableId;
+            decision.stagingPartitionId = stagingPartitionId;
+            decision.tokenEqual = tokenEqual;
+            return decision;
+        }
     }
 
     /**
@@ -2386,6 +3171,15 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
      */
     @VisibleForTesting
     void invalidateRestoreLineageOfOverwrittenPartitions(Database db) {
+        invalidateRestoreLineageOfOverwrittenPartitions(db, Collections.emptySet());
+    }
+
+    /**
+     * @param skipped the (table id, partition id) of the partitions whose state token is kept, because they are
+     *         candidates of partition level reuse that are not decided yet
+     */
+    @VisibleForTesting
+    void invalidateRestoreLineageOfOverwrittenPartitions(Database db, Set<Pair<Long, Long>> skipped) {
         for (long tblId : restoredVersionInfo.rowKeySet()) {
             Table tbl = db.getTableNullable(tblId);
             if (!(tbl instanceof OlapTable)) {
@@ -2397,6 +3191,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             }
             try {
                 for (long partId : restoredVersionInfo.row(tblId).keySet()) {
+                    if (skipped.contains(Pair.of(tblId, partId))) {
+                        continue;
+                    }
                     Partition part = olapTbl.getPartition(partId);
                     if (part != null) {
                         // the data of the partition is being replaced: it has no state until the job stamps it.
@@ -2472,6 +3269,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
      * partition that keeps its local data (kept, or the base of an incremental append), whose replicas the restore
      * did not replace. Taint wins in any order of the taint and of this, so the master, which may run this before
      * the operation that taints and log it after, and a follower, which replays the operation first, agree.</li>
+     * <li>A partition kept without a digest (an unverified keep, restore_reuse_allow_unverified_keep) is not proved
+     * to be the backup partition: invalidated, no name.</li>
      * <li>A partition that is not at the version of the backup, which is the version the job set (a load made
      * visible in between): invalidated, the name of the backup would be bound to other data.</li>
      * <li>Otherwise it is the backup partition and adopts its token, bound to the version this frontend has for it.
@@ -2495,6 +3294,12 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             PartitionStateToken.invalidate(part);
             return;
         }
+        RestoreReuseResult.Decision kept = reuseResult == null ? null
+                : reuseResult.getKept(olapTbl.getId(), part.getId());
+        if (kept != null && kept.isUnverifiedKeep()) {
+            PartitionStateToken.invalidate(part);
+            return;
+        }
         if (part.getVisibleVersion() != partInfo.version) {
             LOG.info("restore: partition {} is at version {}, not at the version {} of the backup, no state token, "
                     + "job: {}", part.getId(), part.getVisibleVersion(), partInfo.version, jobId);
@@ -2512,8 +3317,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     /**
-     * Non-atomic restore: the partitions in restoredVersionInfo that are downloaded as a whole get all their
-     * replicas from the backup, so their taint is cleared
+     * Non-atomic restore: the partitions in restoredVersionInfo that are downloaded as a whole (not an incremental
+     * append, whose base is the local data) get all their replicas from the backup, so their taint is cleared
      * (invalid until stampStateToken). Done where the DOWNLOAD state is logged, with the write locks of the tables
      * held until it is logged on the master, and on the replay of that log: an operation that taints is ordered
      * before or after it the same way on every frontend. If the job is cancelled from then on, the partitions are
@@ -2533,7 +3338,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             try {
                 for (long partId : restoredVersionInfo.row(tblId).keySet()) {
                     Partition part = ((OlapTable) tbl).getPartition(partId);
-                    if (part != null && PartitionStateToken.isTainted(part)) {
+                    if (part != null && PartitionStateToken.isTainted(part)
+                            && !isIncrementalPartition(tblId, partId)) {
                         part.setStateToken(PartitionStateToken.invalid());
                     }
                 }
@@ -2644,6 +3450,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             restoredPartitions.clear();
             restoredTbls.clear();
             restoredResources.clear();
+            clearReuseWorkingState();
 
             // backupMeta is useless
             backupMeta = null;
@@ -2657,6 +3464,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             RestoreJobState curState = state;
             finishedTime = System.currentTimeMillis();
             state = RestoreJobState.CANCELLED;
+            clearLocalSourceStagingPartitions();
             // log
             env.getEditLog().logRestoreJob(this);
 
@@ -2669,6 +3477,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             return;
         }
 
+        // replay
+        clearLocalSourceStagingPartitions();
         LOG.info("finished to cancel restore job. is replay: {}. {}", isReplay, this);
     }
 
@@ -2757,7 +3567,132 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
     }
 
+    // The decisions of the partitions of the origin table that keep its data (or its base), atomic restore.
+    private List<RestoreReuseResult.Decision> getAtomicLocalDecisions(long originTableId) {
+        List<RestoreReuseResult.Decision> result = Lists.newArrayList();
+        if (reuseResult != null) {
+            for (RestoreReuseResult.Decision decision : reuseResult.getDecisions()) {
+                if (decision.atomic && (decision.kept || decision.incremental) && decision.tableId == originTableId) {
+                    result.add(decision);
+                }
+            }
+        }
+        return result;
+    }
+
+    private boolean hasAtomicLocalDecision(long originTableId) {
+        return !getAtomicLocalDecisions(originTableId).isEmpty();
+    }
+
+    /**
+     * Fail if a partition of the origin table that the staging table is made from has been written since it was proved
+     * equal to the backup (its version changed, or a load is committed and not published yet). The caller holds the
+     * write lock of the origin table.
+     */
+    @VisibleForTesting
+    Status checkAtomicLocalVersions(OlapTable originTbl) {
+        Database db = env.getInternalCatalog().getDbNullable(dbId);
+        for (RestoreReuseResult.Decision decision : getAtomicLocalDecisions(originTbl.getId())) {
+            Partition part = originTbl.getPartition(decision.partitionId);
+            if (part == null) {
+                return new Status(ErrCode.NOT_FOUND, "the partition " + decision.tableName + "."
+                        + decision.partitionName + " that the restored data is made from has been dropped");
+            }
+            if (part.getVisibleVersion() != decision.version || part.getNextVersion() != decision.version + 1) {
+                return new Status(ErrCode.COMMON_ERROR, "the visible version of the partition "
+                        + decision.tableName + "." + decision.partitionName + " that the restored data is made from"
+                        + " changed from " + decision.version + " to " + part.getVisibleVersion() + " (next version "
+                        + part.getNextVersion() + ") during the restore, the local data is not what was verified any"
+                        + " more. The table is not replaced, restore again");
+            }
+            if (!stillHasKeptStateToken(db, decision, part)) {
+                return new Status(ErrCode.COMMON_ERROR, "the state token of the partition "
+                        + decision.tableName + "." + decision.partitionName + " that the restored data is made from"
+                        + " by it changed during the restore (" + PartitionStateToken.effective(part) + ", a change"
+                        + " that keeps the version), the local data is not what was verified any more. The table is"
+                        + " not replaced, restore again");
+            }
+        }
+        return Status.OK;
+    }
+
+    /**
+     * Lock the origin tables that have a local decision (db lock first, then the tables by ascending id), and check
+     * all of them, before any table is replaced: either all of them are at the version they were proved at, or none
+     * is touched. The caller holds the write lock of the database, and unlocks the tables added to the locked list.
+     */
+    private Status lockAndCheckAtomicOriginTables(Database db, List<OlapTable> locked) {
+        Map<Long, OlapTable> origins = Maps.newTreeMap();
+        for (String tableName : jobInfo.backupOlapTableObjects.keySet()) {
+            String originName = jobInfo.getAliasByOriginNameIfSet(tableName);
+            if (Env.isStoredTableNamesLowerCase()) {
+                originName = originName.toLowerCase();
+            }
+            Table originTbl = db.getTableNullable(originName);
+            if (originTbl instanceof OlapTable && hasAtomicLocalDecision(originTbl.getId())) {
+                origins.put(originTbl.getId(), (OlapTable) originTbl);
+            }
+        }
+        for (OlapTable originTbl : origins.values()) {
+            originTbl.writeLock();
+            locked.add(originTbl);
+        }
+        for (OlapTable originTbl : origins.values()) {
+            Status st = checkAtomicLocalVersions(originTbl);
+            if (!st.ok()) {
+                return st;
+            }
+        }
+        return Status.OK;
+    }
+
     private Status atomicReplaceOlapTables(Database db, boolean isReplay) {
+        // The database lock is held until all the tables are replaced (it is reentrant), and so are the write locks
+        // of the origin tables that keep local data: no write is allowed to be in between the check of their
+        // versions and the replace.
+        if (!db.writeLockIfExist()) {
+            return Status.OK;
+        }
+        List<OlapTable> lockedOrigins = Lists.newArrayList();
+        try {
+            if (!isReplay) {
+                Status st = lockAndCheckAtomicOriginTables(db, lockedOrigins);
+                if (!st.ok()) {
+                    return st;
+                }
+            }
+            return replaceOlapTablesAndViews(db, isReplay);
+        } finally {
+            for (int i = lockedOrigins.size() - 1; i >= 0; i--) {
+                lockedOrigins.get(i).writeUnlock();
+            }
+            db.writeUnlock();
+        }
+    }
+
+    /**
+     * Atomic restore: a staging partition made from the local data of the table being replaced (kept, or the base of
+     * an incremental append) has the replicas of that data, so it takes over the taint of the local partition (see
+     * PartitionStateToken). The local partition may have been tainted after it was judged. Run on the master and on
+     * replay, as the tables are replaced; the caller holds the write lock of the origin table.
+     */
+    private void carryTaintToStagingPartitions(OlapTable originTbl, OlapTable stagingTbl) {
+        stagingTbl.writeLock();
+        try {
+            for (RestoreReuseResult.Decision decision : getAtomicLocalDecisions(originTbl.getId())) {
+                Partition originPart = originTbl.getPartition(decision.partitionId);
+                if (originPart != null && PartitionStateToken.isTainted(originPart)) {
+                    PartitionStateToken.taint(stagingTbl.getPartition(decision.stagingPartitionId));
+                    LOG.info("restore: the staging partition {} takes over the taint of partition {}, job: {}",
+                            decision.stagingPartitionId, decision.partitionId, jobId);
+                }
+            }
+        } finally {
+            stagingTbl.writeUnlock();
+        }
+    }
+
+    private Status replaceOlapTablesAndViews(Database db, boolean isReplay) {
         for (String tableName : jobInfo.backupOlapTableObjects.keySet()) {
             String originName = jobInfo.getAliasByOriginNameIfSet(tableName);
             if (Env.isStoredTableNamesLowerCase()) {
@@ -2829,6 +3764,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     // The origin table is not used anymore, need to drop all its tablets.
                     originOlapTbl.writeLock();
                     try {
+                        carryTaintToStagingPartitions(originOlapTbl, newOlapTbl);
                         LOG.info("drop the origin olap table {}. table={}" + " isAtomicRestore: {}",
                                 originOlapTbl.getName(), originOlapTbl.getId(), isAtomicRestore);
                         Env.getCurrentEnv().onEraseOlapTable(originOlapTbl, isReplay);
@@ -3097,6 +4033,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         isCleanPartitions = Boolean.parseBoolean(properties.get(PROP_CLEAN_PARTITIONS));
         isAtomicRestore = Boolean.parseBoolean(properties.get(PROP_ATOMIC_RESTORE));
         isForceReplace = Boolean.parseBoolean(properties.get(PROP_FORCE_REPLACE));
+        // The set is not persisted: rebuild it from the persisted decisions of a job which is not done. The backup
+        // handler learns about it when it adds the job (BackupHandler.addBackupOrRestoreJob).
+        if (state != RestoreJobState.FINISHED && state != RestoreJobState.CANCELLED) {
+            localSourceStagingPartitions = computeLocalSourceStagingPartitions(reuseResult);
+        }
     }
 
     @Override
