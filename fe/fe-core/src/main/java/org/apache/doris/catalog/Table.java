@@ -85,6 +85,10 @@ public abstract class Table extends MetaObject implements Writable, TableIf, Gso
     @SerializedName(value = "createTime")
     protected long createTime;
     protected MonitoredReentrantReadWriteLock rwLock;
+    // How many times the write lock has been taken. It is written under the write lock and read under the read
+    // lock, so a reader that sees the same count twice knows that no writer has run in between, even though it has
+    // released the read lock.
+    private long writeLockCount = 0;
     // Used for queuing commit transactifon tasks to avoid fdb transaction conflicts,
     // especially to reduce conflicts when obtaining delete bitmap update locks for
     // MoW table
@@ -231,15 +235,23 @@ public abstract class Table extends MetaObject implements Writable, TableIf, Gso
 
     public void writeLock() {
         this.rwLock.writeLock().lock();
+        writeLockCount++;
     }
 
     public boolean writeLockIfExist() {
-        this.rwLock.writeLock().lock();
+        writeLock();
         if (isDropped) {
-            this.rwLock.writeLock().unlock();
+            writeUnlock();
             return false;
         }
         return true;
+    }
+
+    /**
+     * The number of times the write lock of this table has been taken. The caller must hold the read lock.
+     */
+    public long getWriteLockCount() {
+        return writeLockCount;
     }
 
     // TabletStatMgr will invoke all olap tables' tryWriteLock every one minute,
@@ -248,6 +260,9 @@ public abstract class Table extends MetaObject implements Writable, TableIf, Gso
     public boolean tryWriteLock(long timeout, TimeUnit unit) {
         try {
             boolean res = this.rwLock.writeLock().tryLock(timeout, unit);
+            if (res) {
+                writeLockCount++;
+            }
             if (!res && unit.toSeconds(timeout) >= 1) {
                 if (readLockThreads == null) {
                     LOG.warn("Failed to try table {}'s write lock. timeout {} {}. Current owner: {}",

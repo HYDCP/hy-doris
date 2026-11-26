@@ -107,6 +107,40 @@ public class TableTest {
     }
 
     @Test
+    public void testWriteLockCount() {
+        table.readLock();
+        long count = table.getWriteLockCount();
+        table.readUnlock();
+
+        // readers do not count
+        table.readLock();
+        Assert.assertEquals(count, table.getWriteLockCount());
+        table.readUnlock();
+
+        // every way to take the write lock counts
+        table.writeLock();
+        table.writeUnlock();
+        Assert.assertTrue(table.writeLockIfExist());
+        table.writeUnlock();
+        Assert.assertTrue(table.tryWriteLock(1, TimeUnit.SECONDS));
+        table.writeUnlock();
+        Assert.assertTrue(table.tryWriteLockIfExist(1, TimeUnit.SECONDS));
+        table.writeUnlock();
+
+        table.readLock();
+        Assert.assertEquals(count + 4, table.getWriteLockCount());
+        table.readUnlock();
+
+        // the write lock of a dropped table is taken as well, before it is given back
+        table.markDropped();
+        Assert.assertFalse(table.writeLockIfExist());
+        table.unmarkDropped();
+        table.readLock();
+        Assert.assertEquals(count + 5, table.getWriteLockCount());
+        table.readUnlock();
+    }
+
+    @Test
     public void lockTestWithException() {
         table.markDropped();
         ExceptionChecker.expectThrowsWithMsg(DdlException.class,

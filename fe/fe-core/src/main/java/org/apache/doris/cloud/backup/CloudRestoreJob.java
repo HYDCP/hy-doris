@@ -240,7 +240,7 @@ public class CloudRestoreJob extends RestoreJob {
     public void waitingAllSnapshotsFinished() {
         snapshotFinishedTime = System.currentTimeMillis();
         state = RestoreJobState.DOWNLOAD;
-        env.getEditLog().logRestoreJob(this);
+        logDownloadJournal();
         LOG.info("finished making snapshots. {}", this);
     }
 
