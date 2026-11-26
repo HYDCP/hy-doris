@@ -986,7 +986,7 @@ public class InternalCatalog implements CatalogIf<Database> {
                 tableName, dbName, isView, force, costTimes);
     }
 
-    public void rollbackCreatedOlapTable(OlapTable table) throws DdlException {
+    public void rollbackCreatedTable(Table table) throws DdlException {
         Database db = getDbNullable(table.getQualifiedDbName());
         if (db != null && db.writeLockIfExist()) {
             try {
@@ -2479,7 +2479,7 @@ public class InternalCatalog implements CatalogIf<Database> {
             tableName = Util.generateTempTableInnerName(tableName);
         }
 
-        boolean tableHasExist = false;
+        boolean tableHasExist;
         BinlogConfig dbBinlogConfig;
         db.readLock();
         try {
@@ -3322,7 +3322,8 @@ public class InternalCatalog implements CatalogIf<Database> {
                 ErrorReport.reportDdlException(ErrorCode.ERR_TABLE_EXISTS_ERROR, tableShowName);
             }
 
-            if (result.second) {
+            tableHasExist = result.second;
+            if (tableHasExist) {
                 if (Env.getCurrentColocateIndex().isColocateTable(tableId)) {
                     // if this is a colocate table, its table id is already added to colocate group
                     // so we should remove the tableId here
@@ -3398,7 +3399,7 @@ public class InternalCatalog implements CatalogIf<Database> {
         }
 
         if (!tableHasExist) {
-            stmt.setCreatedOlapTable(olapTable);
+            stmt.setCreatedTable(olapTable);
         }
         return tableHasExist;
     }
@@ -3411,8 +3412,7 @@ public class InternalCatalog implements CatalogIf<Database> {
         long tableId = Env.getCurrentEnv().getNextId();
         MysqlTable mysqlTable = new MysqlTable(tableId, tableName, columns, stmt.getProperties());
         mysqlTable.setComment(stmt.getComment());
-        Pair<Boolean, Boolean> result = db.createTableWithLock(mysqlTable, false, stmt.isSetIfNotExists());
-        return checkCreateTableResult(tableName, tableId, result);
+        return registerCreatedTable(db, stmt, mysqlTable);
     }
 
     private boolean createOdbcTable(Database db, CreateTableStmt stmt) throws DdlException {
@@ -3422,8 +3422,7 @@ public class InternalCatalog implements CatalogIf<Database> {
         long tableId = Env.getCurrentEnv().getNextId();
         OdbcTable odbcTable = new OdbcTable(tableId, tableName, columns, stmt.getProperties());
         odbcTable.setComment(stmt.getComment());
-        Pair<Boolean, Boolean> result = db.createTableWithLock(odbcTable, false, stmt.isSetIfNotExists());
-        return checkCreateTableResult(tableName, tableId, result);
+        return registerCreatedTable(db, stmt, odbcTable);
     }
 
     private boolean createEsTable(Database db, CreateTableStmt stmt) throws DdlException, AnalysisException {
@@ -3459,8 +3458,7 @@ public class InternalCatalog implements CatalogIf<Database> {
         esTable.setId(tableId);
         esTable.setComment(stmt.getComment());
         esTable.syncTableMetaData();
-        Pair<Boolean, Boolean> result = db.createTableWithLock(esTable, false, stmt.isSetIfNotExists());
-        return checkCreateTableResult(tableName, tableId, result);
+        return registerCreatedTable(db, stmt, esTable);
     }
 
     private boolean createBrokerTable(Database db, CreateTableStmt stmt) throws DdlException {
@@ -3472,8 +3470,7 @@ public class InternalCatalog implements CatalogIf<Database> {
         BrokerTable brokerTable = new BrokerTable(tableId, tableName, columns, stmt.getProperties());
         brokerTable.setComment(stmt.getComment());
         brokerTable.setBrokerProperties(stmt.getExtProperties());
-        Pair<Boolean, Boolean> result = db.createTableWithLock(brokerTable, false, stmt.isSetIfNotExists());
-        return checkCreateTableResult(tableName, tableId, result);
+        return registerCreatedTable(db, stmt, brokerTable);
     }
 
     private boolean createJdbcTable(Database db, CreateTableStmt stmt) throws DdlException {
@@ -3485,19 +3482,19 @@ public class InternalCatalog implements CatalogIf<Database> {
         JdbcTable jdbcTable = new JdbcTable(tableId, tableName, columns, stmt.getProperties());
         jdbcTable.setComment(stmt.getComment());
         // check table if exists
-        Pair<Boolean, Boolean> result = db.createTableWithLock(jdbcTable, false, stmt.isSetIfNotExists());
-        return checkCreateTableResult(tableName, tableId, result);
+        return registerCreatedTable(db, stmt, jdbcTable);
     }
 
-    private boolean checkCreateTableResult(String tableName, long tableId, Pair<Boolean, Boolean> result)
-                throws DdlException {
+    private boolean registerCreatedTable(Database db, CreateTableStmt stmt, Table table) throws DdlException {
+        Pair<Boolean, Boolean> result = db.createTableWithLock(table, false, stmt.isSetIfNotExists());
         if (Boolean.FALSE.equals(result.first)) {
-            ErrorReport.reportDdlException(ErrorCode.ERR_TABLE_EXISTS_ERROR, tableName);
+            ErrorReport.reportDdlException(ErrorCode.ERR_TABLE_EXISTS_ERROR, table.getName());
         }
         if (Boolean.TRUE.equals(result.second)) {
             return true;
         }
-        LOG.info("successfully create table[{}-{}]", tableName, tableId);
+        stmt.setCreatedTable(table);
+        LOG.info("successfully create table[{}-{}]", table.getName(), table.getId());
         return false;
     }
 

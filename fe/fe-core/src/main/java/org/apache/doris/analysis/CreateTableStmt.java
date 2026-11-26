@@ -24,8 +24,8 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.GeneratedColumnInfo;
 import org.apache.doris.catalog.Index;
 import org.apache.doris.catalog.KeysType;
-import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.PrimitiveType;
+import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.catalog.VariantField;
 import org.apache.doris.catalog.VariantType;
@@ -83,7 +83,7 @@ public class CreateTableStmt extends DdlStmt implements NotFallbackInParser {
     protected boolean ifNotExists;
     private boolean isExternal;
     private boolean isTemp;
-    private OlapTable createdOlapTable;
+    private Table createdTable;
     protected TableName tableName;
     protected List<ColumnDef> columnDefs;
     private List<IndexDef> indexDefs;
@@ -233,12 +233,12 @@ public class CreateTableStmt extends DdlStmt implements NotFallbackInParser {
         return isExternal;
     }
 
-    public OlapTable getCreatedOlapTable() {
-        return createdOlapTable;
+    public Table getCreatedTable() {
+        return createdTable;
     }
 
-    public void setCreatedOlapTable(OlapTable table) {
-        createdOlapTable = table;
+    public void setCreatedTable(Table table) {
+        createdTable = table;
     }
 
     public boolean isTemp() {

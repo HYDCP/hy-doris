@@ -17,10 +17,12 @@
 
 package org.apache.doris.catalog;
 
+import org.apache.doris.analysis.CreateTableStmt;
 import org.apache.doris.analysis.DropTableStmt;
 import org.apache.doris.analysis.TableName;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.jmockit.Deencapsulation;
+import org.apache.doris.common.util.Util;
 import org.apache.doris.datasource.CatalogMgr;
 import org.apache.doris.datasource.ExternalCatalog;
 import org.apache.doris.datasource.InternalCatalog;
@@ -31,11 +33,57 @@ import org.apache.doris.nereids.trees.plans.commands.insert.InsertUtils;
 import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
 class TemporaryTableDropTest {
+    @Test
+    void rollbackJdbcCtasPreservesShadowingTemporaryTable() throws Exception {
+        Env env = Mockito.mock(Env.class, Mockito.RETURNS_DEEP_STUBS);
+        InternalCatalog catalog = Mockito.mock(InternalCatalog.class);
+        Database db = new Database(7L, "db");
+        Mockito.when(env.getInternalCatalog()).thenReturn(catalog);
+        Mockito.when(catalog.getDbOrDdlException("db")).thenReturn(db);
+        Mockito.when(catalog.getDbNullable("db")).thenReturn(db);
+        Mockito.when(env.getNextId()).thenReturn(9L);
+        JdbcResource resource = Mockito.mock(JdbcResource.class);
+        Mockito.when(resource.getType()).thenReturn(Resource.ResourceType.JDBC);
+        Mockito.when(resource.getProperty(Mockito.anyString())).thenReturn("1");
+        Mockito.when(resource.getProperty(JdbcResource.JDBC_URL)).thenReturn("jdbc:mysql://localhost/test");
+        Mockito.when(env.getResourceMgr().getResource("test_resource")).thenReturn(resource);
+        Mockito.doCallRealMethod().when(catalog).createTable(Mockito.any());
+        Mockito.doCallRealMethod().when(catalog).rollbackCreatedTable(Mockito.any());
+        Mockito.doCallRealMethod().when(catalog).unprotectDropTable(Mockito.any(), Mockito.any(),
+                Mockito.anyBoolean(), Mockito.anyBoolean(), Mockito.anyLong());
+        Mockito.doCallRealMethod().when(env).rollbackCtas(Mockito.any(), Mockito.anyBoolean());
+        CatalogRecycleBin recycleBin = Mockito.mock(CatalogRecycleBin.class);
+        try (MockedStatic<Env> mocked = Mockito.mockStatic(Env.class)) {
+            mocked.when(Env::getCurrentEnv).thenReturn(env);
+            mocked.when(Env::getCurrentRecycleBin).thenReturn(recycleBin);
+            mocked.when(Env::isTableNamesCaseInsensitive).thenReturn(true);
+            new ConnectContext().setThreadLocalInfo();
+            OlapTable temp = new OlapTable(8L, Util.generateTempTableInnerName("Mixed"), true,
+                    ImmutableList.of(), KeysType.DUP_KEYS, new SinglePartitionInfo(), null, null);
+            Assertions.assertTrue(db.registerTable(temp));
+            CreateTableStmt stmt = new CreateTableStmt(false, true, new TableName("internal", "db", "mixed"),
+                    null, "jdbc", null, null, null,
+                    ImmutableMap.of("resource", "test_resource", "table", "remote_table", "table_type", "mysql"), null, "");
+            Assertions.assertFalse(catalog.createTable(stmt));
+            Assertions.assertSame(db.getTableNullable(9L), stmt.getCreatedTable());
+            Assertions.assertSame(temp, db.getTableNullable("mixed"));
+
+            env.rollbackCtas(stmt, false);
+            Assertions.assertSame(temp, db.getTableNullable(8L));
+            Assertions.assertNull(db.getTableNullable(9L));
+            Mockito.verify(recycleBin).recycleTable(7L, stmt.getCreatedTable(), false, true, 0L);
+        } finally {
+            ConnectContext.remove();
+        }
+    }
+
     @Test
     void bindsCtasSinkByIdAfterCopyingThePlan() {
         Env env = Mockito.mock(Env.class);

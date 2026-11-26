@@ -20,8 +20,8 @@ package org.apache.doris.nereids.trees.plans.commands;
 import org.apache.doris.analysis.CreateTableStmt;
 import org.apache.doris.analysis.StmtType;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.ScalarType;
+import org.apache.doris.catalog.Table;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.util.DebugPointUtil;
@@ -173,13 +173,13 @@ public class CreateTableCommand extends Command implements NeedAuditEncryption, 
             throw new AnalysisException(e.getMessage(), e.getCause());
         }
 
-        query = UnboundTableSinkCreator.createUnboundTableSink(createTableInfo.getTableNameParts(),
-                ImmutableList.of(), ImmutableList.of(), ImmutableList.of(), query);
-        OlapTable createdTable = createTableStmt.getCreatedOlapTable();
-        if (createdTable != null) {
-            query = ((UnboundTableSink<?>) query).withTargetTableId(createdTable.getId());
-        }
         try {
+            query = UnboundTableSinkCreator.createUnboundTableSink(createTableInfo.getTableNameParts(),
+                    ImmutableList.of(), ImmutableList.of(), ImmutableList.of(), query);
+            Table createdTable = createTableStmt.getCreatedTable();
+            if (createdTable != null) {
+                query = ((UnboundTableSink<?>) query).withTargetTableId(createdTable.getId());
+            }
             if (DebugPointUtil.isEnable("CreateTableCommand.beforeCtasInsert")) {
                 throw new AnalysisException("injected CTAS insert failure");
             }
