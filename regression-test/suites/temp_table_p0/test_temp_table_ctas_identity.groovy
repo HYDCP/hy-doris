@@ -19,6 +19,7 @@ import org.apache.doris.regression.suite.ClusterOptions
 
 suite("test_temp_table_ctas_identity", "p0,docker") {
     def options = new ClusterOptions()
+    options.enableDebugPoints()
     options.setFeNum(1)
     options.setBeNum(1)
     options.feConfigs.add("lower_case_table_names=2")
