@@ -1311,7 +1311,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         FrontendService.Client client = null;
         boolean transportOk = false;
         try {
-            client = ClientPool.frontendPool.borrowObject(address, 1000);
+            client = ClientPool.frontendSessionCheckPool.borrowObject(address);
             Env env = Env.getCurrentEnv();
             TFrontendReportAliveSessionRequest request = new TFrontendReportAliveSessionRequest(
                     env.getClusterId(), env.getToken()).setConnectionId(connectionId);
@@ -1325,9 +1325,9 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         } finally {
             if (client != null) {
                 if (transportOk) {
-                    ClientPool.frontendPool.returnObject(address, client);
+                    ClientPool.frontendSessionCheckPool.returnObject(address, client);
                 } else {
-                    ClientPool.frontendPool.invalidateObject(address, client);
+                    ClientPool.frontendSessionCheckPool.invalidateObject(address, client);
                 }
             }
         }
