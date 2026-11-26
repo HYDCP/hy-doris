@@ -21,6 +21,7 @@ import org.apache.doris.backup.BackupJobInfo.BackupIndexInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupOlapTableInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupPartitionInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupTabletInfo;
+import org.apache.doris.backup.RestoreJob.RestoreJobState;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.HashDistributionInfo;
@@ -35,6 +36,7 @@ import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.MarkedCountDownLatch;
 import org.apache.doris.common.UserException;
@@ -45,6 +47,12 @@ import org.apache.doris.fs.FileSystemFactory;
 import org.apache.doris.persist.EditLog;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.SystemInfoService;
+import org.apache.doris.task.DirMoveTask;
+import org.apache.doris.task.DownloadTask;
+import org.apache.doris.task.SnapshotTask;
+import org.apache.doris.thrift.TFinishTaskRequest;
+import org.apache.doris.thrift.TStatus;
+import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TStorageMedium;
 
 import com.google.common.collect.Lists;
@@ -55,6 +63,7 @@ import mockit.Injectable;
 import mockit.Mock;
 import mockit.MockUp;
 import mockit.Mocked;
+import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -66,6 +75,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.zip.Adler32;
@@ -101,6 +112,15 @@ public class RestoreJobTest {
             super(env);
         }
 
+        // the jobs nudged, whether or not Config.backup_restore_run_on_task_finish lets the nudge through
+        private final List<Long> nudgedJobIds = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void nudge(long dbId, long jobId) {
+            nudgedJobIds.add(jobId);
+            super.nudge(dbId, jobId);
+        }
+
         @Override
         public RepositoryMgr getRepoMgr() {
             return repoMgr;
@@ -130,15 +150,27 @@ public class RestoreJobTest {
 
     private BackupMeta backupMeta;
 
+    // the state of the job at every restore edit log written
+    private final List<RestoreJobState> loggedStates = new CopyOnWriteArrayList<>();
+    private boolean origMergeIdleTicks;
+    private boolean origRunOnTaskFinish;
+
     @Before
     public void setUp() throws Exception {
+        origMergeIdleTicks = Config.backup_restore_merge_idle_ticks;
+        origRunOnTaskFinish = Config.backup_restore_run_on_task_finish;
+        Config.backup_restore_merge_idle_ticks = false;
+        Config.backup_restore_run_on_task_finish = false;
+        loggedStates.clear();
         db = CatalogMocker.mockDb();
         backupHandler = new MockBackupHandler(env);
         repoMgr = new MockRepositoryMgr();
 
         Deencapsulation.setField(env, "backupHandler", backupHandler);
 
-        new Expectations() {
+        // partial on env, as in BackupJobTest: what is not recorded (getBackupHandler()) runs the real code, so that
+        // the nudge of a job reaches the handler above (Thread is unmockable, it can not be cascaded)
+        new Expectations(env) {
             {
                 env.getInternalCatalog();
                 minTimes = 0;
@@ -193,6 +225,14 @@ public class RestoreJobTest {
                 result = new Delegate() {
                     public void logBackupJob(BackupJob job) {
                         System.out.println("log backup job: " + job);
+                    }
+                };
+
+                editLog.logRestoreJob((RestoreJob) any);
+                minTimes = 0;
+                result = new Delegate() {
+                    public void logRestoreJob(RestoreJob job) {
+                        loggedStates.add(job.getState());
                     }
                 };
             }
@@ -259,15 +299,28 @@ public class RestoreJobTest {
         // drop this table, cause we want to try restoring this table
         db.unregisterTable(expectedRestoreTbl.getName());
 
-        job = new RestoreJob(label, "2018-01-01 01:01:01", db.getId(), db.getFullName(), jobInfo, false,
-                new ReplicaAllocation((short) 3), 100000, -1, false, false,
-                false, false, false, false, false,
-                env, repo.getId());
+        job = newJob();
 
         List<Table> tbls = Lists.newArrayList();
         List<Resource> resources = Lists.newArrayList();
         tbls.add(expectedRestoreTbl);
         backupMeta = new BackupMeta(tbls, resources);
+    }
+
+    // the repo is set, as by the first run()
+    private RestoreJob newJob() {
+        RestoreJob restoreJob = new RestoreJob(label, "2018-01-01 01:01:01", db.getId(), db.getFullName(), jobInfo,
+                false, new ReplicaAllocation((short) 3), 100000, -1, false, false,
+                false, false, false, false, false,
+                env, repo.getId());
+        Deencapsulation.setField(restoreJob, "repo", repo);
+        return restoreJob;
+    }
+
+    @After
+    public void tearDown() {
+        Config.backup_restore_merge_idle_ticks = origMergeIdleTicks;
+        Config.backup_restore_run_on_task_finish = origRunOnTaskFinish;
     }
 
     @Test
@@ -362,5 +415,199 @@ public class RestoreJobTest {
         Partition localPart = remoteTbl.getPartition(partName);
         Assert.assertEquals(localPart.getVisibleVersion(), visibleVersion);
         Assert.assertEquals(localPart.getNextVersion(), visibleVersion + 1);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // backup_restore_merge_idle_ticks and backup_restore_run_on_task_finish on a restore job
+    // ---------------------------------------------------------------------------------------------
+
+    private static TFinishTaskRequest ok() {
+        TFinishTaskRequest report = new TFinishTaskRequest();
+        report.setTaskStatus(new TStatus(TStatusCode.OK));
+        return report;
+    }
+
+    private static TFinishTaskRequest downloadReport() {
+        TFinishTaskRequest report = ok();
+        report.setDownloadedTabletIds(Lists.newArrayList());
+        return report;
+    }
+
+    // the job in DOWNLOADING with the given download tasks outstanding, of different backends; the job has nothing
+    // to move at the commit (no snapshot info)
+    private List<DownloadTask> downloading(RestoreJob restoreJob, int taskNum) {
+        Deencapsulation.setField(restoreJob, "state", RestoreJobState.DOWNLOADING);
+        Map<Long, Long> unfinished = Deencapsulation.getField(restoreJob, "unfinishedSignatureToId");
+        List<DownloadTask> tasks = Lists.newArrayList();
+        for (int i = 0; i < taskNum; i++) {
+            long beId = CatalogMocker.BACKEND1_ID + i;
+            DownloadTask task = new DownloadTask(null, beId, 7001 + i, restoreJob.getJobId(), db.getId(),
+                    Lists.newArrayList());
+            unfinished.put(task.getSignature(), beId);
+            tasks.add(task);
+        }
+        return tasks;
+    }
+
+    @Test
+    public void testMergedTicksGoFromTheDownloadToTheEndInOneRun() {
+        // the switch off: one state per run, as before
+        job = newJob();
+        downloading(job, 0);
+        job.run();
+        Assert.assertEquals(RestoreJobState.COMMIT, job.getState());
+        job.run();
+        Assert.assertEquals(RestoreJobState.COMMITTING, job.getState());
+        job.run();
+        Assert.assertEquals(RestoreJobState.FINISHED, job.getState());
+        List<RestoreJobState> oneByOne = Lists.newArrayList(loggedStates);
+        Assert.assertEquals(Lists.newArrayList(RestoreJobState.COMMIT, RestoreJobState.FINISHED), oneByOne);
+
+        // the switch on: the job waits while a download task is outstanding, then goes to the end in one run with
+        // the same logs in the same order
+        Config.backup_restore_merge_idle_ticks = true;
+        loggedStates.clear();
+        job = newJob();
+        DownloadTask task = downloading(job, 1).get(0);
+        job.run();
+        Assert.assertEquals(RestoreJobState.DOWNLOADING, job.getState());
+        Assert.assertTrue(loggedStates.isEmpty());
+        Assert.assertTrue(job.finishTabletDownloadTask(task, downloadReport()));
+        job.run();
+        Assert.assertTrue(job.getStatus().toString(), job.getStatus().ok());
+        Assert.assertEquals(RestoreJobState.FINISHED, job.getState());
+        Assert.assertEquals(oneByOne, loggedStates);
+    }
+
+    // The handler runs the nudged job as in the FE: this FE is a ready master and the job is the current one of its
+    // database. env.getBackupHandler() is the handler of setUp (set by reflection, Thread is unmockable).
+    private void armNudges(RestoreJob nudged) {
+        Deencapsulation.setField(backupHandler, "isInit", true);
+        new Expectations() {
+            {
+                env.isReady();
+                minTimes = 0;
+                result = true;
+
+                env.isMaster();
+                minTimes = 0;
+                result = true;
+            }
+        };
+        Deencapsulation.invoke(backupHandler, "addBackupOrRestoreJob", db.getId(), nudged);
+        backupHandler.nudgedJobIds.clear();
+    }
+
+    // waits until everything the nudge thread has been given so far has run
+    private void drainNudges() throws Exception {
+        ExecutorService executor = Deencapsulation.getField(backupHandler, "nudgeExecutor");
+        executor.submit(() -> { }).get(10, TimeUnit.SECONDS);
+    }
+
+    // RestoreJob.finishTabletDownloadTask
+    @Test
+    public void testNudgeOnTheReportOfTheLastDownloadTask() throws Exception {
+        Config.backup_restore_run_on_task_finish = true;
+        job = newJob();
+        List<DownloadTask> tasks = downloading(job, 2);
+        armNudges(job);
+
+        // the other task is still outstanding: no nudge
+        Assert.assertTrue(job.finishTabletDownloadTask(tasks.get(0), downloadReport()));
+        drainNudges();
+        Assert.assertTrue(backupHandler.nudgedJobIds.toString(), backupHandler.nudgedJobIds.isEmpty());
+        Assert.assertEquals(RestoreJobState.DOWNLOADING, job.getState());
+
+        // the last task: nudged once, and the nudge runs the job, which moves on without waiting for its round
+        Assert.assertTrue(job.finishTabletDownloadTask(tasks.get(1), downloadReport()));
+        drainNudges();
+        Assert.assertEquals(Lists.newArrayList(job.getJobId()), backupHandler.nudgedJobIds);
+        Assert.assertEquals(RestoreJobState.COMMIT, job.getState());
+
+        // a duplicate report: not accepted, no nudge
+        Assert.assertFalse(job.finishTabletDownloadTask(tasks.get(1), downloadReport()));
+        drainNudges();
+        Assert.assertEquals(1, backupHandler.nudgedJobIds.size());
+    }
+
+    @Test
+    public void testNoNudgedRunOnTheDownloadReportWhenTheSwitchIsOff() throws Exception {
+        Config.backup_restore_run_on_task_finish = false;
+        job = newJob();
+        List<DownloadTask> tasks = downloading(job, 2);
+        armNudges(job);
+        Assert.assertTrue(job.finishTabletDownloadTask(tasks.get(0), downloadReport()));
+        Assert.assertTrue(job.finishTabletDownloadTask(tasks.get(1), downloadReport()));
+        drainNudges();
+        // the last report asks for the nudge, the handler does not run the job: it waits for its next round
+        Assert.assertEquals(Lists.newArrayList(job.getJobId()), backupHandler.nudgedJobIds);
+        Assert.assertEquals(RestoreJobState.DOWNLOADING, job.getState());
+        job.run();
+        Assert.assertEquals(RestoreJobState.COMMIT, job.getState());
+    }
+
+    // RestoreJob.finishDirMoveTask
+    @Test
+    public void testNudgeOnTheReportOfTheLastDirMoveTask() throws Exception {
+        Config.backup_restore_run_on_task_finish = true;
+        job = newJob();
+        Deencapsulation.setField(job, "state", RestoreJobState.COMMITTING);
+        Map<Long, Long> unfinished = Deencapsulation.getField(job, "unfinishedSignatureToId");
+        List<DirMoveTask> moves = Lists.newArrayList();
+        for (int i = 0; i < 2; i++) {
+            long tabletId = 8001 + i;
+            DirMoveTask move = new DirMoveTask(null, CatalogMocker.BACKEND1_ID, 7101 + i, job.getJobId(), db.getId(),
+                    CatalogMocker.TEST_TBL2_ID, 1, 1, tabletId, "/path/to/snapshot", 0, true);
+            unfinished.put(move.getSignature(), tabletId);
+            moves.add(move);
+        }
+        armNudges(job);
+
+        Assert.assertTrue(job.finishDirMoveTask(moves.get(0), ok()));
+        drainNudges();
+        Assert.assertTrue(backupHandler.nudgedJobIds.toString(), backupHandler.nudgedJobIds.isEmpty());
+        Assert.assertEquals(RestoreJobState.COMMITTING, job.getState());
+
+        Assert.assertTrue(job.finishDirMoveTask(moves.get(1), ok()));
+        drainNudges();
+        Assert.assertEquals(Lists.newArrayList(job.getJobId()), backupHandler.nudgedJobIds);
+        Assert.assertEquals(RestoreJobState.FINISHED, job.getState());
+
+        Assert.assertFalse(job.finishDirMoveTask(moves.get(1), ok()));
+        drainNudges();
+        Assert.assertEquals(1, backupHandler.nudgedJobIds.size());
+    }
+
+    // RestoreJob.finishTabletSnapshotTask: the site asks for the nudge on the last report only (the switch is off,
+    // the job is not run by it)
+    @Test
+    public void testNudgeOnTheReportOfTheLastSnapshotTask() throws Exception {
+        job = newJob();
+        Deencapsulation.setField(job, "state", RestoreJobState.SNAPSHOTING);
+        Map<Long, Long> unfinished = Deencapsulation.getField(job, "unfinishedSignatureToId");
+        List<SnapshotTask> tasks = Lists.newArrayList();
+        for (int i = 0; i < 2; i++) {
+            long tabletId = 8001 + i;
+            SnapshotTask task = new SnapshotTask(null, CatalogMocker.BACKEND1_ID, 7201 + i, job.getJobId(),
+                    db.getId(), CatalogMocker.TEST_TBL2_ID, 1, 1, tabletId, 1, 0, 1000, true);
+            unfinished.put(task.getSignature(), tabletId);
+            tasks.add(task);
+        }
+        armNudges(job);
+
+        TFinishTaskRequest report = ok();
+        report.setSnapshotPath("/path/to/snapshot");
+        Assert.assertTrue(job.finishTabletSnapshotTask(tasks.get(0), report));
+        drainNudges();
+        Assert.assertTrue(backupHandler.nudgedJobIds.toString(), backupHandler.nudgedJobIds.isEmpty());
+
+        Assert.assertTrue(job.finishTabletSnapshotTask(tasks.get(1), report));
+        drainNudges();
+        Assert.assertEquals(Lists.newArrayList(job.getJobId()), backupHandler.nudgedJobIds);
+        Assert.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+
+        Assert.assertFalse(job.finishTabletSnapshotTask(tasks.get(1), report));
+        drainNudges();
+        Assert.assertEquals(1, backupHandler.nudgedJobIds.size());
     }
 }

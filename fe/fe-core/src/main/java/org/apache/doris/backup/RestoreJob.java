@@ -322,6 +322,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 LOG.debug("get finished snapshot info: {}, unfinished tasks num: {}, remove result: {}. {}",
                           info, unfinishedSignatureToId.size(), this, removedTabletId);
             }
+            nudgeIfIdle(unfinishedSignatureToId.isEmpty());
             return true;
         }
         return false;
@@ -352,6 +353,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
 
         taskErrMsg.remove(task.getSignature());
+        nudgeIfIdle(unfinishedSignatureToId.isEmpty());
         return true;
     }
 
@@ -368,6 +370,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
 
         taskErrMsg.remove(task.getSignature());
+        nudgeIfIdle(unfinishedSignatureToId.isEmpty());
         return true;
     }
 
@@ -463,44 +466,73 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
         LOG.info("run restore job: {}", this);
 
-        checkIfNeedCancel();
+        // With backup_restore_merge_idle_ticks the next state is run in this round as well when the state reached
+        // waits for nothing (the cancel check and the pause of the debug point are done before every state).
+        int steps = 0;
+        do {
+            RestoreJobState before = state;
+            checkIfNeedCancel();
 
-        if (status.ok()) {
-            if (state != RestoreJobState.PENDING && state != RestoreJobState.CREATING
-                    && label.equals(DebugPointUtil.getDebugParamOrDefault("FE.PAUSE_NON_PENDING_RESTORE_JOB", ""))) {
-                LOG.info("pause restore job by debug point: {}", this);
-                return;
-            }
+            if (status.ok()) {
+                if (state != RestoreJobState.PENDING && state != RestoreJobState.CREATING
+                        && label.equals(DebugPointUtil.getDebugParamOrDefault("FE.PAUSE_NON_PENDING_RESTORE_JOB",
+                                ""))) {
+                    LOG.info("pause restore job by debug point: {}", this);
+                    return;
+                }
 
-            switch (state) {
-                case PENDING:
-                    checkAndPrepareMeta();
-                    break;
-                case CREATING:
-                    waitingAllReplicasCreated();
-                    break;
-                case SNAPSHOTING:
-                    waitingAllSnapshotsFinished();
-                    break;
-                case DOWNLOAD:
-                    downloadSnapshots();
-                    break;
-                case DOWNLOADING:
-                    waitingAllDownloadFinished();
-                    break;
-                case COMMIT:
-                    commit();
-                    break;
-                case COMMITTING:
-                    waitingAllTabletsCommitted();
-                    break;
-                default:
-                    break;
+                switch (state) {
+                    case PENDING:
+                        checkAndPrepareMeta();
+                        break;
+                    case CREATING:
+                        waitingAllReplicasCreated();
+                        break;
+                    case SNAPSHOTING:
+                        waitingAllSnapshotsFinished();
+                        break;
+                    case DOWNLOAD:
+                        downloadSnapshots();
+                        break;
+                    case DOWNLOADING:
+                        waitingAllDownloadFinished();
+                        break;
+                    case COMMIT:
+                        commit();
+                        break;
+                    case COMMITTING:
+                        waitingAllTabletsCommitted();
+                        break;
+                    default:
+                        break;
+                }
             }
-        }
+            if (!Config.backup_restore_merge_idle_ticks || !status.ok() || state == before || isWaitingState()
+                    || ++steps >= MAX_MERGED_STEPS_RESTORE) {
+                break;
+            }
+            LOG.info("go on with state {} in the same round. {}", state, this);
+        } while (true);
 
         if (!status.ok()) {
             cancelInternal(false);
+        }
+    }
+
+    // Whether the state waits for the backends (or is done): the next round looks again, nothing to run now.
+    // CREATING polls the create replica tasks every round as before.
+    private boolean isWaitingState() {
+        switch (state) {
+            case CREATING:
+            case FINISHED:
+            case CANCELLED:
+                return true;
+            case SNAPSHOTING:
+            case DOWNLOADING:
+            case COMMITTING:
+                return !unfinishedSignatureToId.isEmpty();
+            default:
+                return false;
         }
     }
 

@@ -84,6 +84,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -156,6 +159,20 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
     private Env env;
 
+    // Config.backup_restore_run_on_task_finish: the jobs nudged by the report of their last task are run by this
+    // one thread, once per nudge (nudgePending dedupes the nudges of a job until it is run). The thread is started
+    // on the first nudge only.
+    private final ExecutorService nudgeExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "backup-restore-nudge");
+        t.setDaemon(true);
+        return t;
+    });
+    private final Set<Long> nudgePending = ConcurrentHashMap.newKeySet();
+    // Taken around each run of a job, by the daemon and by the nudge thread: the jobs are still run one at a time,
+    // as when only the daemon ran them (a nudge may come in between two jobs of a round, not run beside one).
+    // Always taken before the lock of the job (run() is synchronized), never while holding it.
+    private final ReentrantLock jobRunLock = new ReentrantLock();
+
     // map to store backup info, key is label name, value is the BackupJob
     // this map not present in persist && only in fe memory
     // one table only keep one snapshot info, only keep last
@@ -223,6 +240,48 @@ public class BackupHandler extends MasterDaemon implements Writable {
         return getCurrentJob(dbId);
     }
 
+    /**
+     * A job says that the last task its state waits for is reported: run it now (on the nudge thread), if
+     * Config.backup_restore_run_on_task_finish. Only the id of the job is kept: when the nudge is run the job is
+     * looked up again, and it is run only if this frontend is still the master and the job is still the current one
+     * of its database, not done (the object may have been replaced by a replay, or evicted, meanwhile).
+     */
+    public void nudge(long dbId, long jobId) {
+        if (!Config.backup_restore_run_on_task_finish || !nudgePending.add(jobId)) {
+            return;
+        }
+        try {
+            nudgeExecutor.execute(() -> runNudgedJob(dbId, jobId));
+        } catch (RejectedExecutionException e) {
+            nudgePending.remove(jobId);
+            LOG.warn("failed to submit the nudge of job {}, it runs at the next round", jobId, e);
+        }
+    }
+
+    private void runNudgedJob(long dbId, long jobId) {
+        nudgePending.remove(jobId);
+        // as the daemon: only a ready master runs the jobs
+        if (!isInit || env == null || !env.isReady() || !env.isMaster()) {
+            return;
+        }
+        AbstractJob job = getCurrentJob(dbId);
+        if (job == null || job.getJobId() != jobId || job.isDone()) {
+            return;
+        }
+        job.setEnv(env);
+        jobRunLock.lock();
+        try {
+            // looked at again under the lock: the daemon may have run the job to its end meanwhile
+            if (!job.isDone()) {
+                job.run();
+            }
+        } catch (Throwable t) {
+            LOG.warn("failed to run the nudged backup or restore job {}", job, t);
+        } finally {
+            jobRunLock.unlock();
+        }
+    }
+
     public List<AbstractJob> getJobs(long dbId, Predicate<String> predicate) {
         jobLock.lock();
         try {
@@ -245,7 +304,15 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
         for (AbstractJob job : getAllCurrentJobs()) {
             job.setEnv(env);
-            job.run();
+            jobRunLock.lock();
+            try {
+                job.run();
+            } catch (Throwable t) {
+                // the other jobs still run this round
+                LOG.warn("failed to run the backup or restore job {}", job, t);
+            } finally {
+                jobRunLock.unlock();
+            }
         }
     }
 
