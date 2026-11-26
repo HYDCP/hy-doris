@@ -3394,7 +3394,7 @@ public class StmtExecutor {
         // after success create table insert data
         try {
             parsedStmt = ctasStmt.getInsertStmt();
-            OlapTable createdTable = ctasStmt.getCreateTableStmt().getCreatedOlapTable();
+            Table createdTable = ctasStmt.getCreateTableStmt().getCreatedTable();
             if (createdTable != null) {
                 ((NativeInsertStmt) parsedStmt).setCtasTargetTableId(createdTable.getId());
             }
