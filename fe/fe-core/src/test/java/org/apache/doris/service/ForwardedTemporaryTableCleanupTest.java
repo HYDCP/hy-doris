@@ -21,18 +21,49 @@ import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.MysqlConnectProcessor;
 import org.apache.doris.system.Frontend;
 import org.apache.doris.thrift.TFrontendReportAliveSessionResult;
+import org.apache.doris.thrift.TMasterOpRequest;
+import org.apache.doris.thrift.TMasterOpResult;
 import org.apache.doris.thrift.TStatusCode;
 
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.mockito.MockedConstruction;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
 import java.util.Collections;
 
 class ForwardedTemporaryTableCleanupTest {
+    @Test
+    void reportsCreatedIdsToOriginWithoutChangingLegacyReplies() throws Exception {
+        Env env = Mockito.mock(Env.class);
+        Frontend origin = Mockito.mock(Frontend.class);
+        Mockito.when(env.checkFeExist("origin", 9010)).thenReturn(origin);
+        FrontendServiceImpl service = Mockito.mock(FrontendServiceImpl.class, Mockito.CALLS_REAL_METHODS);
+        Mockito.doReturn(false).when(service).isTemporaryTableOriginClosed(origin, 7, "owner");
+        TMasterOpRequest request = new TMasterOpRequest().setClientNodeHost("origin").setClientNodePort(9010)
+                .setSessionId("owner").setTempTableOriginConnectionId(7);
+        try (MockedStatic<Env> mocked = Mockito.mockStatic(Env.class);
+                MockedConstruction<MysqlConnectProcessor> processors = Mockito.mockConstruction(
+                        MysqlConnectProcessor.class, (processor, construction) -> {
+                            ConnectContext proxy = (ConnectContext) construction.arguments().get(0);
+                            Mockito.when(processor.proxyExecute(request)).thenAnswer(call -> {
+                                proxy.addTemporaryTable(10L, 11L);
+                                return new TMasterOpResult().setStatus("OK");
+                            });
+                        })) {
+            mocked.when(Env::getCurrentEnv).thenReturn(env);
+            Assertions.assertEquals(Collections.singletonMap(11L, 10L),
+                    service.forward(request).getCreatedTemporaryTableDbIds());
+            request.unsetTempTableOriginConnectionId();
+            Assertions.assertFalse(service.forward(request).isSetCreatedTemporaryTableDbIds());
+            Assertions.assertEquals(2, processors.constructed().size());
+        }
+    }
+
     @Test
     void cleansTableWhenCreateFinishesAfterOriginDisconnected() throws Exception {
         Env env = Mockito.mock(Env.class);

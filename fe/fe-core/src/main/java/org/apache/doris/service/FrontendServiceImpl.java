@@ -1276,6 +1276,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             }
         }
         if (params.isSetTempTableOriginConnectionId()) {
+            result.setCreatedTemporaryTableDbIds(context.snapshotTemporaryTables());
             result.setMaxJournalId(Env.getCurrentEnv().getMaxJournalId());
         }
         return result;

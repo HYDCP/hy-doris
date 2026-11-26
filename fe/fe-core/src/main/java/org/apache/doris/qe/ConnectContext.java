@@ -98,7 +98,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -257,7 +256,9 @@ public class ConnectContext {
     // These fields are guarded by this context's monitor. Match temporary tables by ID across replay and cleanup.
     private final Map<Long, Long> temporaryTableIdsToDbIds = new HashMap<>();
     private int activeStatements;
-    private final Set<TableName> uncertainTempTableTargets = new HashSet<>();
+    private long temporaryTableJournalId;
+    private final Map<Long, TableName> temporaryTableTargetsAwaitingReplay = new HashMap<>();
+    private final Map<TableName, Long> uncertainTempTableTargets = new HashMap<>();
     private final ReentrantLock tempTableCleanupLock = new ReentrantLock();
 
     // internal call like `insert overwrite` need skipAuth
@@ -934,7 +935,9 @@ public class ConnectContext {
         tempTableCleanupLock.lock();
         try {
             Map<Long, Long> snapshot;
-            Set<TableName> uncertain;
+            Map<TableName, Long> uncertain;
+            Map<Long, TableName> awaitingReplay;
+            long journalId;
             synchronized (this) {
                 if (activeStatements != 0) {
                     if (strict) {
@@ -943,13 +946,31 @@ public class ConnectContext {
                     return;
                 }
                 snapshot = new HashMap<>(temporaryTableIdsToDbIds);
-                uncertain = new HashSet<>(uncertainTempTableTargets);
+                uncertain = new HashMap<>(uncertainTempTableTargets);
+                journalId = temporaryTableJournalId;
+                awaitingReplay = new HashMap<>(temporaryTableTargetsAwaitingReplay);
             }
             if (snapshot.isEmpty() && uncertain.isEmpty()) {
                 return;
             }
 
             Env currentEnv = Env.getCurrentEnv();
+            boolean replayFailed = false;
+            // A reply can arrive before a failed journal wait. Resolve its IDs only after replay.
+            if (journalId > 0 && !currentEnv.isMaster() && journalId > currentEnv.getReplayedJournalId()) {
+                int timeoutMs = (int) Math.min(Integer.MAX_VALUE, Math.max(1, getExecTimeout()) * 1000L);
+                try {
+                    currentEnv.getJournalObservable().waitOn(journalId, timeoutMs);
+                } catch (DdlException e) {
+                    if (strict) {
+                        throw e;
+                    }
+                    // A physical close cannot retry. Reach the Master for confirmed creates still awaiting replay.
+                    replayFailed = true;
+                    LOG.warn("Journal {} unavailable during temporary table cleanup for session {}", journalId,
+                            sessionId, e);
+                }
+            }
             InternalCatalog catalog = currentEnv.getInternalCatalog();
             DdlException failure = strict && !uncertain.isEmpty()
                     ? new DdlException("The result of a forwarded temporary table statement is unknown") : null;
@@ -958,7 +979,9 @@ public class ConnectContext {
                 long dbId = entry.getValue();
                 try {
                     Database db = catalog.getDbNullable(dbId);
-                    if (db != null) {
+                    if (replayFailed && awaitingReplay.containsKey(tableId)) {
+                        cleanupTemporaryTableByTarget(currentEnv, catalog, awaitingReplay.get(tableId), dbId);
+                    } else if (db != null) {
                         if (currentEnv.isMaster()) {
                             catalog.dropTemporaryTable(db, tableId, sessionId);
                         } else {
@@ -976,9 +999,10 @@ public class ConnectContext {
                 }
             }
             if (!strict) {
-                for (TableName target : uncertain) {
+                for (Map.Entry<TableName, Long> entry : uncertain.entrySet()) {
+                    TableName target = entry.getKey();
                     try {
-                        cleanupUnconfirmedTemporaryTable(currentEnv, catalog, target);
+                        cleanupTemporaryTableByTarget(currentEnv, catalog, target, entry.getValue());
                         synchronized (this) {
                             uncertainTempTableTargets.remove(target);
                         }
@@ -1012,22 +1036,31 @@ public class ConnectContext {
         }
     }
 
-    private void cleanupUnconfirmedTemporaryTable(Env env, InternalCatalog catalog, TableName target)
+    private void cleanupTemporaryTableByTarget(Env env, InternalCatalog catalog, TableName target, Long originalDbId)
             throws Exception {
         if (!InternalCatalog.INTERNAL_CATALOG_NAME.equals(target.getCtl())) {
             return;
         }
         String innerName = sessionId + FeNameFormat.TEMPORARY_TABLE_SIGN + target.getTbl();
+        // An unconfirmed CREATE can refer to the original database or one that subsequently reused its name.
+        Database originalDb = originalDbId == null ? null : catalog.getDbNullable(originalDbId.longValue());
+        if (originalDb != null && !originalDb.getFullName().equals(target.getDb())) {
+            cleanupTemporaryTableByName(env, originalDb, originalDb.getFullName(), innerName);
+        }
+        cleanupTemporaryTableByName(env, catalog.getDbNullable(target.getDb()), target.getDb(), innerName);
+    }
+
+    private void cleanupTemporaryTableByName(Env env, Database db, String dbName, String innerName)
+            throws Exception {
         if (!env.isMaster()) {
             // The create may still be absent in the local journal. Check directly at the Master.
-            forwardTemporaryTableDrop(target.getDb(), innerName);
+            forwardTemporaryTableDrop(dbName, innerName);
             return;
         }
-        Database db = catalog.getDbNullable(target.getDb());
         if (db != null) {
             Table table = db.getTemporaryTableNullable(innerName);
             if (table != null) {
-                catalog.dropTemporaryTable(db, table.getId(), sessionId);
+                env.getInternalCatalog().dropTemporaryTable(db, table.getId(), sessionId);
             }
         }
     }
@@ -1747,17 +1780,33 @@ public class ConnectContext {
         temporaryTableIdsToDbIds.put(tableId, dbId);
     }
 
+    synchronized void addForwardedTemporaryTables(Map<Long, Long> tableDbIds, long journalId,
+            TableName awaitingReplay) {
+        if (!tableDbIds.isEmpty()) {
+            temporaryTableIdsToDbIds.putAll(tableDbIds);
+            if (awaitingReplay != null) {
+                tableDbIds.keySet().forEach(id -> temporaryTableTargetsAwaitingReplay.put(id, awaitingReplay));
+            }
+            temporaryTableJournalId = Math.max(temporaryTableJournalId, journalId);
+        }
+    }
+
     public synchronized void removeTemporaryTable(long tableId) {
         temporaryTableIdsToDbIds.remove(tableId);
+        temporaryTableTargetsAwaitingReplay.remove(tableId);
     }
 
     synchronized void removeDroppedTemporaryTables(Database db) {
+        if (temporaryTableJournalId > 0 && temporaryTableJournalId > getEnv().getReplayedJournalId()) {
+            return;
+        }
         temporaryTableIdsToDbIds.entrySet().removeIf(entry ->
                 entry.getValue() == db.getId() && db.getTableNullable(entry.getKey().longValue()) == null);
+        temporaryTableTargetsAwaitingReplay.keySet().retainAll(temporaryTableIdsToDbIds.keySet());
     }
 
-    synchronized void markTemporaryTableDdlUncertain(TableName target) {
-        uncertainTempTableTargets.add(target);
+    synchronized void markTemporaryTableDdlUncertain(TableName target, Database originalDb) {
+        uncertainTempTableTargets.put(target, originalDb == null ? null : originalDb.getId());
     }
 
     public synchronized Map<Long, Long> snapshotTemporaryTables() {

@@ -18,11 +18,13 @@
 package org.apache.doris.qe;
 
 import org.apache.doris.analysis.RedirectStatus;
+import org.apache.doris.analysis.TableName;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.thrift.TGroupCommitInfo;
 import org.apache.doris.thrift.TMasterOpRequest;
+import org.apache.doris.thrift.TMasterOpResult;
 import org.apache.doris.thrift.TNetworkAddress;
 
 import org.apache.logging.log4j.LogManager;
@@ -71,6 +73,15 @@ public class MasterOpExecutor extends FEOpExecutor {
         waitOnReplaying();
     }
 
+    boolean recordCreatedTemporaryTables(TableName awaitingReplay) {
+        if (result == null || !result.isSetCreatedTemporaryTableDbIds()) {
+            return false;
+        }
+        ctx.addForwardedTemporaryTables(result.getCreatedTemporaryTableDbIds(), result.getMaxJournalId(),
+                awaitingReplay);
+        return true;
+    }
+
     public void trackTemporaryTableCreation() {
         trackTemporaryTableCreation = true;
     }
@@ -86,8 +97,10 @@ public class MasterOpExecutor extends FEOpExecutor {
 
     @Override
     public void cancel() throws Exception {
-        super.cancel();
-        waitOnReplaying();
+        TMasterOpResult cancelResult = sendCancel();
+        if (cancelResult != null) {
+            ctx.getEnv().getJournalObservable().waitOn(cancelResult.getMaxJournalId(), journalWaitTimeoutMs);
+        }
     }
 
     private void waitOnReplaying() throws DdlException {

@@ -66,6 +66,7 @@ public class FEOpExecutor {
 
     protected boolean shouldNotRetry;
     protected boolean moreStmtExists = false;
+    private boolean statementRpcAttempted;
 
     public FEOpExecutor(TNetworkAddress feAddress, OriginStatement originStmt, ConnectContext ctx, boolean isQuery) {
         this.feAddr = feAddress;
@@ -98,10 +99,18 @@ public class FEOpExecutor {
         }
     }
 
+    boolean wasStatementRpcAttempted() {
+        return statementRpcAttempted;
+    }
+
     public void cancel() throws Exception {
+        sendCancel();
+    }
+
+    protected TMasterOpResult sendCancel() throws Exception {
         TUniqueId queryId = ctx.queryId();
         if (queryId == null) {
-            return;
+            return null;
         }
         Preconditions.checkNotNull(feAddr, "query with id %s is not forwarded to fe", queryId);
         TMasterOpRequest request = new TMasterOpRequest();
@@ -113,7 +122,7 @@ public class FEOpExecutor {
         request.setClientNodePort(Env.getCurrentEnv().getSelfNode().getPort());
         // just make the protocol happy
         request.setSql("");
-        result = forward(request);
+        return forward(request);
     }
 
     // Send request to specific fe
@@ -135,6 +144,9 @@ public class FEOpExecutor {
 
         boolean isReturnToPool = false;
         try {
+            if (!params.isCancelQeury()) {
+                statementRpcAttempted = true;
+            }
             final TMasterOpResult result = client.forward(params);
             isReturnToPool = true;
             return result;

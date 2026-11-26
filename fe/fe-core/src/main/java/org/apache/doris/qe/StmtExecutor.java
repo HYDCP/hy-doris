@@ -1332,18 +1332,21 @@ public class StmtExecutor {
         }
         masterOpExecutor.setMoreStmtExists(moreStmtExists);
         TableName tempTableTarget = getForwardedTemporaryTableTarget();
+        Database originalDb = null;
         if (tempTableTarget != null) {
             tempTableTarget.analyze(new Analyzer(context.getEnv(), context));
+            originalDb = getForwardedInternalDatabase(tempTableTarget.getCtl(), tempTableTarget.getDb());
             masterOpExecutor.trackTemporaryTableCreation();
         }
         try {
             masterOpExecutor.execute();
         } catch (Exception e) {
-            if (tempTableTarget != null) {
-                context.markTemporaryTableDdlUncertain(tempTableTarget);
+            if (tempTableTarget != null && masterOpExecutor.wasStatementRpcAttempted()
+                    && !masterOpExecutor.recordCreatedTemporaryTables(tempTableTarget)) {
+                context.markTemporaryTableDdlUncertain(tempTableTarget, originalDb);
                 try {
                     new MasterOpExecutor(context).syncJournal();
-                    recordForwardedTemporaryTable(tempTableTarget);
+                    recordForwardedTemporaryTable(tempTableTarget, originalDb);
                 } catch (Exception syncException) {
                     e.addSuppressed(syncException);
                 }
@@ -1351,7 +1354,12 @@ public class StmtExecutor {
             throw e;
         }
         if (tempTableTarget != null) {
-            recordForwardedTemporaryTable(tempTableTarget);
+            if (!masterOpExecutor.recordCreatedTemporaryTables(null)
+                    && !recordForwardedTemporaryTable(tempTableTarget, originalDb)
+                    && masterOpExecutor.getStatusCode() == 0) {
+                // An older Master did not report IDs, and the original name is no longer resolvable.
+                context.markTemporaryTableDdlUncertain(tempTableTarget, originalDb);
+            }
         } else if (masterOpExecutor.getStatusCode() == 0 && parsedStmt instanceof DropTableStmt) {
             DropTableStmt drop = (DropTableStmt) parsedStmt;
             Database db = getForwardedInternalDatabase(drop.getCatalogName(), drop.getDbName());
@@ -1414,14 +1422,17 @@ public class StmtExecutor {
         return like.isTemp() ? new TableName(like.getCatalogName(), like.getDbName(), like.getTableName()) : null;
     }
 
-    private void recordForwardedTemporaryTable(TableName target) {
-        Database db = getForwardedInternalDatabase(target.getCtl(), target.getDb());
+    private boolean recordForwardedTemporaryTable(TableName target, Database originalDb) {
+        Database db = originalDb == null ? getForwardedInternalDatabase(target.getCtl(), target.getDb())
+                : context.getEnv().getInternalCatalog().getDbNullable(originalDb.getId());
         if (db != null) {
             Table table = db.getTemporaryTableNullable(target.getTbl());
             if (table != null && context.getSessionId().equals(Util.getTempTableSessionId(table.getName()))) {
                 context.addTemporaryTable(db.getId(), table.getId());
+                return true;
             }
         }
+        return false;
     }
 
     private Database getForwardedInternalDatabase(String catalogName, String dbName) {
