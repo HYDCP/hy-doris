@@ -51,6 +51,16 @@ public:
 
     void add_scan_bytes(int64_t delta_scan_bytes) { scan_bytes += delta_scan_bytes; }
 
+    void add_process_rows(int64_t rows) {
+        _process_rows.fetch_add(rows, std::memory_order_relaxed);
+    }
+    void add_total_pipeline_tasks(int32_t tasks) {
+        _total_pipeline_tasks.fetch_add(tasks, std::memory_order_relaxed);
+    }
+    void finish_pipeline_task() {
+        _finished_pipeline_tasks.fetch_add(1, std::memory_order_relaxed);
+    }
+
     void add_cpu_nanos(int64_t delta_cpu_time) { cpu_nanos += delta_cpu_time; }
 
     void add_shuffle_send_bytes(int64_t delta_bytes) { shuffle_send_bytes += delta_bytes; }
@@ -88,6 +98,9 @@ private:
     std::atomic<int64_t> scan_rows;
     std::atomic<int64_t> scan_bytes;
     std::atomic<int64_t> cpu_nanos;
+    std::atomic<int64_t> _process_rows {0};
+    std::atomic<int32_t> _total_pipeline_tasks {0};
+    std::atomic<int32_t> _finished_pipeline_tasks {0};
     std::atomic<int64_t> _scan_bytes_from_local_storage;
     std::atomic<int64_t> _scan_bytes_from_remote_storage;
     // number rows returned by query.

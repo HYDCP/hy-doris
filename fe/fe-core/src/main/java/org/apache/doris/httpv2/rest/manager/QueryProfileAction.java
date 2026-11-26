@@ -63,6 +63,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -97,6 +98,7 @@ public class QueryProfileAction extends RestBaseController {
     private static final String QUERY_ID_PARA = "query_id";
     private static final String SEARCH_PARA = "search";
     private static final String IS_ALL_NODE_PARA = "is_all_node";
+    private static final String EXTENDED_STATS_PARA = "extended_stats";
     private static final String FRAGMENT_ID = "fragment_id";
     private static final String INSTANCE_ID = "instance_id";
 
@@ -434,15 +436,25 @@ public class QueryProfileAction extends RestBaseController {
      */
     @RequestMapping(path = "/current_queries", method = RequestMethod.GET)
     public Object currentQueries(HttpServletRequest request, HttpServletResponse response,
-            @RequestParam(value = IS_ALL_NODE_PARA, required = false, defaultValue = "true") boolean isAllNode) {
+            @RequestParam(value = IS_ALL_NODE_PARA, required = false, defaultValue = "true") boolean isAllNode,
+            @RequestParam(value = EXTENDED_STATS_PARA, required = false) Boolean requestedExtendedStats) {
         executeCheckPassword(request, response);
         checkGlobalAuth(ConnectContext.get().getCurrentUserIdentity(), PrivPredicate.ADMIN);
+        boolean extended = isAllNode || requestedExtendedStats == null
+                ? Config.enable_extended_current_query_stats : requestedExtendedStats;
+        List<String> localTitles = Lists.newArrayList(CurrentQueryStatementsProcNode.TITLE_NAMES);
+        localTitles.add(0, FRONTEND);
+        List<String> titles = extended ? Lists.newArrayList(CurrentQueryStatementsProcNode.EXTENDED_TITLE_NAMES)
+                : localTitles;
+        if (extended) {
+            titles.add(0, FRONTEND);
+        }
 
         if (isAllNode) {
-            // Get current queries from all FE
             String httpPath = "/rest/v2/manager/query/current_queries";
             Map<String, String> arguments = Maps.newHashMap();
             arguments.put(IS_ALL_NODE_PARA, "false");
+            arguments.put(EXTENDED_STATS_PARA, String.valueOf(extended));
             List<List<String>> queries = Lists.newArrayList();
             List<String> dataList = requestAllFe(httpPath, arguments, request.getHeader(NodeAction.AUTHORIZATION),
                     HttpMethod.GET);
@@ -450,30 +462,35 @@ public class QueryProfileAction extends RestBaseController {
                 try {
                     NodeAction.NodeInfo nodeInfo = GsonUtils.GSON.fromJson(data, new TypeToken<NodeAction.NodeInfo>() {
                     }.getType());
-                    queries.addAll(nodeInfo.getRows());
+                    if (titles.equals(nodeInfo.getColumnNames())) {
+                        queries.addAll(nodeInfo.getRows());
+                    } else if (extended && localTitles.equals(nodeInfo.getColumnNames())) {
+                        // Old FE ignores the requested format. Its columns are a prefix of the extended view.
+                        for (List<String> oldRow : nodeInfo.getRows()) {
+                            List<String> row = Lists.newArrayList(oldRow);
+                            row.addAll(Collections.nCopies(titles.size() - localTitles.size(), "N/A"));
+                            queries.add(row);
+                        }
+                    } else {
+                        LOG.warn("unexpected current queries columns: {}", nodeInfo.getColumnNames());
+                    }
                 } catch (Exception e) {
-                    LOG.warn("parse query info error: {}", data, e);
+                    LOG.warn("parse query info error: {} ", e.getMessage());
                 }
             }
-            List<String> titles = Lists.newArrayList(CurrentQueryStatementsProcNode.TITLE_NAMES);
-            titles.add(0, FRONTEND);
             return ResponseEntityBuilder.ok(new NodeAction.NodeInfo(titles, queries));
-        } else {
-            try {
-                CurrentQueryStatementsProcNode node = new CurrentQueryStatementsProcNode();
-                ProcResult result = node.fetchResult();
-                // add frontend info at first column.
-                List<String> titles = Lists.newArrayList(CurrentQueryStatementsProcNode.TITLE_NAMES);
-                titles.add(0, FRONTEND);
-                List<List<String>> rows = result.getRows();
-                String feIp = FrontendOptions.getLocalHostAddress();
-                for (List<String> row : rows) {
-                    row.add(0, feIp);
-                }
-                return ResponseEntityBuilder.ok(new NodeAction.NodeInfo(titles, rows));
-            } catch (AnalysisException e) {
-                return ResponseEntityBuilder.badRequest(e.getMessage());
+        }
+
+        try {
+            ProcResult result = new CurrentQueryStatementsProcNode().fetchResult(extended);
+            List<List<String>> rows = result.getRows();
+            String feIp = FrontendOptions.getLocalHostAddress();
+            for (List<String> row : rows) {
+                row.add(0, feIp);
             }
+            return ResponseEntityBuilder.ok(new NodeAction.NodeInfo(titles, rows));
+        } catch (AnalysisException e) {
+            return ResponseEntityBuilder.badRequest(e.getMessage());
         }
     }
 

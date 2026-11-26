@@ -75,6 +75,7 @@
 #include "pipeline/local_exchange/local_exchange_sink_operator.h"
 #include "pipeline/local_exchange/local_exchange_source_operator.h"
 #include "pipeline/pipeline.h"
+#include "runtime/query_context.h"
 #include "util/debug_util.h"
 #include "util/runtime_profile.h"
 #include "util/string_util.h"
@@ -363,6 +364,9 @@ void PipelineXLocalStateBase::reached_limit(vectorized::Block* block, bool* eos)
 
     if (auto rows = block->rows()) {
         _num_rows_returned += rows;
+        if (auto* query_ctx = _state->get_query_ctx()) {
+            query_ctx->add_process_rows(rows);
+        }
     }
 }
 

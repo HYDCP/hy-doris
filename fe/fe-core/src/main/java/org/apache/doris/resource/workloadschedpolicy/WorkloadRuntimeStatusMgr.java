@@ -20,11 +20,14 @@ package org.apache.doris.resource.workloadschedpolicy;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.Pair;
+import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.common.util.MasterDaemon;
 import org.apache.doris.plugin.AuditEvent;
+import org.apache.doris.qe.QeProcessorImpl;
 import org.apache.doris.thrift.TQueryStatistics;
 import org.apache.doris.thrift.TReportWorkloadRuntimeStatusParams;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import org.apache.logging.log4j.LogManager;
@@ -48,8 +51,33 @@ public class WorkloadRuntimeStatusMgr extends MasterDaemon {
 
     private static final Logger LOG = LogManager.getLogger(WorkloadRuntimeStatusMgr.class);
     private Map<Long, BeReportInfo> beToQueryStatsMap = Maps.newConcurrentMap();
+    private volatile QueryStatisticsSnapshot queryStatisticsSnapshot =
+            new QueryStatisticsSnapshot(ImmutableMap.of(), ImmutableMap.of());
     private final ReentrantReadWriteLock queryAuditEventLock = new ReentrantReadWriteLock();
     private List<AuditEvent> queryAuditEventList = Lists.newLinkedList();
+
+    public static final class QueryStatisticsSnapshot {
+        private final Map<String, TQueryStatistics> statistics;
+        private final Map<String, Integer> reportingBackends;
+
+        private QueryStatisticsSnapshot(Map<String, TQueryStatistics> statistics,
+                Map<String, Integer> reportingBackends) {
+            this.statistics = statistics;
+            this.reportingBackends = reportingBackends;
+        }
+
+        public Map<String, TQueryStatistics> getStatistics() {
+            return statistics;
+        }
+
+        public Map<String, Integer> getReportingBackends() {
+            return reportingBackends;
+        }
+    }
+
+    public QueryStatisticsSnapshot getQueryStatisticsSnapshot() {
+        return queryStatisticsSnapshot;
+    }
 
     private class BeReportInfo {
         volatile long beLastReportTime;
@@ -68,7 +96,8 @@ public class WorkloadRuntimeStatusMgr extends MasterDaemon {
     @Override
     protected void runAfterCatalogReady() {
         // 1 merge be query statistics
-        Map<String, TQueryStatistics> queryStatisticsMap = getQueryStatisticsMap();
+        queryStatisticsSnapshot = buildQueryStatisticsSnapshot();
+        Map<String, TQueryStatistics> queryStatisticsMap = queryStatisticsSnapshot.getStatistics();
 
         // 2 log query audit
         try {
@@ -175,30 +204,37 @@ public class WorkloadRuntimeStatusMgr extends MasterDaemon {
     void clearReportTimeoutBeStatistics() {
         // 1 clear report timeout be
         Set<Long> currentBeIdSet = beToQueryStatsMap.keySet();
-        Long currentTime = System.currentTimeMillis();
+        long expireBefore = System.currentTimeMillis() - Config.be_report_query_statistics_timeout_ms;
+        boolean retainRunningQueries = Config.enable_extended_current_query_stats;
         for (Long beId : currentBeIdSet) {
             BeReportInfo beReportInfo = beToQueryStatsMap.get(beId);
-            if (currentTime - beReportInfo.beLastReportTime > Config.be_report_query_statistics_timeout_ms) {
+            if (!retainRunningQueries && beReportInfo.beLastReportTime < expireBefore) {
                 beToQueryStatsMap.remove(beId);
                 continue;
             }
-            Set<String> queryIdSet = beReportInfo.queryStatsMap.keySet();
-            for (String queryId : queryIdSet) {
-                Pair<Long, TQueryStatistics> pair = beReportInfo.queryStatsMap.get(queryId);
-                long queryLastReportTime = pair.first;
-                if (currentTime - queryLastReportTime > Config.be_report_query_statistics_timeout_ms) {
-                    beReportInfo.queryStatsMap.remove(queryId);
-                }
+            // A BE can finish its fragments while other BEs are still executing the same query.
+            beReportInfo.queryStatsMap.entrySet().removeIf(entry -> entry.getValue().first < expireBefore
+                    && (!retainRunningQueries || !isQueryRunning(entry.getKey())));
+            if (beReportInfo.beLastReportTime < expireBefore && beReportInfo.queryStatsMap.isEmpty()) {
+                beToQueryStatsMap.remove(beId, beReportInfo);
             }
         }
     }
 
-    // NOTE: currently getQueryStatisticsMap must be called before clear beToQueryStatsMap
-    // so there is no need lock or null check when visit beToQueryStatsMap
-    public Map<String, TQueryStatistics> getQueryStatisticsMap() {
+    private boolean isQueryRunning(String queryId) {
+        try {
+            return QeProcessorImpl.INSTANCE.getCoordinator(DebugUtil.parseTUniqueIdFromString(queryId)) != null;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
+    // The daemon builds the snapshot before it cleans up expired reports.
+    QueryStatisticsSnapshot buildQueryStatisticsSnapshot() {
         // 1 merge query stats in all be
         Set<Long> beIdSet = beToQueryStatsMap.keySet();
         Map<String, TQueryStatistics> resultQueryMap = Maps.newHashMap();
+        Map<String, Integer> reportingBackends = Maps.newHashMap();
         for (Long beId : beIdSet) {
             BeReportInfo beReportInfo = beToQueryStatsMap.get(beId);
             Set<String> queryIdSet = beReportInfo.queryStatsMap.keySet();
@@ -211,10 +247,24 @@ public class WorkloadRuntimeStatusMgr extends MasterDaemon {
                     resultQueryMap.put(queryId, retQuery);
                 }
                 mergeQueryStatistics(retQuery, curQueryStats);
+                int reportCount = reportingBackends.merge(queryId, 1, Integer::sum);
+                mergeProgress(retQuery, curQueryStats, reportCount == 1);
             }
         }
 
-        return resultQueryMap;
+        return new QueryStatisticsSnapshot(ImmutableMap.copyOf(resultQueryMap), ImmutableMap.copyOf(reportingBackends));
+    }
+
+    private void mergeProgress(TQueryStatistics dst, TQueryStatistics src, boolean firstReport) {
+        if (src.isSetTotalTasksNum() && src.isSetFinishedTasksNum()
+                && (firstReport || dst.isSetTotalTasksNum())) {
+            dst.setTotalTasksNum(dst.total_tasks_num + src.total_tasks_num);
+            dst.setFinishedTasksNum(dst.finished_tasks_num + src.finished_tasks_num);
+        } else {
+            // An old BE report has no progress counters. Keep the query's progress unknown.
+            dst.unsetTotalTasksNum();
+            dst.unsetFinishedTasksNum();
+        }
     }
 
     private void mergeQueryStatistics(TQueryStatistics dst, TQueryStatistics src) {
@@ -225,6 +275,15 @@ public class WorkloadRuntimeStatusMgr extends MasterDaemon {
         dst.cpu_ms += src.cpu_ms;
         dst.shuffle_send_bytes += src.shuffle_send_bytes;
         dst.shuffle_send_rows += src.shuffle_send_rows;
+        if (src.isSetProcessRows()) {
+            dst.setProcessRows(dst.process_rows + src.process_rows);
+        }
+        if (dst.current_used_memory_bytes < src.current_used_memory_bytes) {
+            dst.setCurrentUsedMemoryBytes(src.current_used_memory_bytes);
+        }
+        if (dst.workload_group_id <= 0 && src.workload_group_id > 0) {
+            dst.setWorkloadGroupId(src.workload_group_id);
+        }
         if (dst.max_peak_memory_bytes < src.max_peak_memory_bytes) {
             dst.max_peak_memory_bytes = src.max_peak_memory_bytes;
         }

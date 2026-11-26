@@ -350,6 +350,7 @@ Status PipelineFragmentContext::prepare(const doris::TPipelineFragmentParams& re
         SCOPED_TIMER(_build_tasks_timer);
         // 6. Build pipeline tasks and initialize local state.
         RETURN_IF_ERROR(_build_pipeline_tasks(request, thread_pool));
+        _query_ctx->add_total_pipeline_tasks(_total_tasks.load(std::memory_order_relaxed));
     }
 
     _init_next_report_time();
@@ -1680,6 +1681,8 @@ Status PipelineFragmentContext::submit() {
             if (!st) {
                 cancel(Status::InternalError("submit context to executor fail"));
                 std::lock_guard<std::mutex> l(_task_mutex);
+                _query_ctx->add_total_pipeline_tasks(submit_tasks -
+                                                     _total_tasks.load(std::memory_order_relaxed));
                 _total_tasks = submit_tasks;
                 break;
             }
@@ -1756,6 +1759,7 @@ void PipelineFragmentContext::close_a_pipeline(PipelineId pipeline_id) {
     }
     std::lock_guard<std::mutex> l(_task_mutex);
     ++_closed_tasks;
+    _query_ctx->finish_pipeline_task();
     if (_closed_tasks == _total_tasks) {
         _close_fragment_instance();
     }

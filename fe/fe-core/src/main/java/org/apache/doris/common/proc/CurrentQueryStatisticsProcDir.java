@@ -18,6 +18,7 @@
 package org.apache.doris.common.proc;
 
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.util.QueryStatisticsFormatter;
 import org.apache.doris.qe.QeProcessorImpl;
 import org.apache.doris.qe.QueryStatisticsItem;
@@ -60,6 +61,9 @@ public class CurrentQueryStatisticsProcDir implements ProcDirInterface {
 
     @Override
     public ProcResult fetchResult() throws AnalysisException {
+        if (Config.enable_extended_current_query_stats) {
+            return new CurrentQueryStatementsProcNode().fetchResult(true);
+        }
         final BaseProcResult result = new BaseProcResult();
         final Map<String, QueryStatisticsItem> statistic =
                 QeProcessorImpl.INSTANCE.getQueryStatistics();

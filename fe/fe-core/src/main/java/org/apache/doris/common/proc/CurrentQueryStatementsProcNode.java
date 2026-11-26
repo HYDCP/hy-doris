@@ -17,15 +17,22 @@
 
 package org.apache.doris.common.proc;
 
+import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
+import org.apache.doris.common.util.QueryStatisticsFormatter;
 import org.apache.doris.qe.QeProcessorImpl;
 import org.apache.doris.qe.QueryStatisticsItem;
+import org.apache.doris.resource.workloadschedpolicy.WorkloadRuntimeStatusMgr.QueryStatisticsSnapshot;
+import org.apache.doris.thrift.TQueryStatistics;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import org.apache.commons.codec.digest.DigestUtils;
 
+import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /*
@@ -36,14 +43,27 @@ public class CurrentQueryStatementsProcNode implements ProcNodeInterface {
             .add("QueryId").add("ConnectionId").add("Catalog").add("Database").add("User")
             .add("ExecTime").add("SqlHash").add("Statement").build();
 
+    public static final ImmutableList<String> EXTENDED_TITLE_NAMES = new ImmutableList.Builder<String>()
+            .addAll(TITLE_NAMES)
+            .add("ScanRows").add("ScanBytes").add("ProcessRows").add("CpuMs")
+            .add("MaxPeakMemoryBytes").add("CurrentUsedMemoryBytes").add("WorkloadGroupId")
+            .add("ShuffleSendBytes").add("ShuffleSendRows")
+            .add("ScanBytesFromLocalStorage").add("ScanBytesFromRemoteStorage")
+            .add("TotalTasks").add("FinishedTasks").add("Progress").build();
     private static final int EXEC_TIME_INDEX = 5;
 
     @Override
     public ProcResult fetchResult() throws AnalysisException {
+        return fetchResult(Config.enable_extended_current_query_stats);
+    }
+
+    public ProcResult fetchResult(boolean extended) throws AnalysisException {
         final BaseProcResult result = new BaseProcResult();
         final Map<String, QueryStatisticsItem> statistic =
                 QeProcessorImpl.INSTANCE.getQueryStatistics();
-        result.setNames(TITLE_NAMES.asList());
+        result.setNames(extended ? EXTENDED_TITLE_NAMES : TITLE_NAMES);
+        QueryStatisticsSnapshot snapshot = extended
+                ? Env.getCurrentEnv().getWorkloadRuntimeStatusMgr().getQueryStatisticsSnapshot() : null;
         final List<List<String>> sortedRowData = Lists.newArrayList();
 
         for (QueryStatisticsItem item : statistic.values()) {
@@ -56,6 +76,9 @@ public class CurrentQueryStatementsProcNode implements ProcNodeInterface {
             values.add(item.getQueryExecTime());
             values.add(DigestUtils.md5Hex(item.getSql()));
             values.add(item.getSql());
+            if (extended) {
+                appendStatistics(values, snapshot, item);
+            }
             sortedRowData.add(values);
         }
 
@@ -67,5 +90,39 @@ public class CurrentQueryStatementsProcNode implements ProcNodeInterface {
         });
         result.setRows(sortedRowData);
         return result;
+    }
+
+    private void appendStatistics(List<String> row, QueryStatisticsSnapshot snapshot, QueryStatisticsItem item) {
+        TQueryStatistics statistics = snapshot.getStatistics().get(item.getQueryId());
+        if (statistics == null) {
+            row.addAll(Collections.nCopies(EXTENDED_TITLE_NAMES.size() - TITLE_NAMES.size(), "N/A"));
+            return;
+        }
+        row.add(QueryStatisticsFormatter.getRowsReturned(statistics.getScanRows()));
+        row.add(QueryStatisticsFormatter.getScanBytes(statistics.getScanBytes()));
+        row.add(statistics.isSetProcessRows()
+                ? QueryStatisticsFormatter.getRowsReturned(statistics.getProcessRows()) : "N/A");
+        row.add(String.valueOf(statistics.getCpuMs()));
+        row.add(QueryStatisticsFormatter.getScanBytes(statistics.getMaxPeakMemoryBytes()));
+        row.add(QueryStatisticsFormatter.getScanBytes(statistics.getCurrentUsedMemoryBytes()));
+        row.add(String.valueOf(statistics.getWorkloadGroupId()));
+        row.add(QueryStatisticsFormatter.getScanBytes(statistics.getShuffleSendBytes()));
+        row.add(QueryStatisticsFormatter.getRowsReturned(statistics.getShuffleSendRows()));
+        row.add(QueryStatisticsFormatter.getScanBytes(statistics.getScanBytesFromLocalStorage()));
+        row.add(QueryStatisticsFormatter.getScanBytes(statistics.getScanBytesFromRemoteStorage()));
+
+        long expectedBackends = item.getFragmentInstanceInfos().stream()
+                .map(instance -> instance.getAddress()).distinct().count();
+        int reportingBackends = snapshot.getReportingBackends().getOrDefault(item.getQueryId(), 0);
+        if (expectedBackends == 0 || reportingBackends < expectedBackends || !statistics.isSetTotalTasksNum()
+                || statistics.getTotalTasksNum() <= 0
+                || statistics.getFinishedTasksNum() > statistics.getTotalTasksNum()) {
+            row.addAll(Collections.nCopies(3, "N/A"));
+        } else {
+            row.add(String.valueOf(statistics.getTotalTasksNum()));
+            row.add(String.valueOf(statistics.getFinishedTasksNum()));
+            double progress = 100.0 * statistics.getFinishedTasksNum() / statistics.getTotalTasksNum();
+            row.add(String.format(Locale.ROOT, "%.1f%%", progress));
+        }
     }
 }
