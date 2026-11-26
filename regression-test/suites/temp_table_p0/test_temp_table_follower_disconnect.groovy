@@ -47,6 +47,22 @@ suite('test_temp_table_follower_disconnect', 'p0,docker') {
         }
         assertTempTableDropped("t_test_temp_table_follower_disconnect_1")
 
+        sql "DROP TABLE IF EXISTS test_temp_table_follower_disconnect_source"
+        sql """
+            CREATE TABLE test_temp_table_follower_disconnect_source (id INT)
+            DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ("replication_num" = "1")
+        """
+        connectInDocker(context.config.jdbcUser, context.config.jdbcPassword) {
+            sql "USE test_temp_table_follower_disconnect_db"
+            sql """
+                CREATE TEMPORARY TABLE test_temp_table_follower_disconnect_like
+                LIKE test_temp_table_follower_disconnect_source
+            """
+            def tables = sql_return_maparray("SHOW DATA")
+            assertTrue(tables.any { it.TableName.contains("test_temp_table_follower_disconnect_like") })
+        }
+        assertTempTableDropped("test_temp_table_follower_disconnect_like")
+
         // case 2: session times out, the temporary table should be dropped
         connectInDocker(context.config.jdbcUser, context.config.jdbcPassword) {
             sql "use test_temp_table_follower_disconnect_db"

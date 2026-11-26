@@ -53,8 +53,12 @@ public class CreateTableLikeCommand extends Command implements ForwardWithSync {
     public void run(ConnectContext ctx, StmtExecutor executor) throws Exception {
         executor.checkBlockRules();
         info.validate(ctx);
-        CreateTableLikeStmt stmt = info.translateToLegacyStmt();
+        CreateTableLikeStmt stmt = toLegacyStmt();
         doRun(stmt, ctx, executor);
+    }
+
+    public CreateTableLikeStmt toLegacyStmt() throws DdlException {
+        return info.translateToLegacyStmt();
     }
 
     @Override

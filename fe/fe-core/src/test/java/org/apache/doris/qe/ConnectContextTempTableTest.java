@@ -20,150 +20,200 @@ package org.apache.doris.qe;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.Table;
+import org.apache.doris.common.DdlException;
+import org.apache.doris.common.FeNameFormat;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.qe.QueryState.MysqlStateType;
+import org.apache.doris.transaction.TransactionEntry;
 
-import mockit.Delegate;
 import mockit.Expectations;
 import mockit.Invocation;
 import mockit.Mock;
 import mockit.MockUp;
 import mockit.Mocked;
 import mockit.Verifications;
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 
-public class ConnectContextTempTableTest {
+class ConnectContextTempTableTest {
     @Mocked
     private Env env;
+    @Mocked
+    private InternalCatalog catalog;
+    @Mocked
+    private Database db;
 
-    @Test
-    public void testMasterContinuesAfterMissingDatabaseAndTable(@Mocked InternalCatalog catalog,
-            @Mocked Database db, @Mocked Table table) throws Exception {
-        ConnectContext ctx = new ConnectContext();
-        ctx.addTempTableToDB("empty_db", "removed");
-        ctx.removeTempTableFromDB("empty_db", "removed");
-        ctx.addTempTableToDB("dropped_db", "stale");
-        ctx.addTempTableToDB("live_db", "missing");
-        ctx.addTempTableToDB("live_db", "remaining");
-
+    private void mockLocalCatalog(boolean leader) {
         new Expectations() {
             {
                 Env.getCurrentEnv();
                 result = env;
+                minTimes = 0;
                 env.isMaster();
-                result = true;
+                result = leader;
+                minTimes = 0;
                 env.getInternalCatalog();
                 result = catalog;
-                catalog.getDb("dropped_db");
-                result = Optional.empty();
-                catalog.getDb("live_db");
-                result = Optional.of(db);
-                db.getTable("missing");
-                result = Optional.empty();
-                db.getTable("remaining");
-                result = Optional.of(table);
-            }
-        };
-
-        ctx.cleanup();
-
-        new Verifications() {
-            {
-                catalog.getDb("empty_db");
-                times = 0;
-                catalog.dropTableWithoutCheck(db, table, false, true);
-                times = 1;
-                env.unregisterSessionInfo(ctx.getSessionId());
-                times = 1;
+                minTimes = 0;
+                catalog.getDbNullable(10L);
+                result = db;
+                minTimes = 0;
             }
         };
     }
 
     @Test
-    public void testDropCanUnregisterTablesDuringCleanup(@Mocked InternalCatalog catalog,
-            @Mocked Database db, @Mocked Table table) throws Exception {
+    void retriesFailedResetWithoutRepeatingSuccessfulDrops() throws Exception {
+        mockLocalCatalog(true);
         ConnectContext ctx = new ConnectContext();
-        ctx.addTempTableToDB("db", "first");
-        ctx.addTempTableToDB("db", "second");
-        List<String> dropped = new ArrayList<>();
+        ctx.addTemporaryTable(10L, 11L);
+        ctx.addTemporaryTable(10L, 12L);
         new Expectations() {
             {
-                Env.getCurrentEnv();
-                result = env;
-                env.isMaster();
-                result = true;
-                env.getInternalCatalog();
-                result = catalog;
-                catalog.getDb("db");
-                result = Optional.of(db);
-                db.getTable(anyString);
-                result = new Delegate<Object>() {
-                    Optional<Table> lookup(String name) {
-                        dropped.add(name);
-                        return Optional.of(table);
-                    }
-                };
-                catalog.dropTableWithoutCheck(db, table, false, true);
-                result = new Delegate<Object>() {
-                    void drop() {
-                        ctx.removeTempTableFromDB("db", dropped.get(dropped.size() - 1));
-                    }
-                };
+                catalog.dropTemporaryTable(db, 11L, ctx.getSessionId());
+                result = new DdlException("injected DROP failure");
+                result = null;
                 times = 2;
             }
         };
 
-        ctx.killConnection();
+        ConnectProcessor processor = new MysqlConnectProcessor(ctx);
+        processor.handleResetConnection();
+        Assertions.assertEquals(MysqlStateType.ERR, ctx.getState().getStateType());
+        processor.handleResetConnection();
+        Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
 
-        Assert.assertTrue(dropped.contains("first"));
-        Assert.assertTrue(dropped.contains("second"));
+        new Verifications() {
+            {
+                catalog.dropTemporaryTable(db, 12L, ctx.getSessionId());
+                times = 1;
+            }
+        };
     }
 
     @Test
-    public void testFollowerForwardsQualifiedNames() {
+    void retainsTemporaryTablesWhenRollbackFails(@Mocked TransactionEntry transaction) throws Exception {
+        mockLocalCatalog(true);
         ConnectContext ctx = new ConnectContext();
-        ctx.setEnv(env);
-        ctx.addTempTableToDB("db_a", "tmp");
-        ctx.addTempTableToDB("db_b", "tmp");
+        ctx.setTxnEntry(transaction);
+        ctx.addTemporaryTable(10L, 11L);
         new Expectations() {
             {
-                Env.getCurrentEnv();
-                result = env;
-                env.isMaster();
-                result = false;
+                transaction.isTxnModel();
+                result = true;
+                transaction.abortTransaction();
+                result = new DdlException("injected rollback failure");
             }
         };
 
-        List<String> sql = new ArrayList<>();
+        new MysqlConnectProcessor(ctx).handleResetConnection();
+        Assertions.assertEquals(MysqlStateType.ERR, ctx.getState().getStateType());
+        Assertions.assertSame(transaction, ctx.getTxnEntry());
+        new Verifications() {
+            {
+                catalog.dropTemporaryTable(db, anyLong, anyString);
+                times = 0;
+            }
+        };
+    }
+
+    @Test
+    void drainsInFlightStatementBeforeCleaningOnce() throws Exception {
+        mockLocalCatalog(true);
+        ConnectContext ctx = new ConnectContext();
+        ctx.addTemporaryTable(10L, 11L);
+        ctx.beginStatementExecution();
+        ctx.cleanup();
+        new Verifications() {
+            {
+                catalog.dropTemporaryTable(db, anyLong, anyString);
+                times = 0;
+            }
+        };
+
+        ctx.addTemporaryTable(10L, 12L);
+        ctx.endStatementExecution();
+        ctx.cleanup();
+        Assertions.assertThrows(DdlException.class, ctx::beginStatementExecution);
+
+        new Verifications() {
+            {
+                catalog.dropTemporaryTable(db, 11L, ctx.getSessionId());
+                times = 1;
+                catalog.dropTemporaryTable(db, 12L, ctx.getSessionId());
+                times = 1;
+            }
+        };
+    }
+
+    @Test
+    void followerQualifiesDropAndChecksMasterStatus(@Mocked Table table) throws Exception {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.changeDefaultCatalog("external_catalog");
+        ctx.addTemporaryTable(10L, 11L);
+        String internalName = ctx.getSessionId() + FeNameFormat.TEMPORARY_TABLE_SIGN + "tmp";
+        new Expectations() {
+            {
+                db.getFullName();
+                result = "other_db";
+                db.getTableNullable(11L);
+                result = table;
+                table.isTemporary();
+                result = true;
+                table.getName();
+                result = internalName;
+            }
+        };
+        List<String> sentSql = new ArrayList<>();
         new MockUp<MasterOpExecutor>() {
             @Mock
             public void execute(Invocation invocation) {
-                MasterOpExecutor executor = invocation.getInvokedInstance();
-                sql.add(executor.originStmt.originStmt);
+                MasterOpExecutor operation = invocation.getInvokedInstance();
+                sentSql.add(operation.originStmt.originStmt);
+            }
+        };
+        new MockUp<FEOpExecutor>() {
+            @Mock
+            public int getStatusCode() {
+                return 1105;
+            }
+
+            @Mock
+            public String getErrMsg() {
+                return "injected forwarded error";
             }
         };
 
-        ctx.cleanup();
-
-        Assert.assertEquals(2, sql.size());
-        Assert.assertTrue(sql.contains("drop table `db_a`.`tmp`"));
-        Assert.assertTrue(sql.contains("drop table `db_b`.`tmp`"));
+        DdlException failure = Assertions.assertThrows(DdlException.class, ctx::resetTemporaryTables);
+        Assertions.assertTrue(failure.getCause().getMessage().contains("injected forwarded error"));
+        Assertions.assertEquals(1, sentSql.size());
+        Assertions.assertEquals("DROP TEMPORARY TABLE IF EXISTS `internal`.`other_db`.`" + internalName + "` FORCE",
+                sentSql.get(0));
     }
 
     @Test
-    public void testProxyLeavesTablesToCreatingSession() {
-        ConnectContext proxy = new ConnectContext(null, true);
-        proxy.addTempTableToDB("db", "tmp");
+    void rejectsResetAfterUncertainCreate() {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.markTemporaryTableDdlUncertain();
+        DdlException error = Assertions.assertThrows(DdlException.class, ctx::resetTemporaryTables);
+        Assertions.assertTrue(error.getMessage().contains("unknown"));
+    }
 
+    @Test
+    void proxyDoesNotCleanOriginatingSession() throws Exception {
+        ConnectContext proxy = new ConnectContext(null, true, "test-session");
+        proxy.addTemporaryTable(10L, 11L);
         proxy.deleteTempTable();
 
         new Verifications() {
             {
-                env.isMaster();
+                env.getInternalCatalog();
                 times = 0;
             }
         };
