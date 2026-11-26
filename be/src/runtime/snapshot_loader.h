@@ -17,7 +17,9 @@
 
 #pragma once
 
+#include <gen_cpp/AgentService_types.h>
 #include <gen_cpp/Types_types.h>
+#include <gen_cpp/olap_file.pb.h>
 
 #include <cstdint>
 #include <map>
@@ -35,6 +37,7 @@ class RemoteFileSystem;
 
 class DataDir;
 class TRemoteTabletSnapshot;
+struct LocalSourceStats;
 class StorageEngine;
 
 struct FileStat {
@@ -115,11 +118,34 @@ public:
     Status remote_http_download(const std::vector<TRemoteTabletSnapshot>& remote_tablets,
                                 std::vector<int64_t>* downloaded_tablet_ids);
 
+    // An empty snapshot dir (no tablet meta, no data file) is the one of a tablet which the snapshot task loaded
+    // from the local source itself (TSnapshotRequest.restore_kept_load): nothing is moved, the evidence of the load
+    // of this job in the tablet meta is checked instead, an error with kRestoreNotRetryable if it is not there.
     Status move(const std::string& snapshot_path, TabletSharedPtr tablet, bool overwrite);
+
+    // move(), the tablet meta saved with the loaded tablet has restore_stage as the evidence of the restore job
+    // (none if null). The restore stage of the source snapshot is always dropped.
+    Status move_with_restore_stage(const std::string& snapshot_path, TabletSharedPtr tablet,
+                                   bool overwrite, const RestoreStagePB* restore_stage);
+
+    // Atomic restore with partition level reuse, a kept tablet (request.restore_kept_load): the tablet being
+    // replaced (request.ref_tablet_id) is the source of the data up to request.version, the version kept. Make the
+    // snapshot of it (see TSnapshotRequest.restore_local_source), load it into the tablet of the restore at once as
+    // the move does, release it, and make an empty snapshot dir (snapshot_path), so that the move has nothing to
+    // move. On failure no snapshot is left, the tablet may have been loaded.
+    Status make_local_source_snapshot_and_load(const TSnapshotRequest& request,
+                                               std::string* snapshot_path, LocalSourceStats* stats);
 
     int64_t get_http_download_files_num() const { return _http_download_files_num; }
 
+    // The prefix of the error messages which make the FE cancel the restore job instead of resending the task.
+    static constexpr const char* kRestoreNotRetryable = "[RESTORE_NOT_RETRYABLE]";
+
 private:
+    // The move of an empty snapshot: the tablet must have the evidence of the load of the local source by this job
+    // (LOCAL_LOADED) and be at the version loaded, else an error of kRestoreNotRetryable. Reads the tablet only.
+    Status _confirm_local_source_loaded(const TabletSharedPtr& tablet);
+
     Status _replace_tablet_id(const std::string& file_name, int64_t tablet_id,
                               std::string* new_file_name);
 

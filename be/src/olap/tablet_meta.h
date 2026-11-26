@@ -260,6 +260,19 @@ public:
         _binlog_config = std::move(binlog_config);
     }
 
+    // The completion evidence of the restore job which loaded the data of the tablet (atomic restore,
+    // partition level reuse). It is saved with the tablet meta. The caller holds the header lock.
+    bool has_restore_stage() const { return _has_restore_stage; }
+    const RestoreStagePB& restore_stage() const { return _restore_stage; }
+    void set_restore_stage(const RestoreStagePB& stage) {
+        _restore_stage = stage;
+        _has_restore_stage = true;
+    }
+    void clear_restore_stage() {
+        _restore_stage.Clear();
+        _has_restore_stage = false;
+    }
+
     void set_compaction_policy(std::string compaction_policy) {
         _compaction_policy = compaction_policy;
     }
@@ -357,6 +370,10 @@ private:
 
     // binlog config
     BinlogConfig _binlog_config {};
+
+    // the evidence of the restore job which loaded the data, see has_restore_stage()
+    RestoreStagePB _restore_stage;
+    bool _has_restore_stage = false;
 
     // meta for compaction
     std::string _compaction_policy;

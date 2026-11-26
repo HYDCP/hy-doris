@@ -307,6 +307,8 @@ DECLARE_mInt32(download_low_speed_time);
 DECLARE_mBool(enable_batch_download);
 // whether to check md5sum when download
 DECLARE_mBool(enable_download_md5sum_check);
+// how long (seconds) the snapshot of the local source of a tablet lives in the snapshot dir, see config.cpp
+DECLARE_mInt32(restore_local_source_snapshot_timeout_s);
 // download binlog meta timeout
 DECLARE_mInt32(download_binlog_meta_timeout_ms);
 // the interval time(seconds) for agent report index policy to FE
