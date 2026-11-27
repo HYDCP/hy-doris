@@ -75,6 +75,9 @@ public:
 
     virtual Status close() { return Status::OK(); }
 
+    // JNI readers can perform storage reads outside the native FileReader hierarchy.
+    virtual int64_t take_remote_read_bytes() { return 0; }
+
     /// The reader is responsible for counting the number of rows read,
     /// because some readers, such as parquet/orc,
     /// can skip some pages/rowgroups through indexes.

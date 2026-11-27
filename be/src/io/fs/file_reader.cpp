@@ -22,6 +22,7 @@
 
 #include "io/cache/cached_remote_file_reader.h"
 #include "io/fs/file_system.h"
+#include "io/io_common.h"
 #include "util/async_io.h"
 
 namespace doris::io {
@@ -31,9 +32,14 @@ const std::string FileReader::VIRTUAL_REMOTE_DATA_DIR = "virtual_remote_data_dir
 Status FileReader::read_at(size_t offset, Slice result, size_t* bytes_read,
                            const IOContext* io_ctx) {
     DCHECK(bthread_self() == 0);
+    auto remote_bytes = io_ctx && io_ctx->remote_scan_bytes && reads_remote_storage()
+                                ? io_ctx->remote_scan_bytes
+                                : nullptr;
     Status st = read_at_impl(offset, result, bytes_read, io_ctx);
     if (!st) {
         LOG(WARNING) << st;
+    } else if (remote_bytes) {
+        remote_bytes->fetch_add(*bytes_read, std::memory_order_relaxed);
     }
     return st;
 }

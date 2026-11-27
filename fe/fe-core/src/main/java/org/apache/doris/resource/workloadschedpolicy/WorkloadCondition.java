@@ -38,7 +38,7 @@ public interface WorkloadCondition {
         } else if (WorkloadMetricType.BE_SCAN_BYTES.equals(cm.metricName)) {
             return WorkloadConditionBeScanBytes.createWorkloadCondition(cm.op, cm.value);
         } else if (WorkloadMetricType.BE_SCAN_BYTES_FROM_REMOTE_STORAGE.equals(cm.metricName)) {
-            return WorkloadConditionBeScanBytesFromRemoteStorage.createWorkloadCondition(cm.value);
+            return WorkloadConditionBeScanBytesFromRemoteStorage.createWorkloadCondition(cm);
         } else if (WorkloadMetricType.QUERY_BE_MEMORY_BYTES.equals(cm.metricName)) {
             return WorkloadConditionQueryBeMemory.createWorkloadCondition(cm.op, cm.value);
         }

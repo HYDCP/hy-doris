@@ -29,7 +29,7 @@ import org.junit.jupiter.api.Test;
 class WorkloadRemoteScanBytesTest {
     @Test
     void remoteConditionSurvivesReplayAndPublication() throws Exception {
-        WorkloadConditionMeta condition = new WorkloadConditionMeta("be_scan_bytes_from_remote_storage", ">", "1");
+        WorkloadConditionMeta condition = new WorkloadConditionMeta("be_scan_bytes_from_remote_storage", ">", "+1２");
         WorkloadActionMeta action = new WorkloadActionMeta("cancel_query", "");
         WorkloadSchedPolicy policy = new WorkloadSchedPolicy(1L, "remote_scan_policy",
                 ImmutableList.of(WorkloadCondition.createWorkloadCondition(condition)),
@@ -37,7 +37,12 @@ class WorkloadRemoteScanBytesTest {
         policy.setConditionMeta(ImmutableList.of(condition));
         policy.setActionMeta(ImmutableList.of(action));
 
+        Assertions.assertEquals("12", condition.value);
+        Assertions.assertEquals("12", policy.toTopicInfo().getWorkloadSchedPolicy().getConditionList().get(0).value);
+        // Simulate metadata written by an FE that stored the original spelling.
+        condition.value = "+１2";
         WorkloadSchedPolicy replayed = GsonUtils.GSON.fromJson(GsonUtils.GSON.toJson(policy), WorkloadSchedPolicy.class);
+        Assertions.assertEquals("12", replayed.toTopicInfo().getWorkloadSchedPolicy().getConditionList().get(0).value);
         Assertions.assertEquals(TWorkloadMetricType.BE_SCAN_BYTES_FROM_REMOTE_STORAGE,
                 replayed.toTopicInfo().getWorkloadSchedPolicy().getConditionList().get(0).getMetricName());
     }

@@ -17,6 +17,8 @@
 
 #include "runtime/workload_management/workload_condition.h"
 
+#include <charconv>
+
 namespace doris {
 
 // query time
@@ -45,9 +47,25 @@ bool WorkloadConditionScanRows::eval(std::string str_val) {
 
 // scan bytes
 WorkloadConditionScanBytes::WorkloadConditionScanBytes(WorkloadCompareOperator op,
-                                                       std::string str_val,
+                                                       int64_t threshold,
                                                        WorkloadMetricType metric_type)
-        : _metric_type(metric_type), _scan_bytes(std::stol(str_val)), _op(op) {}
+        : _metric_type(metric_type), _scan_bytes(threshold), _op(op) {}
+
+std::unique_ptr<WorkloadCondition> WorkloadConditionScanBytes::create_remote(
+        WorkloadCompareOperator op, const std::string& value) {
+    uint64_t threshold;
+    const char* end = value.data() + value.size();
+    const bool negative = value.starts_with('-');
+    const char* begin = value.data() + (negative || value.starts_with('+'));
+    auto [pos, error] = std::from_chars(begin, end, threshold);
+    if (error != std::errc() || pos != end || threshold > INT64_MAX ||
+        (negative && threshold != 0)) {
+        LOG(WARNING) << "Invalid remote scan byte threshold: " << value;
+        return nullptr;
+    }
+    return std::make_unique<WorkloadConditionScanBytes>(op, threshold,
+                                                        SCAN_BYTES_FROM_REMOTE_STORAGE);
+}
 
 // todo(wb): need handle invalid input value
 bool WorkloadConditionScanBytes::eval(std::string str_val) {

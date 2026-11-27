@@ -170,6 +170,9 @@ Status JniConnector::get_table_schema(std::string& table_schema_str) {
 
 Status JniConnector::get_statistics(JNIEnv* env, std::map<std::string, std::string>* result) {
     result->clear();
+    if (!_scanner_opened || _closed) {
+        return Status::OK();
+    }
     jobject metrics = env->CallObjectMethod(_jni_scanner_obj, _jni_scanner_get_statistics);
     jthrowable exc = (env)->ExceptionOccurred();
     if (exc != nullptr) {

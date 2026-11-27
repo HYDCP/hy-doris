@@ -97,6 +97,8 @@ protected:
     void _collect_profile_before_close() override;
 
     bool _should_update_load_counters() const override;
+    Status _close_reader();
+    void _update_remote_scan_bytes(int64_t reader_bytes);
 
     // fe will add skip_bitmap_col to _input_tuple_desc iff the target olaptable has skip_bitmap_col
     // and the current load is a flexible partial update
@@ -171,7 +173,6 @@ protected:
     Block _runtime_filter_partition_prune_block;
 
     std::unique_ptr<io::FileCacheStatistics> _file_cache_statistics;
-    int64_t _reported_peer_cache_bytes = 0;
     std::unique_ptr<io::FileReaderStats> _file_reader_stats;
     std::unique_ptr<io::IOContext> _io_ctx;
 

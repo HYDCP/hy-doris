@@ -31,13 +31,15 @@ public class WorkloadConditionBeScanBytesFromRemoteStorage implements WorkloadCo
     }
 
     public static WorkloadConditionBeScanBytesFromRemoteStorage createWorkloadCondition(
-            String value) throws UserException {
+            WorkloadConditionMeta condition) throws UserException {
         try {
-            if (Long.parseLong(value) < 0) {
+            long threshold = Long.parseLong(condition.value);
+            if (threshold < 0) {
                 throw new NumberFormatException();
             }
+            condition.value = Long.toString(threshold);
         } catch (NumberFormatException e) {
-            throw new UserException("invalid remote scan bytes value: " + value + ", it requires >= 0");
+            throw new UserException("invalid remote scan bytes value: " + condition.value + ", it requires >= 0");
         }
         return new WorkloadConditionBeScanBytesFromRemoteStorage();
     }

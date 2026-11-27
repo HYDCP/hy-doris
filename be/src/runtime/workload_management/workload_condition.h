@@ -69,8 +69,10 @@ private:
 
 class WorkloadConditionScanBytes : public WorkloadCondition {
 public:
-    WorkloadConditionScanBytes(WorkloadCompareOperator op, std::string str_val,
+    WorkloadConditionScanBytes(WorkloadCompareOperator op, int64_t threshold,
                                WorkloadMetricType metric_type = WorkloadMetricType::SCAN_BYTES);
+    static std::unique_ptr<WorkloadCondition> create_remote(WorkloadCompareOperator op,
+                                                            const std::string& value);
     bool eval(std::string str_val) override;
     WorkloadMetricType get_workload_metric_type() override { return _metric_type; }
 
@@ -106,10 +108,9 @@ public:
         } else if (TWorkloadMetricType::type::BE_SCAN_ROWS == metric_name) {
             return std::make_unique<WorkloadConditionScanRows>(op, str_val);
         } else if (TWorkloadMetricType::type::BE_SCAN_BYTES == metric_name) {
-            return std::make_unique<WorkloadConditionScanBytes>(op, str_val);
+            return std::make_unique<WorkloadConditionScanBytes>(op, std::stol(str_val));
         } else if (TWorkloadMetricType::type::BE_SCAN_BYTES_FROM_REMOTE_STORAGE == metric_name) {
-            return std::make_unique<WorkloadConditionScanBytes>(
-                    op, str_val, WorkloadMetricType::SCAN_BYTES_FROM_REMOTE_STORAGE);
+            return WorkloadConditionScanBytes::create_remote(op, str_val);
         } else if (TWorkloadMetricType::type::QUERY_BE_MEMORY_BYTES == metric_name) {
             return std::make_unique<WorkloadConditionQueryMemory>(op, str_val);
         }

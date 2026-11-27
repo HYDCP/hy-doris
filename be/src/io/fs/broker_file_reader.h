@@ -51,6 +51,7 @@ public:
     bool closed() const override { return _closed.load(std::memory_order_acquire); }
 
 protected:
+    bool reads_remote_storage() const override { return true; }
     Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
                         const IOContext* io_ctx) override;
 

@@ -74,7 +74,6 @@
 #include "vec/exec/format/table/trino_connector_jni_reader.h"
 #include "vec/exec/format/text/text_reader.h"
 #include "vec/exec/format/wal/wal_reader.h"
-#include "vec/exec/scan/file_scan_io_statistics.h"
 #include "vec/exec/scan/vscan_node.h"
 #include "vec/exprs/vexpr.h"
 #include "vec/exprs/vexpr_context.h"
@@ -166,6 +165,7 @@ Status VFileScanner::prepare(RuntimeState* state, const VExprContextSPtrs& conju
     _io_ctx.reset(new io::IOContext());
     _io_ctx->file_cache_stats = _file_cache_statistics.get();
     _io_ctx->file_reader_stats = _file_reader_stats.get();
+    _io_ctx->remote_scan_bytes = std::make_shared<std::atomic<int64_t>>(0);
 
     if (_is_load) {
         _src_row_desc.reset(new RowDescriptor(_state->desc_tbl(),
@@ -903,10 +903,9 @@ Status VFileScanner::_get_next_reader() {
     while (true) {
         if (_cur_reader) {
             _cur_reader->collect_profile_before_close();
-            RETURN_IF_ERROR(_cur_reader->close());
+            RETURN_IF_ERROR(_close_reader());
             _state->update_num_finished_scan_range(1);
         }
-        _cur_reader.reset(nullptr);
         _src_block_init = false;
         bool has_next = _first_scan_range;
         if (!_first_scan_range) {
@@ -1579,9 +1578,8 @@ Status VFileScanner::close(RuntimeState* state) {
     }
 
     if (_cur_reader) {
-        RETURN_IF_ERROR(_cur_reader->close());
+        RETURN_IF_ERROR(_close_reader());
     }
-
     RETURN_IF_ERROR(VScanner::close(state));
     return Status::OK();
 }
@@ -1591,6 +1589,26 @@ void VFileScanner::try_stop() {
     if (_io_ctx) {
         _io_ctx->should_stop = true;
     }
+}
+
+Status VFileScanner::_close_reader() {
+    auto reader_bytes = _cur_reader->take_remote_read_bytes();
+    auto status = _cur_reader->close();
+    _cur_reader.reset();
+    _update_remote_scan_bytes(reader_bytes);
+    return status;
+}
+
+void VFileScanner::_update_remote_scan_bytes(int64_t reader_bytes) {
+    int64_t bytes =
+            reader_bytes + _io_ctx->remote_scan_bytes->exchange(0, std::memory_order_relaxed);
+    if (bytes == 0) {
+        return;
+    }
+    if (_query_statistics) {
+        _query_statistics->add_scan_bytes_from_remote_storage(bytes);
+    }
+    DorisMetrics::instance()->query_scan_bytes_from_remote->increment(bytes);
 }
 
 void VFileScanner::update_realtime_counters() {
@@ -1605,19 +1623,14 @@ void VFileScanner::update_realtime_counters() {
         _query_statistics->add_scan_bytes(_file_reader_stats->read_bytes);
     }
 
-    // Peer bytes are cumulative for the scanner profile. Only classify the new reads here.
-    const auto peer_cache_bytes =
-            _file_cache_statistics->bytes_read_from_peer - _reported_peer_cache_bytes;
-    _reported_peer_cache_bytes = _file_cache_statistics->bytes_read_from_peer;
-    const auto scan_bytes = classify_file_scan_bytes(file_type_for_range(_current_range, *_params),
-                                                     _file_reader_stats->read_bytes,
-                                                     *_file_cache_statistics, peer_cache_bytes);
+    int64_t local_bytes = file_type_for_range(_current_range, *_params) == TFileType::FILE_LOCAL
+                                  ? _file_reader_stats->read_bytes
+                                  : _file_cache_statistics->bytes_read_from_local;
     if (_query_statistics) {
-        _query_statistics->add_scan_bytes_from_local_storage(scan_bytes.local);
-        _query_statistics->add_scan_bytes_from_remote_storage(scan_bytes.remote);
+        _query_statistics->add_scan_bytes_from_local_storage(local_bytes);
     }
-    DorisMetrics::instance()->query_scan_bytes_from_local->increment(scan_bytes.local);
-    DorisMetrics::instance()->query_scan_bytes_from_remote->increment(scan_bytes.remote);
+    DorisMetrics::instance()->query_scan_bytes_from_local->increment(local_bytes);
+    _update_remote_scan_bytes(_cur_reader ? _cur_reader->take_remote_read_bytes() : 0);
 
     COUNTER_UPDATE(_file_read_bytes_counter, _file_reader_stats->read_bytes);
 

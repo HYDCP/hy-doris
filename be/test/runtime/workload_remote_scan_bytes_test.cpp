@@ -18,7 +18,6 @@
 #include <gtest/gtest.h>
 
 #include "runtime/workload_management/workload_sched_policy.h"
-#include "vec/exec/scan/file_scan_io_statistics.h"
 
 namespace doris {
 
@@ -41,22 +40,25 @@ TEST(WorkloadRemoteScanBytesTest, IgnoresTotalBytesForRemoteThreshold) {
     EXPECT_FALSE(policy.is_match(&query));
     query.metric_map[SCAN_BYTES_FROM_REMOTE_STORAGE] = "101";
     EXPECT_TRUE(policy.is_match(&query));
+}
 
-    auto matches_scan = [&](TFileType::type file_type, const io::FileCacheStatistics& cache,
-                            int64_t peer_cache_bytes = 0) {
-        const auto bytes =
-                vectorized::classify_file_scan_bytes(file_type, 1000, cache, peer_cache_bytes);
-        query.metric_map[SCAN_BYTES_FROM_REMOTE_STORAGE] = std::to_string(bytes.remote);
-        return policy.is_match(&query);
-    };
-    EXPECT_FALSE(matches_scan(TFileType::FILE_LOCAL, {}));
-    EXPECT_FALSE(matches_scan(TFileType::FILE_STREAM, {}));
-    EXPECT_TRUE(matches_scan(TFileType::FILE_HDFS, {}));
-    EXPECT_TRUE(matches_scan(TFileType::FILE_S3, {.bytes_read_from_remote = 101}));
-    EXPECT_FALSE(matches_scan(TFileType::FILE_S3, {.bytes_read_from_local = 1000}));
-    const io::FileCacheStatistics prior_peer_reads {.bytes_read_from_peer = 1000};
-    EXPECT_FALSE(matches_scan(TFileType::FILE_S3, prior_peer_reads, 1000));
-    EXPECT_TRUE(matches_scan(TFileType::FILE_S3, prior_peer_reads, 0));
+TEST(WorkloadRemoteScanBytesTest, InvalidThresholdDoesNotInterruptSubsequentConditions) {
+    TWorkloadCondition condition;
+    condition.__set_metric_name(TWorkloadMetricType::BE_SCAN_BYTES_FROM_REMOTE_STORAGE);
+    condition.__set_op(TCompareOperator::EQUAL);
+    for (const auto* value : {"1２", "２", "+-0", "-1", "", "+", "9223372036854775808"}) {
+        condition.__set_value(value);
+        EXPECT_EQ(nullptr, WorkloadConditionFactory::create_workload_condition(&condition))
+                << value;
+    }
+    condition.__set_value("+12");
+    auto parsed = WorkloadConditionFactory::create_workload_condition(&condition);
+    ASSERT_NE(nullptr, parsed);
+    EXPECT_TRUE(parsed->eval("12"));
+    condition.__set_value("-00");
+    parsed = WorkloadConditionFactory::create_workload_condition(&condition);
+    ASSERT_NE(nullptr, parsed);
+    EXPECT_TRUE(parsed->eval("0"));
 }
 
 } // namespace doris

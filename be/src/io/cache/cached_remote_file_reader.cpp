@@ -524,7 +524,7 @@ Status CachedRemoteFileReader::read_at_impl(size_t offset, Slice result, size_t*
                 SCOPED_RAW_TIMER(&stats.remote_read_timer);
                 RETURN_IF_ERROR(_remote_file_reader->read_at(
                         current_offset, Slice(result.data + (current_offset - offset), read_size),
-                        &bytes_read));
+                        &bytes_read, io_ctx));
                 indirect_read_bytes += read_size;
                 DCHECK(bytes_read == read_size);
             }
