@@ -38,3 +38,20 @@ suite("test_temp_table_explicit_drop", "p0") {
     sql "DROP TEMPORARY TABLE test_temp_table_explicit_drop"
     assertEquals([[1]], sql("SELECT id FROM test_temp_table_explicit_drop ORDER BY id"))
 }
+
+suite("test_drop_view_with_shadowing_temporary_table", "p0") {
+    sql "DROP VIEW IF EXISTS temporary_table_shadowed_view"
+    sql "CREATE VIEW temporary_table_shadowed_view AS SELECT 11 AS id"
+    sql """
+        CREATE TEMPORARY TABLE temporary_table_shadowed_view (id INT)
+        DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ("replication_num" = "1")
+    """
+    sql "INSERT INTO temporary_table_shadowed_view VALUES (29)"
+
+    sql "DROP VIEW temporary_table_shadowed_view"
+    assertEquals([[29]], sql("SELECT id FROM temporary_table_shadowed_view ORDER BY id"))
+    test {
+        sql "DROP VIEW temporary_table_shadowed_view"
+        exception "Unknown table"
+    }
+}

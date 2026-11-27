@@ -904,7 +904,14 @@ public class InternalCatalog implements CatalogIf<Database> {
         watch.split();
         costTimes.put("1:dbWriteLock", watch.getSplitTime());
         try {
-            Table table = mustTemporary ? db.getTemporaryTableNullable(tableName) : db.getTableNullable(tableName);
+            Table table;
+            if (mustTemporary) {
+                table = db.getTemporaryTableNullable(tableName);
+            } else if (isView || isMtmv) {
+                table = db.getNonTempTableNullable(tableName);
+            } else {
+                table = db.getTableNullable(tableName);
+            }
             if (table != null && table.isTemporary()) {
                 ConnectContext context = ConnectContext.get();
                 // Preserve administrator cleanup by internal name. Other sessions may only drop their own tables.

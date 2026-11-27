@@ -556,9 +556,17 @@ public class InsertUtils {
         return getTargetDbAndTable(plan, ctx).second;
     }
 
+    static TableIf getTargetTable(Plan plan, List<String> qualifier, ConnectContext ctx) {
+        return getTargetDbAndTable(plan, qualifier, ctx).second;
+    }
+
     /** Resolve a CTAS sink by its created table ID, or a regular INSERT sink by name. */
     public static Pair<DatabaseIf<?>, TableIf> getTargetDbAndTable(Plan plan, ConnectContext ctx) {
-        List<String> qualifier = getTargetTableQualified(plan, ctx);
+        return getTargetDbAndTable(plan, getTargetTableQualified(plan, ctx), ctx);
+    }
+
+    private static Pair<DatabaseIf<?>, TableIf> getTargetDbAndTable(
+            Plan plan, List<String> qualifier, ConnectContext ctx) {
         if (plan instanceof UnboundTableSink) {
             Optional<Long> tableId = ((UnboundTableSink<?>) plan).getTargetTableId();
             if (tableId.isPresent()) {
