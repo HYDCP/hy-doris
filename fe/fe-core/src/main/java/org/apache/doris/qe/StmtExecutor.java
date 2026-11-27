@@ -638,6 +638,10 @@ public class StmtExecutor {
     }
 
     public void execute(TUniqueId queryId) throws Exception {
+        if (context.getConnectType() != ConnectType.MYSQL) {
+            executeStatement(queryId);
+            return;
+        }
         context.beginStatementExecution();
         try {
             executeStatement(queryId);

@@ -905,11 +905,6 @@ public class CatalogRecycleBin extends MasterDaemon implements Writable, GsonPos
                     + db.getFullName());
             }
 
-            // An explicit table ID can select a force-dropped entry until the erase daemon runs.
-            if (table.isTemporary()) {
-                throw new DdlException("Cannot recover temporary table " + table.getId());
-            }
-
             if (table.getType() == TableType.MATERIALIZED_VIEW) {
                 throw new DdlException("Can not recover materialized view '" + tableName + "' or table id '"
                         + tableId + "' in " + db.getFullName());

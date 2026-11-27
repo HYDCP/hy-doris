@@ -131,7 +131,7 @@ class ConnectContextTempTableTest {
             {
                 transaction.isTxnModel();
                 result = true;
-                transaction.abortTransaction();
+                transaction.abortTransactionForTemporaryTableReset();
                 result = new DdlException("injected rollback failure");
             }
         };

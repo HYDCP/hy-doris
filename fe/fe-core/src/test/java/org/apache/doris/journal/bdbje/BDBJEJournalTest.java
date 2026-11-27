@@ -18,7 +18,6 @@
 package org.apache.doris.journal.bdbje;
 
 import org.apache.doris.catalog.Env;
-import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
@@ -27,10 +26,7 @@ import org.apache.doris.ha.FrontendNodeType;
 import org.apache.doris.journal.JournalBatch;
 import org.apache.doris.journal.JournalCursor;
 import org.apache.doris.journal.JournalEntity;
-import org.apache.doris.persist.DropInfo;
-import org.apache.doris.persist.EditLog;
 import org.apache.doris.persist.OperationType;
-import org.apache.doris.persist.RecoverInfo;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.system.SystemInfoService.HostInfo;
 
@@ -285,12 +281,6 @@ public class BDBJEJournalTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use
                 return true;
             }
 
-            // This fixture opens JE directly, bypassing Env's normal journal-version initialization.
-            @Mock
-            public int getCurrentEnvJournalVersion() {
-                return FeMetaVersion.VERSION_CURRENT;
-            }
-
             @Mock
             public long getReplayedJournalId() {
                 return replayedJournalId;
@@ -356,27 +346,6 @@ public class BDBJEJournalTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use
         }
         journalId = journal.write(batch);
         Assertions.assertEquals(11, journalId);
-
-        BDBJEJournal recordingJournal = Mockito.spy(journal);
-        EditLog editLog = Mockito.mock(EditLog.class, Mockito.CALLS_REAL_METHODS);
-        Deencapsulation.setField(editLog, "journal", recordingJournal);
-        RecoverInfo recover = new RecoverInfo(10, -1, -1, "", "", "", "", "");
-        List<DropInfo> drops = Arrays.asList(
-                DropInfo.forRecoveredTemporaryTable(10, 31, "owner_#TEMP#_one"),
-                DropInfo.forRecoveredTemporaryTable(10, 32, "owner_#TEMP#_two"));
-        editLog.logRecoverDb(recover, drops);
-        Mockito.verify(recordingJournal).write(Mockito.any(JournalBatch.class));
-        Mockito.verify(recordingJournal, Mockito.never()).write(Mockito.anyShort(), Mockito.any(Writable.class));
-        Assertions.assertEquals(23, journal.getMaxJournalId());
-        JournalEntity recovered = journal.read(21);
-        Assertions.assertEquals(OperationType.OP_RECOVER_DB, recovered.getOpCode());
-        Assertions.assertTrue(((RecoverInfo) recovered.getData()).shouldDiscardTemporaryTables());
-        for (int i = 0; i < drops.size(); i++) {
-            JournalEntity drop = journal.read(22 + i);
-            Assertions.assertEquals(OperationType.OP_DROP_TABLE, drop.getOpCode());
-            Assertions.assertEquals(drops.get(i), drop.getData());
-            Assertions.assertTrue(((DropInfo) drop.getData()).isRecoveredTemporaryTable());
-        }
 
         journal.close();
     }

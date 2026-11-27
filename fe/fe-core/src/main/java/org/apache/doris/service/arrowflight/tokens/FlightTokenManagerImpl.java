@@ -77,7 +77,8 @@ public class FlightTokenManagerImpl implements FlightTokenManager {
                         ConnectContext context = ExecuteEnv.getInstance().getScheduler().getFlightSqlConnectPoolMgr()
                                 .getContextWithFlightToken(token);
                         if (context != null) {
-                            context.kill(true);
+                            ExecuteEnv.getInstance().getScheduler().getFlightSqlConnectPoolMgr()
+                                    .unregisterConnection(context);
                             LOG.info("evict bearer token: " + token + " from tokenCache, reason: "
                                     + notification.getCause()
                                     + ", and unregister flight connection context after evict bearer token");

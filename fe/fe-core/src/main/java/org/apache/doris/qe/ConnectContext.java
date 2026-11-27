@@ -911,10 +911,13 @@ public class ConnectContext {
     }
 
     public void resetTemporaryTables() throws DdlException {
+        if (!hasPendingTemporaryTables()) {
+            return;
+        }
         TransactionEntry transaction = txnEntry;
         if (transaction != null && transaction.isTxnModel()) {
             try {
-                transaction.abortTransaction();
+                transaction.abortTransactionForTemporaryTableReset();
             } catch (Exception e) {
                 throw new DdlException("Failed to roll back transaction " + transaction.getTransactionId(), e);
             }
@@ -924,6 +927,10 @@ public class ConnectContext {
         // A legacy FE can still recover a recycled database with the old owner's tables.
         // Alive-session reporting reads this ID directly from the connection registry.
         sessionId = UUID.randomUUID().toString();
+    }
+
+    private synchronized boolean hasPendingTemporaryTables() {
+        return !temporaryTableIdsToDbIds.isEmpty() || !unresolvedTemporaryTables.isEmpty();
     }
 
     protected void deleteTempTable() {

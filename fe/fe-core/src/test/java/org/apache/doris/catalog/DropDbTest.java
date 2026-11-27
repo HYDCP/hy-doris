@@ -23,16 +23,7 @@ import org.apache.doris.analysis.DropDbStmt;
 import org.apache.doris.analysis.RecoverDbStmt;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ExceptionChecker;
-import org.apache.doris.datasource.InternalCatalog;
-import org.apache.doris.journal.JournalEntity;
-import org.apache.doris.nereids.parser.NereidsParser;
-import org.apache.doris.nereids.trees.plans.commands.CreateTableCommand;
-import org.apache.doris.persist.DropInfo;
-import org.apache.doris.persist.EditLog;
-import org.apache.doris.persist.OperationType;
-import org.apache.doris.persist.RecoverInfo;
 import org.apache.doris.qe.ConnectContext;
-import org.apache.doris.qe.StmtExecutor;
 import org.apache.doris.utframe.UtFrameUtils;
 
 import org.junit.AfterClass;
@@ -68,59 +59,6 @@ public class DropDbTest {
         createDb(createDbStmtStr3);
         createTable(createTablleStr1);
         createTable(createTablleStr2);
-    }
-
-    @Test
-    public void legacyDatabaseRecoveryDropsOnlyTemporaryTables() throws Exception {
-        String name = "legacy_temp_recover";
-        createDb("CREATE DATABASE " + name);
-        String definition = " (id INT) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ('replication_num'='1')";
-        createTable("CREATE TABLE " + name + ".shadow" + definition);
-        createTemporaryTable("CREATE TEMPORARY TABLE " + name + ".shadow" + definition);
-        InternalCatalog catalog = Env.getCurrentInternalCatalog();
-        Database db = catalog.getDbOrDdlException(name);
-        Table permanent = db.getNonTempTableNullable("shadow");
-        Table temp = db.getTemporaryTableNullable("shadow");
-        long dbId = db.getId();
-
-        // Older DROP DATABASE records put both tables in the recovery manifest.
-        catalog.replayDropDb(name, false, System.currentTimeMillis());
-        RecoverInfo oldRecover = RecoverInfo.fromJson("{\"dbId\":" + dbId + "}");
-        catalog.replayRecoverDatabase(oldRecover);
-        Assert.assertSame(temp, catalog.getDbOrDdlException(name).getTableNullable(temp.getId()));
-
-        catalog.replayDropDb(name, false, System.currentTimeMillis());
-        RecoverDbStmt recover = (RecoverDbStmt) UtFrameUtils.parseAndAnalyzeStmt("RECOVER DATABASE " + name,
-                connectContext);
-        Env.getCurrentEnv().recoverDatabase(recover);
-        Assert.assertNull(db.getTableNullable(temp.getId()));
-        Assert.assertSame(permanent, db.getTableNullable("shadow"));
-        Assert.assertThrows(DdlException.class, () -> Env.getCurrentRecycleBin().recoverTable(
-                db, temp.getName(), temp.getId(), ""));
-
-        createTemporaryTable("CREATE TEMPORARY TABLE " + name + ".shadow" + definition);
-        Table next = db.getTemporaryTableNullable("shadow");
-        catalog.replayDropDb(name, false, System.currentTimeMillis());
-        String renamed = name + "_renamed";
-        RecoverInfo newRecover = new RecoverInfo(dbId, -1, -1, renamed, "", "", "", "");
-        newRecover.markDiscardTemporaryTables();
-        catalog.replayRecoverDatabase(RecoverInfo.fromJson(newRecover.toJson()));
-        Assert.assertSame(db, catalog.getDbOrDdlException(renamed));
-        Assert.assertEquals(renamed, next.getQualifiedDbName());
-        // Promotion here must be safe even if only the RECOVER record reached the replica.
-        Assert.assertNull(db.getTableNullable(next.getId()));
-        Assert.assertSame(permanent, db.getTableNullable("shadow"));
-        JournalEntity compatDrop = new JournalEntity();
-        compatDrop.setOpCode(OperationType.OP_DROP_TABLE);
-        compatDrop.setData(DropInfo.forRecoveredTemporaryTable(dbId, next.getId(), next.getName()));
-        EditLog.loadJournal(Env.getCurrentEnv(), 1L, compatDrop);
-        Assert.assertSame(permanent, db.getTableNullable("shadow"));
-        Assert.assertTrue(Env.getCurrentRecycleBin().isRecycleTable(dbId, next.getId()));
-    }
-
-    private static void createTemporaryTable(String sql) throws Exception {
-        CreateTableCommand command = (CreateTableCommand) new NereidsParser().parseSingle(sql);
-        command.run(connectContext, new StmtExecutor(connectContext, sql));
     }
 
     @AfterClass

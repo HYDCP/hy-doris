@@ -25,9 +25,13 @@ import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.mysql.MysqlHandshakePacket;
 import org.apache.doris.mysql.privilege.Auth;
 import org.apache.doris.qe.QueryState.MysqlStateType;
+import org.apache.doris.transaction.TransactionEntry;
+import org.apache.doris.transaction.TransactionNotFoundException;
 
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
@@ -44,6 +48,52 @@ class ChangeUserTemporaryTableTest {
         MysqlConnectProcessor processor = new MysqlConnectProcessor(ctx);
         Deencapsulation.setField(processor, "packetBuf", payload);
         Deencapsulation.invoke(processor, "handleChangeUser");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void ordinaryConnectionsResetTwiceWithoutTouchingTransaction(boolean timedOut) throws Exception {
+        Env env = Mockito.mock(Env.class, Mockito.RETURNS_DEEP_STUBS);
+        UserIdentity user = UserIdentity.createAnalyzedUserIdentWithIp("pool_user", "%");
+        try (MockedStatic<Env> mocked = Mockito.mockStatic(Env.class)) {
+            mocked.when(Env::getCurrentEnv).thenReturn(env);
+            ConnectContext ctx = Mockito.spy(new ConnectContext());
+            ctx.setEnv(env);
+            ctx.setCurrentUserIdentity(user);
+            ctx.setQualifiedUser(user.getQualifiedUser());
+            ctx.setRemoteIP("localhost");
+            Mockito.doReturn(new byte[20]).when(ctx).getAuthPluginData();
+            Auth auth = env.getAuth();
+            Mockito.doAnswer(call -> {
+                call.<List<UserIdentity>>getArgument(4).add(user);
+                return null;
+            }).when(auth).checkPassword(Mockito.eq("pool_user"), Mockito.anyString(),
+                    Mockito.any(byte[].class), Mockito.any(byte[].class), Mockito.anyList());
+
+            TransactionEntry transaction = Mockito.mock(TransactionEntry.class);
+            Mockito.when(transaction.isTxnModel()).thenReturn(true);
+            if (timedOut) {
+                TransactionNotFoundException error = new TransactionNotFoundException("transaction timed out", 11L);
+                Mockito.when(transaction.abortTransaction()).thenThrow(error);
+                Mockito.when(transaction.abortTransactionForTemporaryTableReset()).thenThrow(error);
+            }
+            ctx.setTxnEntry(transaction);
+            String sessionId = ctx.getSessionId();
+            MysqlConnectProcessor processor = new MysqlConnectProcessor(ctx);
+            for (int reset = 0; reset < 2; reset++) {
+                processor.handleResetConnection();
+                Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
+                Assertions.assertSame(transaction, ctx.getTxnEntry());
+                Assertions.assertEquals(sessionId, ctx.getSessionId());
+            }
+            for (int reset = 0; reset < 2; reset++) {
+                changeUser(ctx, "pool_user");
+                Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
+                Assertions.assertSame(transaction, ctx.getTxnEntry());
+                Assertions.assertEquals(sessionId, ctx.getSessionId());
+            }
+            Mockito.verifyNoInteractions(transaction);
+        }
     }
 
     @Test

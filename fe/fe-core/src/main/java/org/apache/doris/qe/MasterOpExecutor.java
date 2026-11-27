@@ -137,7 +137,8 @@ public class MasterOpExecutor extends FEOpExecutor {
     @Override
     protected TMasterOpRequest buildStmtForwardParams() throws AnalysisException {
         TMasterOpRequest params = super.buildStmtForwardParams();
-        if (trackTemporaryTableCreation && ctx.getConnectScheduler() != null) {
+        if (trackTemporaryTableCreation && ctx.getConnectType() == ConnectContext.ConnectType.MYSQL
+                && ctx.getConnectScheduler() != null) {
             params.setTempTableOriginConnectionId(ctx.getConnectionId());
         }
         return params;

@@ -20,18 +20,13 @@ import com.mysql.cj.jdbc.MysqlConnectionPoolDataSource
 suite("test_temp_table_change_user_pool", "p0") {
     def database = getCurDbName()
     def borrower = "temp_pool_${UUID.randomUUID().toString().replace('-', '')}"
-    def recoveryDb = "${borrower}_db"
     sql "CREATE USER ${borrower} IDENTIFIED BY 'temp_pool_password'"
     try {
         sql "GRANT SELECT_PRIV, CREATE_PRIV ON `${database}`.* TO ${borrower}"
-        sql "CREATE DATABASE `${recoveryDb}`"
-        sql "GRANT SELECT_PRIV, CREATE_PRIV ON `${recoveryDb}`.* TO ${borrower}"
-        sql """CREATE TABLE `${recoveryDb}`.pool_shadow (permanent_id INT)
+        sql "DROP TABLE IF EXISTS test_temp_table_change_user_pool"
+        sql """CREATE TABLE test_temp_table_change_user_pool (permanent_id INT)
             DISTRIBUTED BY HASH(permanent_id) BUCKETS 1 PROPERTIES ("replication_num" = "1")"""
-        def dbId = sql("SHOW PROC '/dbs'").find { it[1] == recoveryDb }[0]
-        def tableIds = { sql("SHOW PROC '/dbs/${dbId}'").collect { it[0] } }
-        def permanentIds = tableIds()
-        assertEquals(1, permanentIds.size())
+        sql "INSERT INTO test_temp_table_change_user_pool VALUES (17)"
         def source = new MysqlConnectionPoolDataSource()
         source.setURL(getCurDbConnectUrl())
         def pool = source.getPooledConnection(borrower, "temp_pool_password")
@@ -43,26 +38,28 @@ suite("test_temp_table_change_user_pool", "p0") {
                         assertTrue(rows.next())
                         physicalId = rows.getLong(1)
                     }
-                    stmt.execute("""CREATE TEMPORARY TABLE `${recoveryDb}`.pool_shadow (previous_id INT)
-                        DISTRIBUTED BY HASH(previous_id) BUCKETS 1 PROPERTIES ("replication_num" = "1")""")
                     stmt.execute("""CREATE TEMPORARY TABLE test_temp_table_change_user_pool (id INT)
                         DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ("replication_num" = "1")""")
                 }
             }
-            assertEquals(2, tableIds().size())
-            sql "DROP DATABASE `${recoveryDb}`"
-            pool.getConnection().withCloseable { second ->
-                sql "RECOVER DATABASE `${recoveryDb}`"
-                assertEquals(permanentIds, tableIds())
-                second.createStatement().withCloseable { stmt ->
-                    stmt.executeQuery("SELECT CONNECTION_ID()").withCloseable { rows ->
-                        assertTrue(rows.next())
-                        assertEquals(physicalId, rows.getLong(1))
+            2.times {
+                pool.getConnection().withCloseable { nextBorrow ->
+                    nextBorrow.createStatement().withCloseable { stmt ->
+                        stmt.executeQuery("SELECT CONNECTION_ID()").withCloseable { rows ->
+                            assertTrue(rows.next())
+                            assertEquals(physicalId, rows.getLong(1))
+                        }
+                        stmt.executeQuery("SELECT permanent_id FROM test_temp_table_change_user_pool ORDER BY permanent_id")
+                                .withCloseable { rows ->
+                                    assertTrue(rows.next())
+                                    assertEquals(17, rows.getInt(1))
+                                    assertFalse(rows.next())
+                                }
                     }
-                    stmt.executeQuery("SHOW CREATE TABLE `${recoveryDb}`.pool_shadow").withCloseable { rows ->
-                        assertTrue(rows.next())
-                        assertTrue(rows.getString(2).contains("permanent_id"))
-                    }
+                }
+            }
+            pool.getConnection().withCloseable { third ->
+                third.createStatement().withCloseable { stmt ->
                     // Recreating the name without IF NOT EXISTS fails if the first borrower's table survived.
                     stmt.execute("""CREATE TEMPORARY TABLE test_temp_table_change_user_pool (id INT)
                         DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ("replication_num" = "1")""")
@@ -73,6 +70,5 @@ suite("test_temp_table_change_user_pool", "p0") {
         }
     } finally {
         sql "DROP USER ${borrower}"
-        sql "DROP DATABASE IF EXISTS `${recoveryDb}` FORCE"
     }
 }

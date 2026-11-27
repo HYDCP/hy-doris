@@ -20,6 +20,9 @@ import com.mysql.cj.jdbc.JdbcConnection
 import com.mysql.cj.protocol.a.NativeConstants
 import com.mysql.cj.protocol.a.NativePacketPayload
 
+import java.sql.DriverManager
+import java.util.concurrent.TimeUnit
+
 def resetConnection = { connection ->
     NativeSession session = (NativeSession) connection.unwrap(JdbcConnection.class).getSession()
     NativePacketPayload packet = new NativePacketPayload(1)
@@ -70,4 +73,63 @@ suite("test_temp_table_duplicate_create_reset", "p0") {
         }
     }
     sql create
+}
+
+suite("test_permanent_table_transaction_reset", "p0") {
+    if (isCloudMode()) {
+        return
+    }
+    def database = getCurDbName()
+    sql "DROP TABLE IF EXISTS test_permanent_table_transaction_reset"
+    sql """
+        CREATE TABLE test_permanent_table_transaction_reset (id INT)
+        DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ("replication_num" = "1")
+    """
+    sql "INSERT INTO test_permanent_table_transaction_reset VALUES (17)"
+
+    [false, true].each { timeout ->
+        def label = "permanent_reset_${UUID.randomUUID().toString().replace('-', '')}"
+        def conn = context.getConnection().unwrap(JdbcConnection.class)
+        def connectionId = conn.getId()
+        sql "SET insert_timeout = ${timeout ? 5 : 300}"
+        sql "SET query_timeout = ${timeout ? 5 : 300}"
+        sql "BEGIN WITH LABEL ${label}"
+        try {
+            sql "INSERT INTO `${database}`.test_permanent_table_transaction_reset SELECT 29"
+            def expectedStatus = timeout ? "ABORTED" : "PREPARE"
+            def deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90)
+            def status
+            DriverManager.getConnection(getCurDbConnectUrl(), context.config.jdbcUser, context.config.jdbcPassword)
+                    .withCloseable { observer ->
+                        observer.createStatement().withCloseable { stmt ->
+                            while (System.nanoTime() < deadline) {
+                                stmt.executeQuery("SHOW TRANSACTION FROM `${database}` WHERE LABEL = '${label}'")
+                                        .withCloseable { rows ->
+                                            status = rows.next() ? rows.getString("TransactionStatus") : null
+                                        }
+                                if (status == expectedStatus) {
+                                    break
+                                }
+                                sleep(500)
+                            }
+                        }
+                    }
+            assertEquals(expectedStatus, status)
+            2.times {
+                resetConnection(context.getConnection())
+                assertEquals(connectionId, conn.getId())
+            }
+        } finally {
+            if (timeout) {
+                test {
+                    sql "ROLLBACK"
+                    exception "transaction not found"
+                }
+            } else {
+                sql "ROLLBACK"
+            }
+        }
+        assertEquals(connectionId, ((Number) sql("SELECT CONNECTION_ID()")[0][0]).longValue())
+        assertEquals([[17]], sql("SELECT id FROM `${database}`.test_permanent_table_transaction_reset ORDER BY id"))
+    }
 }

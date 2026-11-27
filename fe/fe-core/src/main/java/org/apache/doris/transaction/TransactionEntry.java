@@ -337,7 +337,15 @@ public class TransactionEntry {
         return abortTransaction("user rollback");
     }
 
+    public long abortTransactionForTemporaryTableReset() throws Exception {
+        return abortTransaction("user rollback", true);
+    }
+
     private long abortTransaction(String reason) throws Exception {
+        return abortTransaction(reason, false);
+    }
+
+    private long abortTransaction(String reason, boolean checkForwardedSqlStatus) throws Exception {
         if (isTransactionBegan) {
             if (Env.getCurrentEnv().isMaster() || Config.isCloudMode()) {
                 beforeFinishTransaction();
@@ -348,7 +356,11 @@ public class TransactionEntry {
                 MasterOpExecutor masterOpExecutor = new MasterOpExecutor(originStmt, ConnectContext.get(),
                         RedirectStatus.NO_FORWARD, false);
                 LOG.info("forward rollback to Master for txn_id={}", transactionId);
-                masterOpExecutor.executeCheckingSqlStatus();
+                if (checkForwardedSqlStatus) {
+                    masterOpExecutor.executeCheckingSqlStatus();
+                } else {
+                    masterOpExecutor.execute();
+                }
                 return transactionId;
             }
         } else if (isInsertValuesTxnBegan()) {
