@@ -583,6 +583,73 @@ class ConnectContextTempTableTest {
     }
 
     @Test
+    void successfulLegacyCreateAlsoChecksTheDatabaseThatReusedTheName(@Injectable Database replacementDb,
+            @Injectable Table oldTable, @Injectable Table createdTable) throws Exception {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.setThreadLocalInfo();
+        String owner = ctx.getSessionId();
+        String innerName = owner + FeNameFormat.TEMPORARY_TABLE_SIGN + "tmp";
+        List<Long> dropped = new ArrayList<>();
+        new MockUp<MasterOpExecutor>() {
+            @Mock
+            public void execute(Invocation invocation) {
+                MasterOpExecutor operation = invocation.getInvokedInstance();
+                operation.result = new TMasterOpResult().setStatusCode(0).setMaxJournalId(42L);
+            }
+
+            @Mock
+            boolean tryDropTemporaryTableById(long dbId, long tableId, boolean waitForReplay) {
+                Assertions.assertTrue(waitForReplay);
+                dropped.add(tableId);
+                return true;
+            }
+        };
+        new Expectations() {
+            {
+                catalog.getDbNullable("old_db");
+                result = db;
+                db.getId();
+                result = 10L;
+                db.getTemporaryTableNullable("tmp");
+                result = oldTable;
+                oldTable.getName();
+                result = innerName;
+                oldTable.getId();
+                result = 11L;
+                env.isReady();
+                result = true;
+                env.getReplayedJournalId();
+                result = 42L;
+                catalog.getDbs();
+                result = ImmutableList.of(db, replacementDb);
+                db.getTemporaryTableNullable(innerName);
+                result = oldTable;
+                replacementDb.getTemporaryTableNullable(innerName);
+                result = createdTable;
+                replacementDb.getId();
+                result = 20L;
+                createdTable.getName();
+                result = innerName;
+                createdTable.getId();
+                result = 21L;
+            }
+        };
+        try {
+            Deencapsulation.invoke(forwardedCreate(ctx), "forwardToMaster");
+            Assertions.assertEquals(Collections.singletonMap(11L, 10L), ctx.snapshotTemporaryTables());
+            new MysqlConnectProcessor(ctx).handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
+            Collections.sort(dropped);
+            Assertions.assertEquals(ImmutableList.of(11L, 21L), dropped);
+            Assertions.assertNotEquals(owner, ctx.getSessionId());
+        } finally {
+            ConnectContext.remove();
+        }
+    }
+
+    @Test
     void retriesLegacyCreateAtItsJournalPositionAfterDatabaseRename(@Injectable Table owned,
             @Injectable Database reusedDatabaseName, @Injectable Table replacement,
             @Mocked GenericPool<FrontendService.Client> pool,
@@ -669,6 +736,45 @@ class ConnectContextTempTableTest {
         } finally {
             ConnectContext.remove();
         }
+    }
+
+    @Test
+    void disconnectDropsReconciledLegacyTableOnlyOnce(@Injectable Table table) throws Exception {
+        mockLocalCatalog(true);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        String owner = ctx.getSessionId();
+        String innerName = owner + FeNameFormat.TEMPORARY_TABLE_SIGN + "tmp";
+        ctx.addTemporaryTable(10L, 11L);
+        ctx.trackUnresolvedTemporaryTable(new TableName("internal", "old_db", "tmp"), null, 42L);
+        new Expectations() {
+            {
+                env.isReady();
+                result = true;
+                env.getMaxJournalId();
+                result = 42L;
+                catalog.getDbs();
+                result = Collections.singletonList(db);
+                db.getTemporaryTableNullable(innerName);
+                result = table;
+                db.getId();
+                result = 10L;
+                table.getId();
+                result = 11L;
+                table.getName();
+                result = innerName;
+                catalog.dropTemporaryTable(db, 11L, owner);
+                times = 1;
+            }
+        };
+        ctx.cleanup();
+        ctx.cleanup();
+        new Verifications() {
+            {
+                catalog.getDbNullable("old_db");
+                times = 0;
+            }
+        };
     }
 
     @Test

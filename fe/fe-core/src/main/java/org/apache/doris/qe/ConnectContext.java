@@ -961,11 +961,15 @@ public class ConnectContext {
             Env currentEnv = Env.getCurrentEnv();
             InternalCatalog catalog = currentEnv.getInternalCatalog();
             DdlException failure = null;
-            if (strict && !unresolved.isEmpty()) {
+            if (!unresolved.isEmpty()) {
                 try {
                     reconcileLegacyTemporaryTables(currentEnv, unresolved, snapshot);
+                    unresolved.clear(); // The ID snapshot now covers these names on reset and on close.
                 } catch (DdlException e) {
-                    failure = e;
+                    if (strict) {
+                        failure = e;
+                    }
+                    // Disconnect can still attempt cleanup by name when reconciliation is unavailable.
                 }
             }
             for (Map.Entry<Long, Long> entry : snapshot.entrySet()) {

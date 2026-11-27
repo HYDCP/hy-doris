@@ -1361,12 +1361,13 @@ public class StmtExecutor {
             throw e;
         }
         if (tempTableTarget != null) {
-            if (!masterOpExecutor.recordCreatedTemporaryTables(null)
-                    && !recordForwardedTemporaryTable(tempTableTarget, originalDb)
-                    && masterOpExecutor.getStatusCode() == 0) {
-                // An older Master did not report IDs, and the original name is no longer resolvable.
-                context.trackUnresolvedTemporaryTable(tempTableTarget, originalDb,
-                        masterOpExecutor.getSuccessfulCreateJournalId());
+            if (!masterOpExecutor.recordCreatedTemporaryTables(null)) {
+                recordForwardedTemporaryTable(tempTableTarget, originalDb);
+                if (masterOpExecutor.getStatusCode() == 0) {
+                    // A name match in the original database cannot identify which database the Master used.
+                    context.trackUnresolvedTemporaryTable(tempTableTarget, originalDb,
+                            masterOpExecutor.getSuccessfulCreateJournalId());
+                }
             }
         } else if (masterOpExecutor.getStatusCode() == 0 && parsedStmt instanceof DropTableStmt) {
             DropTableStmt drop = (DropTableStmt) parsedStmt;
@@ -1430,17 +1431,15 @@ public class StmtExecutor {
         return like.isTemp() ? new TableName(like.getCatalogName(), like.getDbName(), like.getTableName()) : null;
     }
 
-    private boolean recordForwardedTemporaryTable(TableName target, Database originalDb) {
+    private void recordForwardedTemporaryTable(TableName target, Database originalDb) {
         Database db = originalDb == null ? getForwardedInternalDatabase(target.getCtl(), target.getDb())
                 : context.getEnv().getInternalCatalog().getDbNullable(originalDb.getId());
         if (db != null) {
             Table table = db.getTemporaryTableNullable(target.getTbl());
             if (table != null && context.getSessionId().equals(Util.getTempTableSessionId(table.getName()))) {
                 context.addTemporaryTable(db.getId(), table.getId());
-                return true;
             }
         }
-        return false;
     }
 
     private Database getForwardedInternalDatabase(String catalogName, String dbName) {
