@@ -118,6 +118,9 @@ public class RestoreReuseCapabilityHeartbeatTest {
         Assertions.assertEquals(0, fe.getRestoreReuseCapability());
         fe.handleHbResponse(current, false);
         Assertions.assertEquals(1, fe.getRestoreReuseCapability());
+        // a frontend that does not answer may come back as an old version
+        fe.handleHbResponse(new FrontendHbResponse("fe1", "down"), false);
+        Assertions.assertEquals(0, fe.getRestoreReuseCapability());
     }
 
     @Test

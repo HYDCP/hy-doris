@@ -3617,27 +3617,40 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     /**
-     * Lock the origin tables that have a local decision (db lock first, then the tables by ascending id), and check
-     * all of them, before any table is replaced: either all of them are at the version they were proved at, or none
-     * is touched. The caller holds the write lock of the database, and unlocks the tables added to the locked list.
+     * If a table keeps local data, lock all the origin tables that are replaced (db lock first, then the tables by
+     * ascending id, the order of a query that reads several of them), and check the ones that have a local decision,
+     * before any table is replaced: either all of them are at the version they were proved at, or none is touched. The
+     * replace locks an origin table again (the lock is reentrant): if only the tables with a local decision were held,
+     * the replace of another one with a lower id would wait for it while holding a higher one, against a query that
+     * holds the lower one and waits for the higher. The caller holds the write lock of the database, and unlocks the
+     * tables added to the locked list.
      */
     private Status lockAndCheckAtomicOriginTables(Database db, List<OlapTable> locked) {
         Map<Long, OlapTable> origins = Maps.newTreeMap();
+        boolean anyLocalDecision = false;
         for (String tableName : jobInfo.backupOlapTableObjects.keySet()) {
             String originName = jobInfo.getAliasByOriginNameIfSet(tableName);
             if (Env.isStoredTableNamesLowerCase()) {
                 originName = originName.toLowerCase();
             }
             Table originTbl = db.getTableNullable(originName);
-            if (originTbl instanceof OlapTable && hasAtomicLocalDecision(originTbl.getId())) {
+            if (originTbl instanceof OlapTable) {
                 origins.put(originTbl.getId(), (OlapTable) originTbl);
+                anyLocalDecision |= hasAtomicLocalDecision(originTbl.getId());
             }
+        }
+        if (!anyLocalDecision) {
+            // nothing to check: the tables are replaced one by one as without the reuse
+            return Status.OK;
         }
         for (OlapTable originTbl : origins.values()) {
             originTbl.writeLock();
             locked.add(originTbl);
         }
         for (OlapTable originTbl : origins.values()) {
+            if (!hasAtomicLocalDecision(originTbl.getId())) {
+                continue;
+            }
             Status st = checkAtomicLocalVersions(originTbl);
             if (!st.ok()) {
                 return st;

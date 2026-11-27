@@ -17,6 +17,7 @@
 
 package org.apache.doris.backup;
 
+import org.apache.doris.analysis.BackupStmt.BackupContent;
 import org.apache.doris.analysis.IndexDef.IndexType;
 import org.apache.doris.analysis.PartitionValue;
 import org.apache.doris.backup.BackupJobInfo.BackupIndexInfo;
@@ -91,8 +92,10 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
@@ -1504,6 +1507,11 @@ public class RestoreTokenReuseTest {
     // Adds a second table to the atomic job: the table of the db (test_tbl) is the origin table, a table registered
     // under the temp name is its staging table, both with a local decision at the version of their partition.
     private OlapTable addSecondAtomicTable(RestoreJob job) {
+        return addSecondAtomicTable(job, true);
+    }
+
+    // withDecision false: the second table is downloaded as a whole, it keeps nothing
+    private OlapTable addSecondAtomicTable(RestoreJob job, boolean withDecision) {
         OlapTable originB = (OlapTable) db.getTableNullable(CatalogMocker.TEST_TBL_NAME);
         Partition partB = originB.getPartitions().iterator().next();
         OlapTable stagingB = new OlapTable(originB.getId() + 7777,
@@ -1515,6 +1523,9 @@ public class RestoreTokenReuseTest {
         db.registerTable(stagingB);
         BackupJobInfo info = Deencapsulation.getField(job, "jobInfo");
         info.backupOlapTableObjects.put(CatalogMocker.TEST_TBL_NAME, new BackupOlapTableInfo());
+        if (!withDecision) {
+            return stagingB;
+        }
         RestoreReuseResult.Decision decision = new RestoreReuseResult.Decision();
         decision.tableId = originB.getId();
         decision.partitionId = partB.getId();
@@ -1525,6 +1536,71 @@ public class RestoreTokenReuseTest {
         decision.atomic = true;
         job.getReuseResult().addDecision(decision);
         return stagingB;
+    }
+
+    // A restore of the metadata only (an old backup of the metadata only may still have the tokens) creates empty
+    // replicas: it gives no token and clears no taint, the same restore of the data does both.
+    @Test
+    public void testRestoreOfTheMetadataOnlyGivesNoTokenAndClearsNoTaint() {
+        Assertions.assertEquals(V1, p1().getVisibleVersion());
+        for (BackupContent content : new BackupContent[] {BackupContent.METADATA_ONLY, BackupContent.ALL}) {
+            BackupJobInfo info = tokenBackupJobInfo();
+            info.content = content;
+            RestoreJob job = newJob(info);
+            Deencapsulation.setField(job, "stampStateTokens", true);
+            setToken(p1(), "another");
+            job.stampRestoreLineage(db, 0L);
+            Assertions.assertEquals(content == BackupContent.ALL ? TK1 : null, PartitionStateToken.effective(p1()),
+                    content.name());
+
+            PartitionStateToken.taint(p1());
+            versionInfo(job).put(tbl2.getId(), p1().getId(), V1);
+            job.clearTaintOfDownloadedPartitions(db);
+            Assertions.assertEquals(content != BackupContent.ALL, PartitionStateToken.isTainted(p1()), content.name());
+            setToken(p1(), TK1);
+        }
+    }
+
+    // A downloaded table of a lower id than the kept one: the replace holds the origin tables in the order of a query
+    // that reads both (ascending id), so the query that holds the lower one gets the higher one.
+    @Test
+    public void testAtomicReplaceLocksTheOriginTablesInTheOrderOfAQuery() throws Exception {
+        RestoreJob job = atomicKeptJob();
+        OlapTable stagingA = staging(job);
+        OlapTable stagingB = addSecondAtomicTable(job, false);
+        OlapTable low = (OlapTable) db.getTableNullable(CatalogMocker.TEST_TBL_NAME);
+        Assertions.assertTrue(low.getId() < tbl2.getId());
+        setToken(p1(), TK1);
+        setToken(p2(), TK2);
+
+        CountDownLatch lowHeld = new CountDownLatch(1);
+        AtomicBoolean gotHigh = new AtomicBoolean(false);
+        Thread query = new Thread(() -> {
+            low.readLock();
+            try {
+                lowHeld.countDown();
+                // let the replace take the locks it takes before it waits for the lower table
+                Thread.sleep(500);
+                if (tbl2.tryReadLock(3, TimeUnit.SECONDS)) {
+                    gotHigh.set(true);
+                    tbl2.readUnlock();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                low.readUnlock();
+            }
+        });
+        query.start();
+        Assertions.assertTrue(lowHeld.await(10, TimeUnit.SECONDS));
+        Status st = Deencapsulation.invoke(job, "atomicReplaceOlapTables", db, false);
+        query.join();
+        Assertions.assertTrue(gotHigh.get(), "the query waited for the kept table held by the replace");
+        Assertions.assertTrue(st.ok(), st.toString());
+        Assertions.assertSame(stagingA, db.getTableNullable(CatalogMocker.TEST_TBL2_NAME));
+        Assertions.assertSame(stagingB, db.getTableNullable(CatalogMocker.TEST_TBL_NAME));
+        Assertions.assertFalse(tbl2.isWriteLockHeldByCurrentThread());
+        Assertions.assertFalse(low.isWriteLockHeldByCurrentThread());
     }
 
     @Test

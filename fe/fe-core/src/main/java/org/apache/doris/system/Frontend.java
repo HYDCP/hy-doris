@@ -197,6 +197,7 @@ public class Frontend implements Writable {
             processUUID = 0;
             // it may come back as a frontend of an old version
             partitionStateTokenCapability = 0;
+            restoreReuseCapability = 0;
             if (isAlive) {
                 isAlive = false;
                 isChanged = true;
