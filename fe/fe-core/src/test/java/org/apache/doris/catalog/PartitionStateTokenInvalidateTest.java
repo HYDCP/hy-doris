@@ -18,7 +18,11 @@
 package org.apache.doris.catalog;
 
 import org.apache.doris.analysis.AdminSetReplicaStatusStmt;
+import org.apache.doris.analysis.BackupStmt.BackupContent;
 import org.apache.doris.analysis.RollupRenameClause;
+import org.apache.doris.backup.BackupJobInfo;
+import org.apache.doris.backup.BackupMeta;
+import org.apache.doris.backup.SnapshotInfo;
 import org.apache.doris.catalog.Replica.ReplicaStatus;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeMetaVersion;
@@ -355,6 +359,29 @@ public class PartitionStateTokenInvalidateTest {
         tokens.put(partition.getId(), new PartitionStateToken("hhhh", version, 1234L));
         env.replaySetPartitionStateToken(new PartitionStateTokenLog(db.getId(), table.getId(), tokens));
         Assertions.assertEquals("hhhh", PartitionStateToken.effective(partition));
+    }
+
+    @Test
+    public void testBackupOfTheMetadataOnlyRecordsNoToken() {
+        Config.restore_state_token_track = true;
+        name("dddd");
+        BackupMeta meta = new BackupMeta(Lists.newArrayList(table), Lists.newArrayList());
+        BackupJobInfo info = BackupJobInfo.fromCatalog(1L, "l", db.getFullName(), db.getId(),
+                BackupContent.METADATA_ONLY, meta, Maps.newHashMap(), Maps.newHashMap());
+        // the restore of it makes empty replicas at the version: a token would name data they do not have
+        Assertions.assertNull(info.getOlapTableInfo(table.getName()).getPartInfo(partition.getName()).stateToken);
+
+        Map<Long, SnapshotInfo> snapshots = Maps.newHashMap();
+        for (MaterializedIndex index : partition.getMaterializedIndices(MaterializedIndex.IndexExtState.VISIBLE)) {
+            for (Tablet tablet : index.getTablets()) {
+                snapshots.put(tablet.getId(), new SnapshotInfo(db.getId(), table.getId(), partition.getId(),
+                        index.getId(), tablet.getId(), 1L, 0, "/p", Lists.newArrayList()));
+            }
+        }
+        info = BackupJobInfo.fromCatalog(1L, "l", db.getFullName(), db.getId(), BackupContent.ALL, meta, snapshots,
+                Maps.newHashMap());
+        Assertions.assertEquals("dddd",
+                info.getOlapTableInfo(table.getName()).getPartInfo(partition.getName()).stateToken);
     }
 
     // a new partition of the test table, at the initial version

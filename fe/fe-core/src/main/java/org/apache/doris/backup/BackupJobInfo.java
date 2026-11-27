@@ -640,8 +640,9 @@ public class BackupJobInfo implements Writable, GsonPostProcessable {
                     BackupPartitionInfo partitionInfo = new BackupPartitionInfo();
                     partitionInfo.id = partition.getId();
                     partitionInfo.version = partition.getVisibleVersion();
-                    // a cluster that does not track the tokens records none (master only, the job info is logged)
-                    partitionInfo.stateToken = Config.restore_state_token_track
+                    // a cluster that does not track the tokens records none (master only, the job info is logged),
+                    // nor does a backup of the metadata only: it has no data the token could name
+                    partitionInfo.stateToken = Config.restore_state_token_track && content == BackupContent.ALL
                             ? PartitionStateToken.effective(partition) : null;
                     tableInfo.partitions.put(partition.getName(), partitionInfo);
                     // indexes

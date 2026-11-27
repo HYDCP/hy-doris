@@ -2457,6 +2457,12 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             PartitionStateToken.invalidate(part);
             return;
         }
+        if (!restoresData()) {
+            // a restore of the metadata only creates empty replicas at the version of the backup: the token of the
+            // source would name data the partition does not have
+            PartitionStateToken.invalidate(part);
+            return;
+        }
         if (part.getVisibleVersion() != partInfo.version) {
             LOG.info("restore: partition {} is at version {}, not at the version {} of the backup, no state token, "
                     + "job: {}", part.getId(), part.getVisibleVersion(), partInfo.version, jobId);
@@ -2466,6 +2472,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         String token = partInfo.stateToken;
         part.setStateToken(token == null ? null : new PartitionStateToken(token, part.getVisibleVersion(),
                 part.getVisibleVersionTime()));
+    }
+
+    // whether the backup has the data of the tablets, not only the metadata (BackupContent.METADATA_ONLY)
+    private boolean restoresData() {
+        return jobInfo.content == null || jobInfo.content == BackupContent.ALL;
     }
 
     /**
@@ -2478,6 +2489,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
      */
     @VisibleForTesting
     void clearTaintOfDownloadedPartitions(Database db) {
+        if (!restoresData()) {
+            // nothing is downloaded: the replicas are not made from the backup
+            return;
+        }
         for (long tblId : restoredVersionInfo.rowKeySet()) {
             Table tbl = db.getTableNullable(tblId);
             if (!(tbl instanceof OlapTable) || !tbl.writeLockIfExist()) {
