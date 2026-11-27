@@ -87,6 +87,13 @@ public class PartitionStateToken {
      */
     public static final String EMPTY = "empty";
 
+    /**
+     * Reported in the heartbeat of a frontend (TFrontendPingFrontendResult.partitionStateTokenCapability): 1, it
+     * replays OP_SET_PARTITION_STATE_TOKEN. A frontend of an old version reports none (0), and exits when it replays
+     * that log.
+     */
+    public static final int CAPABILITY = 1;
+
     @SerializedName("tk")
     private String token;
     // the visible version and the visible version time of the partition the token is bound to

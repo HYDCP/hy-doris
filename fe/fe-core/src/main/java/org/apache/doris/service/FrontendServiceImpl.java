@@ -2516,6 +2516,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         result.setRpcPort(0);
         result.setReplayedJournalId(0);
         result.setVersion(Version.DORIS_BUILD_VERSION + "-" + Version.DORIS_BUILD_SHORT_HASH);
+        result.setPartitionStateTokenCapability(PartitionStateToken.CAPABILITY);
         if (isReady) {
             if (request.getClusterId() != Env.getCurrentEnv().getClusterId()) {
                 result.setStatus(TFrontendPingFrontendStatusCode.FAILED);

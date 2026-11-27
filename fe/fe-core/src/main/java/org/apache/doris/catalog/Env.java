@@ -304,6 +304,7 @@ import org.apache.doris.transaction.GlobalExternalTransactionInfoMgr;
 import org.apache.doris.transaction.GlobalTransactionMgrIface;
 import org.apache.doris.transaction.PublishVersionDaemon;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
@@ -6664,6 +6665,14 @@ public class Env {
         if (!Config.restore_state_token_track) {
             return;
         }
+        String incapable = findFrontendWithoutStateTokenLog();
+        if (incapable != null) {
+            // an old frontend exits when it replays OP_SET_PARTITION_STATE_TOKEN: its partitions without a token are
+            // not kept from this backup, they are downloaded as before
+            LOG.info("do not give state tokens to the partitions of table {} before a backup: {} may not replay it",
+                    olapTable.getId(), incapable);
+            return;
+        }
         // The backup job calls this with its own lock held, so do not wait for the table. A table that is busy or
         // was dropped is not named this time: its partitions without a token are not kept from this backup.
         if (!olapTable.tryWriteLockIfExist(Table.TRY_LOCK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
@@ -6721,6 +6730,27 @@ public class Env {
         getEditLog().logSetReplicaStatus(new SetReplicaStatusOperationLog(backendId, tabletId, status, -1L));
         LOG.info("taint partition {}: replica {} of tablet {} on backend {} is lost and made empty",
                 partition.getId(), replica.getId(), tabletId, backendId);
+    }
+
+    /**
+     * The first frontend, the observers included (they replay the edit log too), that may not replay
+     * OP_SET_PARTITION_STATE_TOKEN: one which did not report PartitionStateToken#CAPABILITY in its last heartbeat, or
+     * does not answer it (it may come back as an old version). Null if there is none. Master only.
+     */
+    @VisibleForTesting
+    String findFrontendWithoutStateTokenLog() {
+        HostInfo self = getSelfNode();
+        for (Frontend fe : getFrontends(null /* all */)) {
+            // the host and the port: several frontends may run on a host
+            if (fe.getHost().equals(self.getHost()) && fe.getEditLogPort() == self.getPort()) {
+                continue;
+            }
+            if (!fe.isAlive() || fe.getPartitionStateTokenCapability() < PartitionStateToken.CAPABILITY) {
+                return "frontend " + fe.getHost() + ":" + fe.getEditLogPort() + " (alive " + fe.isAlive()
+                        + ", capability " + fe.getPartitionStateTokenCapability() + ")";
+            }
+        }
+        return null;
     }
 
     // the caller holds the write lock of the table

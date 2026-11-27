@@ -26,7 +26,9 @@ import org.apache.doris.backup.SnapshotInfo;
 import org.apache.doris.catalog.Replica.ReplicaStatus;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeMetaVersion;
+import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.consistency.ConsistencyChecker;
+import org.apache.doris.ha.FrontendNodeType;
 import org.apache.doris.meta.MetaContext;
 import org.apache.doris.persist.ConsistencyCheckInfo;
 import org.apache.doris.persist.EditLog;
@@ -35,6 +37,8 @@ import org.apache.doris.persist.SetReplicaStatusOperationLog;
 import org.apache.doris.persist.SetReplicaVersionOperationLog;
 import org.apache.doris.persist.TableInfo;
 import org.apache.doris.persist.gson.GsonUtils;
+import org.apache.doris.system.Frontend;
+import org.apache.doris.system.SystemInfoService.HostInfo;
 import org.apache.doris.thrift.TStorageType;
 import org.apache.doris.thrift.TUniqueId;
 import org.apache.doris.transaction.FakeTransactionIDGenerator;
@@ -59,6 +63,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** The changes of a table outside of a transaction that invalidate the state tokens, and the backup that names. */
 public class PartitionStateTokenInvalidateTest {
@@ -359,6 +364,45 @@ public class PartitionStateTokenInvalidateTest {
         tokens.put(partition.getId(), new PartitionStateToken("hhhh", version, 1234L));
         env.replaySetPartitionStateToken(new PartitionStateTokenLog(db.getId(), table.getId(), tokens));
         Assertions.assertEquals("hhhh", PartitionStateToken.effective(partition));
+    }
+
+    // The master and an observer: the observer replays the edit log as a follower does.
+    private Frontend addFrontends() {
+        Deencapsulation.setField(env, "selfNode", new HostInfo("10.0.0.1", 9010));
+        ConcurrentHashMap<String, Frontend> frontends = Deencapsulation.getField(env, "frontends");
+        // the master itself never had a heartbeat answered: it is skipped
+        frontends.put("master", new Frontend(FrontendNodeType.FOLLOWER, "master", "10.0.0.1", 9010));
+        Frontend observer = new Frontend(FrontendNodeType.OBSERVER, "observer", "10.0.0.1", 9011);
+        frontends.put("observer", observer);
+        return observer;
+    }
+
+    @Test
+    public void testBackupDoesNotNameWhileAFrontendMayNotReplayTheNames() {
+        Config.restore_state_token_track = true;
+        Frontend observer = addFrontends();
+        partition.setStateToken(PartitionStateToken.invalid());
+
+        // an old observer (it reports no capability): no OP_SET_PARTITION_STATE_TOKEN is logged
+        Deencapsulation.setField(observer, "isAlive", true);
+        Assertions.assertNotNull(env.findFrontendWithoutStateTokenLog());
+        env.namePartitionsWithoutStateToken(db, table);
+        Assertions.assertNull(PartitionStateToken.effective(partition));
+        Mockito.verify(env.getEditLog(), Mockito.never()).logSetPartitionStateToken(Mockito.any());
+
+        // capable but not answering the heartbeat: it may come back as an old version
+        observer.setPartitionStateTokenCapability(PartitionStateToken.CAPABILITY);
+        Deencapsulation.setField(observer, "isAlive", false);
+        env.namePartitionsWithoutStateToken(db, table);
+        Assertions.assertNull(PartitionStateToken.effective(partition));
+        Mockito.verify(env.getEditLog(), Mockito.never()).logSetPartitionStateToken(Mockito.any());
+
+        // every other frontend is alive and capable
+        Deencapsulation.setField(observer, "isAlive", true);
+        Assertions.assertNull(env.findFrontendWithoutStateTokenLog());
+        env.namePartitionsWithoutStateToken(db, table);
+        Assertions.assertNotNull(PartitionStateToken.effective(partition));
+        Mockito.verify(env.getEditLog(), Mockito.times(1)).logSetPartitionStateToken(Mockito.any());
     }
 
     @Test
