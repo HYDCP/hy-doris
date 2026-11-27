@@ -18,8 +18,10 @@
 #include <gen_cpp/FrontendService_types.h>
 #include <gtest/gtest.h>
 
+#include "pipeline/exec/empty_set_operator.h"
 #include "runtime/query_statistics.h"
 #include "runtime/runtime_query_statistics_mgr.h"
+#include "vec/data_types/data_type_number.h"
 
 namespace doris {
 
@@ -39,6 +41,43 @@ TEST(QueryStatisticsProgressTest, MergesAndReportsPipelineCounters) {
     EXPECT_EQ(8, thrift.total_tasks_num);
     EXPECT_EQ(1, thrift.finished_tasks_num);
     EXPECT_EQ(19, thrift.process_rows);
+}
+
+TEST(QueryStatisticsProgressTest, OperatorOutputIsCountedOnceWithAndWithoutLimitCheck) {
+    class Source : public pipeline::OperatorX<pipeline::EmptySetLocalState> {
+    public:
+        Source(ObjectPool* pool, bool check_limit)
+                : OperatorX(pool, 0, 0), _check_limit(check_limit) {}
+        Status get_block(RuntimeState* state, vectorized::Block* block, bool* eos) override {
+            auto type = std::make_shared<vectorized::DataTypeInt32>();
+            auto column = type->create_column();
+            column->insert_many_defaults(3);
+            block->insert({std::move(column), type, "value"});
+            if (_check_limit) {
+                get_local_state(state).reached_limit(block, eos);
+            }
+            return Status::OK();
+        }
+
+    private:
+        bool _check_limit;
+    };
+
+    for (bool check_limit : {false, true}) {
+        RuntimeState state;
+        Source source(state.obj_pool(), check_limit);
+        RuntimeProfile profile("test");
+        pipeline::LocalStateInfo info {&profile, {}, nullptr, {}, 0};
+        state.resize_op_id_to_local_state(1);
+        ASSERT_TRUE(source.setup_local_state(&state, info).ok());
+        vectorized::Block block;
+        bool eos = false;
+        ASSERT_TRUE(source.get_block_after_projects(&state, &block, &eos).ok());
+        TQueryStatistics statistics;
+        source.get_local_state(&state).get_query_statistics_ptr()->to_thrift(&statistics);
+        EXPECT_EQ(3, block.rows());
+        EXPECT_EQ(3, statistics.process_rows);
+    }
 }
 
 TEST(QueryStatisticsProgressTest, ForwardedReportKeepsAuditAndReachesCoordinator) {

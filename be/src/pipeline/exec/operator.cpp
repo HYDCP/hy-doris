@@ -328,8 +328,7 @@ Status OperatorXBase::get_block_after_projects(RuntimeState* state, vectorized::
     Defer defer([&]() {
         if (status.ok()) {
             if (auto rows = block->rows()) {
-                COUNTER_UPDATE(local_state->_rows_returned_counter, rows);
-                COUNTER_UPDATE(local_state->_blocks_returned_counter, 1);
+                local_state->record_output_rows(rows);
             }
         }
     });
@@ -362,12 +361,13 @@ void PipelineXLocalStateBase::reached_limit(vectorized::Block* block, bool* eos)
         }
     });
 
-    if (auto rows = block->rows()) {
-        _num_rows_returned += rows;
-        if (auto* query_ctx = _state->get_query_ctx()) {
-            query_ctx->add_process_rows(rows);
-        }
-    }
+    _num_rows_returned += block->rows();
+}
+
+void PipelineXLocalStateBase::record_output_rows(int64_t rows) {
+    COUNTER_UPDATE(_rows_returned_counter, rows);
+    COUNTER_UPDATE(_blocks_returned_counter, 1);
+    _query_statistics->add_process_rows(rows);
 }
 
 std::string DataSinkOperatorXBase::debug_string(int indentation_level) const {

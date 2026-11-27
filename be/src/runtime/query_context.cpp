@@ -323,10 +323,6 @@ void QueryContext::register_cpu_statistics() {
 }
 
 // The runtime statistics manager keeps these counters alive until the last report.
-void QueryContext::add_process_rows(int64_t rows) {
-    _cpu_statistics->add_process_rows(rows);
-}
-
 void QueryContext::add_total_pipeline_tasks(int32_t tasks) {
     _cpu_statistics->add_total_pipeline_tasks(tasks);
 }

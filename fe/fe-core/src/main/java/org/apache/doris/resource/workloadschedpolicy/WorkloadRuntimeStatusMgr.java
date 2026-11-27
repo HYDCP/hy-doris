@@ -34,6 +34,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -51,8 +52,9 @@ public class WorkloadRuntimeStatusMgr extends MasterDaemon {
 
     private static final Logger LOG = LogManager.getLogger(WorkloadRuntimeStatusMgr.class);
     private Map<Long, BeReportInfo> beToQueryStatsMap = Maps.newConcurrentMap();
-    private volatile QueryStatisticsSnapshot queryStatisticsSnapshot =
+    private static final QueryStatisticsSnapshot EMPTY_SNAPSHOT =
             new QueryStatisticsSnapshot(ImmutableMap.of(), ImmutableMap.of());
+    private volatile QueryStatisticsSnapshot queryStatisticsSnapshot = EMPTY_SNAPSHOT;
     private final ReentrantReadWriteLock queryAuditEventLock = new ReentrantReadWriteLock();
     private List<AuditEvent> queryAuditEventList = Lists.newLinkedList();
 
@@ -96,8 +98,8 @@ public class WorkloadRuntimeStatusMgr extends MasterDaemon {
     @Override
     protected void runAfterCatalogReady() {
         // 1 merge be query statistics
-        queryStatisticsSnapshot = buildQueryStatisticsSnapshot();
-        Map<String, TQueryStatistics> queryStatisticsMap = queryStatisticsSnapshot.getStatistics();
+        Map<String, TQueryStatistics> queryStatisticsMap = aggregateQueryStatistics(
+                Config.enable_extended_current_query_stats);
 
         // 2 log query audit
         try {
@@ -230,11 +232,11 @@ public class WorkloadRuntimeStatusMgr extends MasterDaemon {
     }
 
     // The daemon builds the snapshot before it cleans up expired reports.
-    QueryStatisticsSnapshot buildQueryStatisticsSnapshot() {
+    Map<String, TQueryStatistics> aggregateQueryStatistics(boolean extended) {
         // 1 merge query stats in all be
         Set<Long> beIdSet = beToQueryStatsMap.keySet();
         Map<String, TQueryStatistics> resultQueryMap = Maps.newHashMap();
-        Map<String, Integer> reportingBackends = Maps.newHashMap();
+        Map<String, Integer> reportingBackends = extended ? Maps.newHashMap() : Collections.emptyMap();
         for (Long beId : beIdSet) {
             BeReportInfo beReportInfo = beToQueryStatsMap.get(beId);
             Set<String> queryIdSet = beReportInfo.queryStatsMap.keySet();
@@ -247,12 +249,22 @@ public class WorkloadRuntimeStatusMgr extends MasterDaemon {
                     resultQueryMap.put(queryId, retQuery);
                 }
                 mergeQueryStatistics(retQuery, curQueryStats);
-                int reportCount = reportingBackends.merge(queryId, 1, Integer::sum);
-                mergeProgress(retQuery, curQueryStats, reportCount == 1);
+                if (extended) {
+                    int reportCount = reportingBackends.merge(queryId, 1, Integer::sum);
+                    mergeProgress(retQuery, curQueryStats, reportCount == 1);
+                    mergeExtendedStatistics(retQuery, curQueryStats);
+                }
             }
         }
 
-        return new QueryStatisticsSnapshot(ImmutableMap.copyOf(resultQueryMap), ImmutableMap.copyOf(reportingBackends));
+        if (extended) {
+            QueryStatisticsSnapshot snapshot = new QueryStatisticsSnapshot(
+                    Collections.unmodifiableMap(resultQueryMap), Collections.unmodifiableMap(reportingBackends));
+            queryStatisticsSnapshot = snapshot;
+            return snapshot.getStatistics();
+        }
+        queryStatisticsSnapshot = EMPTY_SNAPSHOT;
+        return resultQueryMap;
     }
 
     private void mergeProgress(TQueryStatistics dst, TQueryStatistics src, boolean firstReport) {
@@ -277,6 +289,12 @@ public class WorkloadRuntimeStatusMgr extends MasterDaemon {
         dst.cpu_ms += src.cpu_ms;
         dst.shuffle_send_bytes += src.shuffle_send_bytes;
         dst.shuffle_send_rows += src.shuffle_send_rows;
+        if (dst.max_peak_memory_bytes < src.max_peak_memory_bytes) {
+            dst.max_peak_memory_bytes = src.max_peak_memory_bytes;
+        }
+    }
+
+    private void mergeExtendedStatistics(TQueryStatistics dst, TQueryStatistics src) {
         if (src.isSetProcessRows()) {
             dst.setProcessRows(dst.process_rows + src.process_rows);
         }
@@ -285,9 +303,6 @@ public class WorkloadRuntimeStatusMgr extends MasterDaemon {
         }
         if (dst.workload_group_id <= 0 && src.workload_group_id > 0) {
             dst.setWorkloadGroupId(src.workload_group_id);
-        }
-        if (dst.max_peak_memory_bytes < src.max_peak_memory_bytes) {
-            dst.max_peak_memory_bytes = src.max_peak_memory_bytes;
         }
     }
 

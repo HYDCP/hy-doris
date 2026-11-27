@@ -194,7 +194,6 @@ public:
 
     void register_cpu_statistics();
 
-    void add_process_rows(int64_t rows);
     void add_total_pipeline_tasks(int32_t tasks);
     void finish_pipeline_task();
 

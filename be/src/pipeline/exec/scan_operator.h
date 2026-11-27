@@ -358,8 +358,7 @@ public:
         if (status.ok()) {
             if (auto rows = block->rows()) {
                 auto* local_state = state->get_local_state(operator_id());
-                COUNTER_UPDATE(local_state->_rows_returned_counter, rows);
-                COUNTER_UPDATE(local_state->_blocks_returned_counter, 1);
+                local_state->record_output_rows(rows);
             }
         }
         return status;

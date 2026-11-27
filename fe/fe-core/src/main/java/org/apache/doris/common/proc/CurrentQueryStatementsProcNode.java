@@ -121,8 +121,12 @@ public class CurrentQueryStatementsProcNode implements ProcNodeInterface {
         } else {
             row.add(String.valueOf(statistics.getTotalTasksNum()));
             row.add(String.valueOf(statistics.getFinishedTasksNum()));
-            double progress = 100.0 * statistics.getFinishedTasksNum() / statistics.getTotalTasksNum();
-            row.add(String.format(Locale.ROOT, "%.1f%%", progress));
+            row.add(formatProgress(statistics.getFinishedTasksNum(), statistics.getTotalTasksNum()));
         }
+    }
+
+    static String formatProgress(long finished, long total) {
+        double progress = finished == total ? 100.0 : Math.min(99.9, 100.0 * finished / total);
+        return String.format(Locale.ROOT, "%.1f%%", progress);
     }
 }

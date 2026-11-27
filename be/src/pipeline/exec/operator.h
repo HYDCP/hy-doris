@@ -175,6 +175,7 @@ public:
     vectorized::VExprContextSPtrs& conjuncts() { return _conjuncts; }
     vectorized::VExprContextSPtrs& projections() { return _projections; }
     [[nodiscard]] int64_t num_rows_returned() const { return _num_rows_returned; }
+    void record_output_rows(int64_t rows);
     void add_num_rows_returned(int64_t delta) { _num_rows_returned += delta; }
     void set_num_rows_returned(int64_t value) { _num_rows_returned = value; }
 
