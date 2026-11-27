@@ -2351,12 +2351,16 @@ public class DatabaseTransactionMgr {
                     }
                     return v;
                 });
-                partitionTokens.compute(partitionId, (k, v) -> {
-                    if (v == null || version > v.first) {
-                        return Pair.of(version, partitionCommitInfo.getStateToken());
-                    }
-                    return v;
-                });
+                // only a transaction that was given a token has one (assignStateTokens): no entry for the others
+                String stateToken = partitionCommitInfo.getStateToken();
+                if (stateToken != null) {
+                    partitionTokens.compute(partitionId, (k, v) -> {
+                        if (v == null || version > v.first) {
+                            return Pair.of(version, stateToken);
+                        }
+                        return v;
+                    });
+                }
             }
 
             tableMap.compute(tableId, (k, v) -> {
@@ -2371,8 +2375,8 @@ public class DatabaseTransactionMgr {
             long versionTime = entry.getValue().getMiddle();
             Partition partition = entry.getValue().getRight();
             partition.updateVisibleVersionAndTime(version, versionTime);
-            Pair<Long, String> token = partitionTokens.get(partition.getId());
-            if (token != null && token.second != null && token.first == version) {
+            Pair<Long, String> token = partitionTokens.isEmpty() ? null : partitionTokens.get(partition.getId());
+            if (token != null && token.first == version) {
                 partition.setStateToken(new PartitionStateToken(token.second, version, versionTime));
             }
             partitionVisibleVersions.put(partition.getId(), version);
