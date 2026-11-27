@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.trees.plans.commands.info;
 
 import org.apache.doris.analysis.CreateTableLikeStmt;
+import org.apache.doris.analysis.TableName;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
@@ -55,6 +56,10 @@ public class CreateTableLikeInfo {
     public CreateTableLikeStmt translateToLegacyStmt() throws DdlException {
         return new CreateTableLikeStmt(ifNotExists, isTemp, tableName.transferToTableName(),
                 existedTableName.transferToTableName(), rollupNames, withAllRollup);
+    }
+
+    public TableName getTemporaryTableTarget() {
+        return isTemp ? tableName.transferToTableName() : null;
     }
 
     /** validate */

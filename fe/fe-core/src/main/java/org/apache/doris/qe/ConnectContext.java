@@ -957,14 +957,13 @@ public class ConnectContext {
                     }
                     return;
                 }
+                if (temporaryTableIdsToDbIds.isEmpty() && unresolvedTemporaryTables.isEmpty()) {
+                    return;
+                }
                 snapshot = new HashMap<>(temporaryTableIdsToDbIds);
                 unresolved = new HashMap<>(unresolvedTemporaryTables);
                 awaitingReplay = new HashMap<>(temporaryTableTargetsAwaitingReplay);
             }
-            if (snapshot.isEmpty() && unresolved.isEmpty()) {
-                return;
-            }
-
             Env currentEnv = Env.getCurrentEnv();
             InternalCatalog catalog = currentEnv.getInternalCatalog();
             DdlException failure = null;

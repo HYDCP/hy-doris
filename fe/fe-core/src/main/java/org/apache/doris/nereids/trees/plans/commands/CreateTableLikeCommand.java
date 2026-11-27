@@ -19,6 +19,7 @@ package org.apache.doris.nereids.trees.plans.commands;
 
 import org.apache.doris.analysis.CreateTableLikeStmt;
 import org.apache.doris.analysis.StmtType;
+import org.apache.doris.analysis.TableName;
 import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
@@ -53,12 +54,12 @@ public class CreateTableLikeCommand extends Command implements ForwardWithSync {
     public void run(ConnectContext ctx, StmtExecutor executor) throws Exception {
         executor.checkBlockRules();
         info.validate(ctx);
-        CreateTableLikeStmt stmt = toLegacyStmt();
+        CreateTableLikeStmt stmt = info.translateToLegacyStmt();
         doRun(stmt, ctx, executor);
     }
 
-    public CreateTableLikeStmt toLegacyStmt() throws DdlException {
-        return info.translateToLegacyStmt();
+    public TableName getTemporaryTableTarget() {
+        return info.getTemporaryTableTarget();
     }
 
     @Override

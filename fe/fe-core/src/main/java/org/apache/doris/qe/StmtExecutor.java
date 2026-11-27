@@ -638,7 +638,7 @@ public class StmtExecutor {
     }
 
     public void execute(TUniqueId queryId) throws Exception {
-        if (context.getConnectType() != ConnectType.MYSQL) {
+        if (context.isProxy() || context.getConnectType() != ConnectType.MYSQL) {
             executeStatement(queryId);
             return;
         }
@@ -1408,7 +1408,7 @@ public class StmtExecutor {
     }
 
     // The owner is the originating FE connection even though the Master executes the DDL.
-    private TableName getForwardedTemporaryTableTarget() throws DdlException {
+    private TableName getForwardedTemporaryTableTarget() {
         if (parsedStmt instanceof LogicalPlanAdapter) {
             LogicalPlan plan = ((LogicalPlanAdapter) parsedStmt).getLogicalPlan();
             if (plan instanceof CreateTableCommand) {
@@ -1417,7 +1417,7 @@ public class StmtExecutor {
                     return new TableName(info.getCtlName(), info.getDbName(), info.getTableName());
                 }
             } else if (plan instanceof CreateTableLikeCommand) {
-                return getTemporaryLikeTarget(((CreateTableLikeCommand) plan).toLegacyStmt());
+                return ((CreateTableLikeCommand) plan).getTemporaryTableTarget();
             }
         } else if (parsedStmt instanceof CreateTableLikeStmt) {
             return getTemporaryLikeTarget((CreateTableLikeStmt) parsedStmt);

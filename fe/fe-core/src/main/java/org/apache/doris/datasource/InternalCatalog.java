@@ -1065,7 +1065,9 @@ public class InternalCatalog implements CatalogIf<Database> {
             table.writeUnlock();
         }
 
-        Env.getCurrentEnv().getQueryStats().clear(getId(), db.getId(), table.getId());
+        Env env = Env.getCurrentEnv();
+        long catalogId = table.isTemporary() ? getId() : env.getCurrentCatalog().getId();
+        env.getQueryStats().clear(catalogId, db.getId(), table.getId());
         Env.getCurrentEnv().getMtmvService().dropTable(table);
         if (Config.isCloudMode()) {
             ((CloudGlobalTransactionMgr) Env.getCurrentGlobalTransactionMgr())
