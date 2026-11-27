@@ -68,7 +68,7 @@ TEST(QueryStatisticsProgressTest, OperatorOutputIsCountedOnceWithAndWithoutLimit
         Source source(state.obj_pool(), check_limit);
         RuntimeProfile profile("test");
         pipeline::LocalStateInfo info {&profile, {}, nullptr, {}, 0};
-        state.resize_op_id_to_local_state(1);
+        state.resize_op_id_to_local_state(-1);
         ASSERT_TRUE(source.setup_local_state(&state, info).ok());
         vectorized::Block block;
         bool eos = false;
