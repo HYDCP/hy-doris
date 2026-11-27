@@ -17,8 +17,11 @@
 
 package org.apache.doris.catalog;
 
+import org.apache.doris.analysis.Analyzer;
 import org.apache.doris.analysis.CreateTableStmt;
 import org.apache.doris.analysis.DropTableStmt;
+import org.apache.doris.analysis.NativeInsertStmt;
+import org.apache.doris.analysis.QueryStmt;
 import org.apache.doris.analysis.TableName;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.jmockit.Deencapsulation;
@@ -26,6 +29,7 @@ import org.apache.doris.common.util.Util;
 import org.apache.doris.datasource.CatalogMgr;
 import org.apache.doris.datasource.ExternalCatalog;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.nereids.analyzer.UnboundTableSink;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.trees.plans.Plan;
@@ -38,6 +42,10 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
+
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 
 class TemporaryTableDropTest {
     @Test
@@ -109,6 +117,43 @@ class TemporaryTableDropTest {
         db.getIdToTableRef().remove(created.getId());
         Assertions.assertThrows(AnalysisException.class,
                 () -> InsertUtils.getTargetTable(sink, ctx));
+    }
+
+    @Test
+    void legacyCtasCollectsAndBindsTheCreatedTable() throws Exception {
+        Env env = Mockito.mock(Env.class, Mockito.RETURNS_DEEP_STUBS);
+        Analyzer analyzer = Mockito.mock(Analyzer.class);
+        InternalCatalog catalog = Mockito.mock(InternalCatalog.class);
+        Database db = new Database(10L, "db");
+        OlapTable created = new OlapTable(12L, "ctas_target", ImmutableList.of(), KeysType.DUP_KEYS,
+                new SinglePartitionInfo(), null);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setThreadLocalInfo();
+        try (MockedStatic<Env> mocked = Mockito.mockStatic(Env.class)) {
+            mocked.when(Env::getCurrentEnv).thenReturn(env);
+            OlapTable shadow = new OlapTable(13L, Util.generateTempTableInnerName("ctas_target"), true,
+                    ImmutableList.of(), KeysType.DUP_KEYS, new SinglePartitionInfo(), null, null);
+            Assertions.assertTrue(db.registerTable(created));
+            Assertions.assertTrue(db.registerTable(shadow));
+            Assertions.assertSame(shadow, db.getTableNullable("ctas_target"));
+
+            Mockito.when(analyzer.getEnv()).thenReturn(env);
+            CatalogMgr catalogs = env.getCatalogMgr();
+            Mockito.when(catalogs.getCatalog("internal")).thenReturn(catalog);
+            Mockito.when(catalog.getDbOrAnalysisException("db")).thenReturn(db);
+            Mockito.when(env.getAccessManager().checkTblPriv(ctx, "internal", "db", "ctas_target",
+                    PrivPredicate.LOAD)).thenReturn(true);
+            NativeInsertStmt insert = new NativeInsertStmt(new TableName("internal", "db", "ctas_target"),
+                    null, null, Mockito.mock(QueryStmt.class), null, null, true);
+            insert.setCtasTargetTableId(created.getId());
+            Map<Long, TableIf> locked = new HashMap<>();
+            insert.getTables(analyzer, locked, Collections.emptySet());
+            Assertions.assertEquals(Collections.singletonMap(created.getId(), created), locked);
+            Deencapsulation.invoke(insert, "initTargetTable", analyzer);
+            Assertions.assertSame(created, insert.getTargetTable());
+        } finally {
+            ConnectContext.remove();
+        }
     }
 
     @Test
