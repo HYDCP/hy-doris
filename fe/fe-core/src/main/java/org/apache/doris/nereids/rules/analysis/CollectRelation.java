@@ -26,6 +26,7 @@ import org.apache.doris.mtmv.BaseTableInfo;
 import org.apache.doris.nereids.CTEContext;
 import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.PlannerHook;
+import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.StatementContext.TableFrom;
 import org.apache.doris.nereids.analyzer.UnboundRelation;
 import org.apache.doris.nereids.analyzer.UnboundResultSink;
@@ -40,6 +41,7 @@ import org.apache.doris.nereids.rules.exploration.mv.InitMaterializationContextH
 import org.apache.doris.nereids.trees.expressions.CTEId;
 import org.apache.doris.nereids.trees.expressions.SubqueryExpr;
 import org.apache.doris.nereids.trees.plans.Plan;
+import org.apache.doris.nereids.trees.plans.commands.insert.InsertUtils;
 import org.apache.doris.nereids.trees.plans.logical.LogicalCTE;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSubQueryAlias;
@@ -129,6 +131,14 @@ public class CollectRelation implements AnalysisRuleFactory {
 
     private Plan collectFromUnboundSink(MatchingContext<UnboundLogicalSink<Plan>> ctx) {
         List<String> nameParts = ctx.root.getNameParts();
+        if (ctx.root instanceof UnboundTableSink && ((UnboundTableSink<?>) ctx.root).getTargetTableId().isPresent()) {
+            StatementContext statement = ctx.cascadesContext.getConnectContext().getStatementContext();
+            List<String> qualifier = RelationUtil.getQualifierName(statement.getConnectContext(), nameParts);
+            TableIf target = InsertUtils.getTargetDbAndTable(ctx.root, statement.getConnectContext()).second;
+            statement.getInsertTargetTables().put(qualifier, target);
+            setInsertTargetSchema(statement, qualifier, target);
+            return null;
+        }
         switch (nameParts.size()) {
             case 1:
                 // table
@@ -202,15 +212,19 @@ public class CollectRelation implements AnalysisRuleFactory {
             collectMTMVCandidates(table, cascadesContext);
         }
         if (tableFrom == TableFrom.INSERT_TARGET) {
-            if (!cascadesContext.getStatementContext().getInsertTargetSchema().isEmpty()) {
-                LOG.warn("collect insert target table '{}' more than once.", tableQualifier);
-            }
-            cascadesContext.getStatementContext().getInsertTargetSchema().clear();
-            cascadesContext.getStatementContext().getInsertTargetSchema().addAll(table.getFullSchema());
+            setInsertTargetSchema(cascadesContext.getStatementContext(), tableQualifier, table);
         }
         if (table instanceof View) {
             parseAndCollectFromView(tableQualifier, (View) table, cascadesContext);
         }
+    }
+
+    private void setInsertTargetSchema(StatementContext statement, List<String> qualifier, TableIf table) {
+        if (!statement.getInsertTargetSchema().isEmpty()) {
+            LOG.warn("collect insert target table '{}' more than once.", qualifier);
+        }
+        statement.getInsertTargetSchema().clear();
+        statement.getInsertTargetSchema().addAll(table.getFullSchema());
     }
 
     private void collectMTMVCandidates(TableIf table, CascadesContext cascadesContext) {

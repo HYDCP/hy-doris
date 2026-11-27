@@ -42,7 +42,18 @@ suite("test_temp_table_drop_owner", "p0,docker") {
                 sql "DROP TABLE " + target
                 exception "Unknown table"
             }
+            test {
+                sql "DROP TEMPORARY TABLE " + target
+                exception "Unknown table"
+            }
         }
         assertEquals([[10]], sql("SELECT id FROM test_temp_table_drop_owner ORDER BY id"))
+        connectInDocker(context.config.jdbcUser, context.config.jdbcPassword) {
+            sql "DROP TEMPORARY TABLE " + target
+        }
+        test {
+            sql "SELECT id FROM test_temp_table_drop_owner"
+            exception "does not exist"
+        }
     }
 }
