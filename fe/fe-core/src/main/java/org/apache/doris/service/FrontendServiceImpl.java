@@ -2493,6 +2493,9 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                 || !request.getToken().equals(env.getToken())) {
             status.setStatusCode(TStatusCode.NOT_AUTHORIZED);
             status.addToErrorMsgs("Invalid FE cluster credentials");
+        } else if (Strings.isNullOrEmpty(request.getSessionId())) {
+            status.setStatusCode(TStatusCode.INVALID_ARGUMENT);
+            status.addToErrorMsgs("Temporary table cleanup requires a session ID");
         } else {
             try {
                 InternalCatalog catalog = env.getInternalCatalog();

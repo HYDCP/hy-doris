@@ -258,6 +258,7 @@ public class ConnectContext {
     private final Map<Long, Long> temporaryTableIdsToDbIds = new HashMap<>();
     private int activeStatements;
     private long temporaryTableJournalId;
+    private long temporaryTableDropJournalId;
     private final Map<Long, TableName> temporaryTableTargetsAwaitingReplay = new HashMap<>();
     // Keyed by qualified name and original database ID for disconnect cleanup. A negative journal ID
     // means the statement RPC did not return a successful CREATE acknowledgement.
@@ -914,34 +915,40 @@ public class ConnectContext {
         if (!hasPendingTemporaryTables()) {
             return;
         }
+        long deadline = MasterOpExecutor.temporaryTableResetDeadline(this);
         TransactionEntry transaction = txnEntry;
         if (transaction != null && transaction.isTxnModel()) {
             try {
-                transaction.abortTransactionForTemporaryTableReset();
+                transaction.abortTransactionForTemporaryTableReset(deadline);
             } catch (Exception e) {
                 throw new DdlException("Failed to roll back transaction " + transaction.getTransactionId(), e);
             }
             txnEntry = null;
         }
-        cleanupTemporaryTables(true);
+        cleanupTemporaryTables(true, deadline);
         // A legacy FE can still recover a recycled database with the old owner's tables.
         // Alive-session reporting reads this ID directly from the connection registry.
         sessionId = UUID.randomUUID().toString();
     }
 
     private synchronized boolean hasPendingTemporaryTables() {
-        return !temporaryTableIdsToDbIds.isEmpty() || !unresolvedTemporaryTables.isEmpty();
+        return !temporaryTableIdsToDbIds.isEmpty() || !unresolvedTemporaryTables.isEmpty()
+                || temporaryTableDropJournalId > 0;
+    }
+
+    synchronized void recordTemporaryTableDropJournal(long journalId) {
+        temporaryTableDropJournalId = Math.max(temporaryTableDropJournalId, journalId);
     }
 
     protected void deleteTempTable() {
         try {
-            cleanupTemporaryTables(false);
+            cleanupTemporaryTables(false, 0);
         } catch (DdlException e) {
             LOG.warn("Temporary table cleanup failed for session {}", sessionId, e);
         }
     }
 
-    private void cleanupTemporaryTables(boolean strict) throws DdlException {
+    private void cleanupTemporaryTables(boolean strict, long deadline) throws DdlException {
         if (isProxy) {
             return;
         }
@@ -957,7 +964,7 @@ public class ConnectContext {
                     }
                     return;
                 }
-                if (temporaryTableIdsToDbIds.isEmpty() && unresolvedTemporaryTables.isEmpty()) {
+                if (!hasPendingTemporaryTables()) {
                     return;
                 }
                 snapshot = new HashMap<>(temporaryTableIdsToDbIds);
@@ -979,6 +986,9 @@ public class ConnectContext {
                 }
             }
             for (Map.Entry<Long, Long> entry : snapshot.entrySet()) {
+                if (strict && !currentEnv.isMaster()) {
+                    MasterOpExecutor.checkTemporaryTableResetDeadline(deadline);
+                }
                 long tableId = entry.getKey();
                 long dbId = entry.getValue();
                 try {
@@ -988,7 +998,7 @@ public class ConnectContext {
                             catalog.dropTemporaryTable(db, tableId, sessionId);
                         }
                     } else {
-                        dropForwardedTemporaryTable(dbId, tableId, strict, awaitingReplay.get(tableId));
+                        dropForwardedTemporaryTable(dbId, tableId, strict, awaitingReplay.get(tableId), deadline);
                     }
                     removeTemporaryTable(tableId);
                 } catch (Exception e) {
@@ -1018,8 +1028,32 @@ public class ConnectContext {
                 }
                 LOG.warn("Temporary table cleanup incomplete for session {}", sessionId, failure);
             }
+            if (strict) {
+                waitForTemporaryTableDrops(currentEnv, deadline);
+            }
         } finally {
             tempTableCleanupLock.unlock();
+        }
+    }
+
+    private void waitForTemporaryTableDrops(Env env, long deadline) throws DdlException {
+        long journalId;
+        synchronized (this) {
+            journalId = temporaryTableDropJournalId;
+        }
+        if (journalId == 0) {
+            return;
+        }
+        if (env.isMaster()) {
+            if (!env.isReady() || env.getMaxJournalId() < journalId) {
+                throw new DdlException("Cannot reset until temporary table DROP journal " + journalId + " is replayed");
+            }
+        } else {
+            new MasterOpExecutor(this).withTemporaryTableResetDeadline(deadline)
+                    .waitForTemporaryTableResetReplay(journalId);
+        }
+        synchronized (this) {
+            temporaryTableDropJournalId = 0;
         }
     }
 
@@ -1055,9 +1089,9 @@ public class ConnectContext {
         snapshot.putAll(owned);
     }
 
-    private void dropForwardedTemporaryTable(long dbId, long tableId, boolean strict, TableName awaitingReplay)
-            throws Exception {
-        MasterOpExecutor operation = new MasterOpExecutor(this);
+    private void dropForwardedTemporaryTable(long dbId, long tableId, boolean strict, TableName awaitingReplay,
+            long deadline) throws Exception {
+        MasterOpExecutor operation = new MasterOpExecutor(this).withTemporaryTableResetDeadline(deadline);
         if (operation.tryDropTemporaryTableById(dbId, tableId, strict)) {
             return;
         }
@@ -1087,7 +1121,7 @@ public class ConnectContext {
         if (!table.isTemporary() || !sessionId.equals(Util.getTempTableSessionId(table.getName()))) {
             throw new DdlException("Table " + tableId + " is not a temporary table of the closing session");
         }
-        forwardTemporaryTableDrop(db.getFullName(), table.getName());
+        forwardTemporaryTableDrop(db.getFullName(), table.getName(), deadline);
         if (db.getTableNullable(tableId) != null) {
             throw new DdlException("Temporary table " + tableId + " is still present after forwarded DROP");
         }
@@ -1111,7 +1145,7 @@ public class ConnectContext {
             throws Exception {
         if (!env.isMaster()) {
             // The create may still be absent in the local journal. Check directly at the Master.
-            forwardTemporaryTableDrop(dbName, innerName);
+            forwardTemporaryTableDrop(dbName, innerName, 0);
             return;
         }
         if (db != null) {
@@ -1122,7 +1156,7 @@ public class ConnectContext {
         }
     }
 
-    private void forwardTemporaryTableDrop(String dbName, String innerName) throws Exception {
+    private void forwardTemporaryTableDrop(String dbName, String innerName, long deadline) throws Exception {
         // A mode-1 legacy Master lowercases its input before reconstructing the owner's internal name.
         // Forward the display name in that mode. DROP TEMPORARY checks the type under the database lock.
         String tableName = Env.isStoredTableNamesLowerCase()
@@ -1131,7 +1165,7 @@ public class ConnectContext {
                 dbName.replace("`", "``"), tableName.replace("`", "``"));
         MasterOpExecutor operation = new MasterOpExecutor(new OriginStatement(sql, 0), this,
                 RedirectStatus.FORWARD_WITH_SYNC, false);
-        operation.executeTemporaryTableDrop();
+        operation.withTemporaryTableResetDeadline(deadline).executeTemporaryTableDrop();
     }
 
     synchronized void beginStatementExecution() throws DdlException {

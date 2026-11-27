@@ -82,6 +82,8 @@ class ForwardedTemporaryTableCleanupTest {
                     request.deepCopy().setSessionId("another-session")).getStatus().getStatusCode());
             Assertions.assertEquals(TStatusCode.INTERNAL_ERROR, service.dropSessionTemporaryTable(
                     request.deepCopy().setTableId(12L)).getStatus().getStatusCode());
+            Assertions.assertEquals(TStatusCode.INVALID_ARGUMENT, service.dropSessionTemporaryTable(
+                    request.deepCopy().setSessionId("")).getStatus().getStatusCode());
             Assertions.assertSame(owned, db.getTableNullable(11L));
             TDropSessionTemporaryTableResult response = service.dropSessionTemporaryTable(request);
             Assertions.assertEquals(TStatusCode.OK, response.getStatus().getStatusCode());

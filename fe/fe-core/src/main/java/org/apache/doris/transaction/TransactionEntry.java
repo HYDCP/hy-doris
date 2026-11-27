@@ -337,15 +337,37 @@ public class TransactionEntry {
         return abortTransaction("user rollback");
     }
 
-    public long abortTransactionForTemporaryTableReset() throws Exception {
-        return abortTransaction("user rollback", true);
+    public void abortTransactionForTemporaryTableReset(long deadline) throws Exception {
+        if (!isTransactionBegan || Env.getCurrentEnv().isMaster() || Config.isCloudMode()) {
+            try {
+                abortTransaction();
+            } catch (TransactionNotFoundException e) {
+                TransactionState state = Env.getCurrentGlobalTransactionMgr().getTransactionState(dbId, transactionId);
+                if (!isTransactionBegan || state == null || state.getTransactionStatus() != TransactionStatus.ABORTED) {
+                    throw e;
+                }
+            }
+            return;
+        }
+        MasterOpExecutor executor = new MasterOpExecutor(new OriginStatement("rollback", 0), ConnectContext.get(),
+                RedirectStatus.NO_FORWARD, false).withTemporaryTableResetDeadline(deadline);
+        try {
+            executor.executeCheckingSqlStatus();
+        } catch (DdlException e) {
+            boolean aborted;
+            try {
+                aborted = executor.isTemporaryTableResetTransactionAborted(dbId, transactionId);
+            } catch (Exception statusFailure) {
+                e.addSuppressed(statusFailure);
+                throw e;
+            }
+            if (!aborted) {
+                throw e;
+            }
+        }
     }
 
     private long abortTransaction(String reason) throws Exception {
-        return abortTransaction(reason, false);
-    }
-
-    private long abortTransaction(String reason, boolean checkForwardedSqlStatus) throws Exception {
         if (isTransactionBegan) {
             if (Env.getCurrentEnv().isMaster() || Config.isCloudMode()) {
                 beforeFinishTransaction();
@@ -356,11 +378,7 @@ public class TransactionEntry {
                 MasterOpExecutor masterOpExecutor = new MasterOpExecutor(originStmt, ConnectContext.get(),
                         RedirectStatus.NO_FORWARD, false);
                 LOG.info("forward rollback to Master for txn_id={}", transactionId);
-                if (checkForwardedSqlStatus) {
-                    masterOpExecutor.executeCheckingSqlStatus();
-                } else {
-                    masterOpExecutor.execute();
-                }
+                masterOpExecutor.execute();
                 return transactionId;
             }
         } else if (isInsertValuesTxnBegan()) {

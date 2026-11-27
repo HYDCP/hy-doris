@@ -31,10 +31,15 @@ import org.apache.doris.thrift.TMasterOpRequest;
 import org.apache.doris.thrift.TMasterOpResult;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TStatusCode;
+import org.apache.doris.thrift.TWaitingTxnStatusRequest;
+import org.apache.doris.thrift.TWaitingTxnStatusResult;
+import org.apache.doris.transaction.TransactionStatus;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.thrift.TApplicationException;
+
+import java.util.concurrent.TimeUnit;
 
 /**
  * MasterOpExecutor is used to send request to Master FE.
@@ -45,6 +50,7 @@ public class MasterOpExecutor extends FEOpExecutor {
     private static final Logger LOG = LogManager.getLogger(MasterOpExecutor.class);
     private final int journalWaitTimeoutMs;
     private boolean trackTemporaryTableCreation;
+    private long temporaryTableResetDeadline;
 
     public MasterOpExecutor(OriginStatement originStmt, ConnectContext ctx, RedirectStatus status, boolean isQuery) {
         super(new TNetworkAddress(ctx.getEnv().getMasterHost(), ctx.getEnv().getMasterRpcPort()),
@@ -63,6 +69,36 @@ public class MasterOpExecutor extends FEOpExecutor {
         this(null, ctx, RedirectStatus.FORWARD_WITH_SYNC, true);
     }
 
+    static long temporaryTableResetDeadline(ConnectContext ctx) {
+        return System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(
+                (int) (ctx.getExecTimeout() * 1000 * RPC_TIMEOUT_COEFFICIENT));
+    }
+
+    static void checkTemporaryTableResetDeadline(long deadline) throws DdlException {
+        limitToTemporaryTableResetDeadline(Integer.MAX_VALUE, deadline);
+    }
+
+    private static int limitToTemporaryTableResetDeadline(int timeoutMs, long deadline) throws DdlException {
+        if (deadline == 0 || timeoutMs == 0) {
+            return timeoutMs;
+        }
+        long remaining = deadline - System.nanoTime();
+        if (remaining <= 0) {
+            throw new DdlException("Timed out cleaning temporary tables on connection reset");
+        }
+        return (int) Math.min(timeoutMs, Math.max(1, TimeUnit.NANOSECONDS.toMillis(remaining)));
+    }
+
+    public MasterOpExecutor withTemporaryTableResetDeadline(long deadline) {
+        temporaryTableResetDeadline = deadline;
+        return this;
+    }
+
+    @Override
+    protected int getThriftTimeoutMs() throws DdlException {
+        return limitToTemporaryTableResetDeadline(super.getThriftTimeoutMs(), temporaryTableResetDeadline);
+    }
+
     @Override
     public void execute() throws Exception {
         super.execute();
@@ -79,12 +115,30 @@ public class MasterOpExecutor extends FEOpExecutor {
         waitOnReplaying();
     }
 
+    public boolean isTemporaryTableResetTransactionAborted(long dbId, long txnId) throws Exception {
+        FrontendService.Client client = ClientPool.frontendPool.borrowObject(feAddr, getThriftTimeoutMs());
+        boolean transportOk = false;
+        try {
+            TWaitingTxnStatusResult reply = client.waitingTxnStatus(
+                    new TWaitingTxnStatusRequest().setDbId(dbId).setTxnId(txnId));
+            transportOk = true;
+            return reply.getStatus().getStatusCode() == TStatusCode.OK && reply.isSetTxnStatusId()
+                    && reply.getTxnStatusId() == TransactionStatus.ABORTED.value();
+        } finally {
+            if (transportOk) {
+                ClientPool.frontendPool.returnObject(feAddr, client);
+            } else {
+                ClientPool.frontendPool.invalidateObject(feAddr, client);
+            }
+        }
+    }
+
     // Only UNKNOWN_METHOD permits a fallback to SQL on an older Master.
     boolean tryDropTemporaryTableById(long dbId, long tableId, boolean waitForReplay) throws Exception {
         Env env = ctx.getEnv();
         TDropSessionTemporaryTableRequest request = new TDropSessionTemporaryTableRequest(env.getClusterId(),
                 env.getToken(), ctx.getSessionId(), dbId, tableId);
-        FrontendService.Client client = ClientPool.frontendPool.borrowObject(feAddr, thriftTimeoutMs);
+        FrontendService.Client client = ClientPool.frontendPool.borrowObject(feAddr, getThriftTimeoutMs());
         boolean transportOk = false;
         TDropSessionTemporaryTableResult reply;
         try {
@@ -108,7 +162,7 @@ public class MasterOpExecutor extends FEOpExecutor {
                     + reply.getStatus().getStatusCode() + " " + reply.getStatus().getErrorMsgs());
         }
         if (waitForReplay) {
-            env.getJournalObservable().waitOn(reply.getMaxJournalId(), journalWaitTimeoutMs);
+            ctx.recordTemporaryTableDropJournal(reply.getMaxJournalId());
         }
         return true;
     }
@@ -154,7 +208,12 @@ public class MasterOpExecutor extends FEOpExecutor {
 
     void waitOnReplaying() throws DdlException {
         LOG.info("forwarding to master get result max journal id: {}", result.maxJournalId);
-        ctx.getEnv().getJournalObservable().waitOn(result.maxJournalId, journalWaitTimeoutMs);
+        waitForTemporaryTableResetReplay(result.maxJournalId);
+    }
+
+    void waitForTemporaryTableResetReplay(long journalId) throws DdlException {
+        ctx.getEnv().getJournalObservable().waitOn(journalId,
+                limitToTemporaryTableResetDeadline(journalWaitTimeoutMs, temporaryTableResetDeadline));
     }
 
     public void syncJournal() throws Exception {

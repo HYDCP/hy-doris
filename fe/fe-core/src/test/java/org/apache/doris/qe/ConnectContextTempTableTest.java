@@ -41,7 +41,10 @@ import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TStatus;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TTxnParams;
+import org.apache.doris.thrift.TWaitingTxnStatusRequest;
+import org.apache.doris.thrift.TWaitingTxnStatusResult;
 import org.apache.doris.transaction.TransactionEntry;
+import org.apache.doris.transaction.TransactionStatus;
 
 import com.google.common.collect.ImmutableList;
 import mockit.Expectations;
@@ -131,7 +134,7 @@ class ConnectContextTempTableTest {
             {
                 transaction.isTxnModel();
                 result = true;
-                transaction.abortTransactionForTemporaryTableReset();
+                transaction.abortTransactionForTemporaryTableReset(anyLong);
                 result = new DdlException("injected rollback failure");
             }
         };
@@ -281,6 +284,58 @@ class ConnectContextTempTableTest {
                     times = 0;
                 }
             };
+        } finally {
+            ConnectContext.remove();
+        }
+    }
+
+    @Test
+    void followerResetsTwiceAfterMasterConfirmsTransactionAborted(
+            @Mocked GenericPool<FrontendService.Client> pool, @Mocked FrontendService.Client client) throws Exception {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.setThreadLocalInfo();
+        TransactionEntry txn = new TransactionEntry();
+        txn.setTxnConf(new TTxnParams().setNeedTxn(true).setTxnId(-1));
+        Deencapsulation.setField(txn, "isTransactionBegan", true);
+        Deencapsulation.setField(txn, "dbId", 10L);
+        Deencapsulation.setField(txn, "transactionId", 19L);
+        ctx.setTxnEntry(txn);
+        ctx.addTemporaryTable(10L, 11L);
+        new MockUp<FEOpExecutor>() {
+            @Mock
+            protected TMasterOpRequest buildStmtForwardParams() {
+                return new TMasterOpRequest();
+            }
+        };
+        new Expectations() {
+            {
+                FRONTEND_POOL.borrowObject((TNetworkAddress) any, anyInt);
+                result = client;
+                client.forward((TMasterOpRequest) any);
+                result = new TMasterOpResult().setStatusCode(1105).setErrMessage("transaction not found");
+                times = 1;
+                client.waitingTxnStatus(new TWaitingTxnStatusRequest().setDbId(10L).setTxnId(19L));
+                result = new TWaitingTxnStatusResult().setStatus(new TStatus(TStatusCode.OK))
+                        .setTxnStatusId(TransactionStatus.ABORTED.value());
+                times = 1;
+                client.dropSessionTemporaryTable((TDropSessionTemporaryTableRequest) any);
+                result = new TDropSessionTemporaryTableResult(new TStatus(TStatusCode.OK), 42L);
+                times = 1;
+                env.getJournalObservable().waitOn(42L, anyInt);
+                times = 1;
+            }
+        };
+        try {
+            MysqlConnectProcessor processor = new MysqlConnectProcessor(ctx);
+            processor.handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType(),
+                    ctx.getState().getErrorMessage());
+            Assertions.assertNull(ctx.getTxnEntry());
+            Assertions.assertTrue(ctx.snapshotTemporaryTables().isEmpty());
+            processor.handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
         } finally {
             ConnectContext.remove();
         }
@@ -458,7 +513,7 @@ class ConnectContextTempTableTest {
     }
 
     @Test
-    void replayTimeoutKeepsConfirmedTableIdsForResetRetry(@Mocked GenericPool<FrontendService.Client> pool,
+    void resetWaitsOnceForAllConfirmedDropsAndDoesNotResendThem(@Mocked GenericPool<FrontendService.Client> pool,
             @Mocked FrontendService.Client client) throws Exception {
         mockLocalCatalog(false);
         ConnectContext ctx = new ConnectContext();
@@ -479,13 +534,15 @@ class ConnectContextTempTableTest {
                         .setCreatedTemporaryTableDbIds(Collections.singletonMap(11L, 10L));
                 client.dropSessionTemporaryTable((TDropSessionTemporaryTableRequest) any);
                 result = new TDropSessionTemporaryTableResult(new TStatus(TStatusCode.OK), 43L);
+                result = new TDropSessionTemporaryTableResult(new TStatus(TStatusCode.OK), 44L);
                 times = 2;
                 env.getJournalObservable().waitOn(42L, anyInt);
                 result = new DdlException("replay is behind");
                 times = 1;
-                env.getJournalObservable().waitOn(43L, anyInt);
+                env.getJournalObservable().waitOn(44L, anyInt);
                 result = new DdlException("DROP replay is behind");
                 result = null;
+                times = 2;
             }
         };
         try {
@@ -494,14 +551,21 @@ class ConnectContextTempTableTest {
                     () -> Deencapsulation.invoke(create, "forwardToMaster"));
             Assertions.assertTrue(error.getMessage().contains("replay is behind"));
             Assertions.assertEquals(Collections.singletonMap(11L, 10L), ctx.snapshotTemporaryTables());
+            ctx.addTemporaryTable(10L, 12L);
 
             MysqlConnectProcessor processor = new MysqlConnectProcessor(ctx);
             processor.handleResetConnection();
             Assertions.assertEquals(MysqlStateType.ERR, ctx.getState().getStateType());
-            Assertions.assertEquals(Collections.singletonMap(11L, 10L), ctx.snapshotTemporaryTables());
+            Assertions.assertTrue(ctx.snapshotTemporaryTables().isEmpty());
             processor.handleResetConnection();
             Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
             Assertions.assertTrue(ctx.snapshotTemporaryTables().isEmpty());
+            new Verifications() {
+                {
+                    env.getJournalObservable().waitOn(43L, anyInt);
+                    times = 0;
+                }
+            };
         } finally {
             ConnectContext.remove();
         }

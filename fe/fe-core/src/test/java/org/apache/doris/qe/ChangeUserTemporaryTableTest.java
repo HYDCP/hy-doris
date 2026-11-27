@@ -75,7 +75,7 @@ class ChangeUserTemporaryTableTest {
             if (timedOut) {
                 TransactionNotFoundException error = new TransactionNotFoundException("transaction timed out", 11L);
                 Mockito.when(transaction.abortTransaction()).thenThrow(error);
-                Mockito.when(transaction.abortTransactionForTemporaryTableReset()).thenThrow(error);
+                Mockito.doThrow(error).when(transaction).abortTransactionForTemporaryTableReset(Mockito.anyLong());
             }
             ctx.setTxnEntry(transaction);
             String sessionId = ctx.getSessionId();

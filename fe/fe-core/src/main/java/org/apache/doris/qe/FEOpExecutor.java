@@ -103,6 +103,10 @@ public class FEOpExecutor {
         return statementRpcAttempted;
     }
 
+    protected int getThriftTimeoutMs() throws DdlException {
+        return thriftTimeoutMs;
+    }
+
     public void cancel() throws Exception {
         sendCancel();
     }
@@ -131,7 +135,7 @@ public class FEOpExecutor {
 
         FrontendService.Client client;
         try {
-            client = ClientPool.frontendPool.borrowObject(feAddr, thriftTimeoutMs);
+            client = ClientPool.frontendPool.borrowObject(feAddr, getThriftTimeoutMs());
         } catch (Exception e) {
             // may throw NullPointerException. add err msg
             throw new Exception("Failed to get master client.", e);
@@ -155,7 +159,7 @@ public class FEOpExecutor {
             forwardMsg.append(" : failed");
             Exception exception = new ForwardToMasterException(forwardMsg.toString(), e);
 
-            boolean ok = ClientPool.frontendPool.reopen(client, thriftTimeoutMs);
+            boolean ok = ClientPool.frontendPool.reopen(client, getThriftTimeoutMs());
             if (!ok) {
                 throw exception;
             }
