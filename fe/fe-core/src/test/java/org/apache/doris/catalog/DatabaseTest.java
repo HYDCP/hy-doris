@@ -21,6 +21,7 @@ import org.apache.doris.catalog.MaterializedIndex.IndexState;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ExceptionChecker;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.FeNameFormat;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.common.util.Util;
@@ -100,11 +101,17 @@ public class DatabaseTest {
                     new SinglePartitionInfo(), null, null);
             Assert.assertTrue(db.registerTable(temp));
             Assert.assertSame(temp, db.getTableNullable("tmp_orders"));
+            String mixedCaseInnerName = innerName.replace(FeNameFormat.TEMPORARY_TABLE_SIGN, "_#Temp#_");
+            Assert.assertSame(temp, db.getTemporaryTableNullable(innerName));
+            Assert.assertSame(temp, db.getTemporaryTableNullable(mixedCaseInnerName));
+            Assert.assertNull(db.getNonTempTableNullable(innerName));
+            Assert.assertNull(db.getNonTempTableNullable(mixedCaseInnerName));
 
             OlapTable permanent = new OlapTable(2001L, "TMP_ORDERS", ImmutableList.of(), KeysType.DUP_KEYS,
                     new SinglePartitionInfo(), null);
             Assert.assertTrue(db.registerTable(permanent));
             Assert.assertSame(temp, db.getTableNullable("Tmp_Orders"));
+            Assert.assertSame(permanent, db.getNonTempTableNullable("Tmp_Orders"));
             new ConnectContext().setThreadLocalInfo();
             Assert.assertNull(db.getTemporaryTableNullable("tmp_orders"));
             Assert.assertSame(permanent, db.getTableNullable("tmp_orders"));
@@ -130,7 +137,11 @@ public class DatabaseTest {
             Assert.assertTrue(db.registerTable(temp));
             Assert.assertFalse(db.registerTable(temp));
             Assert.assertSame(temp, db.getTableNullable("TMP_ORDERS"));
-            Assert.assertSame(temp, db.getTemporaryTableNullable(innerName.toLowerCase(Locale.ROOT)));
+            String lowerCaseInnerName = innerName.toLowerCase(Locale.ROOT);
+            String mixedCaseInnerName = innerName.replace(FeNameFormat.TEMPORARY_TABLE_SIGN, "_#Temp#_");
+            Assert.assertSame(temp, db.getTemporaryTableNullable(lowerCaseInnerName));
+            Assert.assertSame(temp, db.getTemporaryTableNullable(mixedCaseInnerName));
+            Assert.assertNull(db.getNonTempTableNullable(lowerCaseInnerName));
         } finally {
             ConnectContext.remove();
         }

@@ -47,6 +47,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.gson.annotations.SerializedName;
 import org.apache.commons.codec.digest.DigestUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -59,7 +60,6 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
@@ -86,8 +86,6 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
     private static final Logger LOG = LogManager.getLogger(Database.class);
 
     private static final String TRANSACTION_QUOTA_SIZE = "transactionQuotaSize";
-    private static final String LOWER_CASE_TEMPORARY_TABLE_SIGN =
-            FeNameFormat.TEMPORARY_TABLE_SIGN.toLowerCase(Locale.ROOT);
 
     @SerializedName(value = "id")
     private long id;
@@ -619,8 +617,11 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
 
     public Table getTemporaryTableNullable(String tableName) {
         boolean ignoreCase = Env.isTableNamesCaseInsensitive() || Env.isStoredTableNamesLowerCase();
+        boolean isInternalName = ignoreCase
+                ? StringUtils.containsIgnoreCase(tableName, FeNameFormat.TEMPORARY_TABLE_SIGN)
+                : Util.isTempTable(tableName);
         String innerName = tableName;
-        if (!Util.isTempTable(tableName) && !(ignoreCase && tableName.contains(LOWER_CASE_TEMPORARY_TABLE_SIGN))) {
+        if (!isInternalName) {
             innerName = Util.generateTempTableInnerName(tableName);
             if (innerName.equals(tableName)) {
                 return null;
@@ -654,7 +655,7 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
         }
 
         Table table = nameToTable.get(tableName);
-        return table;
+        return table != null && !table.isTemporary() ? table : null;
     }
 
     /**
