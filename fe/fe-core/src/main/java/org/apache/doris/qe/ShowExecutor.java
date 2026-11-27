@@ -184,6 +184,7 @@ import org.apache.doris.common.proc.FrontendsProcNode;
 import org.apache.doris.common.proc.LoadProcDir;
 import org.apache.doris.common.proc.PartitionsProcDir;
 import org.apache.doris.common.proc.ProcNodeInterface;
+import org.apache.doris.common.proc.ProcResult;
 import org.apache.doris.common.proc.RollupProcDir;
 import org.apache.doris.common.proc.SchemaChangeProcDir;
 import org.apache.doris.common.proc.TabletsProcDir;
@@ -794,11 +795,8 @@ public class ShowExecutor {
 
     private void handleShowProc() throws AnalysisException {
         ShowProcStmt showProcStmt = (ShowProcStmt) stmt;
-        ShowResultSetMetaData metaData = showProcStmt.getMetaData();
-        ProcNodeInterface procNode = showProcStmt.getNode();
-
-        List<List<String>> finalRows = procNode.fetchResult().getRows();
-        resultSet = new ShowResultSet(metaData, finalRows);
+        ProcResult result = showProcStmt.getNode().fetchResult();
+        resultSet = new ShowResultSet(ShowProcStmt.getMetaData(result), result.getRows());
     }
 
     // Show clusters

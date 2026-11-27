@@ -555,6 +555,9 @@ public class Coordinator implements CoordInterface {
                 ConnectContext.get().getCurrentConnectedFEIp())) {
             currentConnectFE = new TNetworkAddress(ConnectContext.get().getCurrentConnectedFEIp(),
                     Config.rpc_port);
+            if (Config.enable_extended_current_query_stats && !coordAddress.equals(currentConnectFE)) {
+                queryOptions.setReportQueryStatisticsToCoordinator(true);
+            }
         } else {
             currentConnectFE = coordAddress;
         }

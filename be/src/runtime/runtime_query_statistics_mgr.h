@@ -23,8 +23,10 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -42,10 +44,15 @@ namespace vectorized {
 class Block;
 } // namespace vectorized
 
+using QueryStatisticsReports = std::map<TNetworkAddress, std::map<std::string, TQueryStatistics>>;
+
 class QueryStatisticsCtx {
 public:
-    QueryStatisticsCtx(TNetworkAddress fe_addr, TQueryType::type query_type)
-            : _fe_addr(fe_addr), _query_type(query_type) {
+    QueryStatisticsCtx(TNetworkAddress fe_addr, TQueryType::type query_type,
+                       std::optional<TNetworkAddress> monitoring_fe_addr = std::nullopt)
+            : _fe_addr(std::move(fe_addr)),
+              _query_type(query_type),
+              _monitoring_fe_addr(std::move(monitoring_fe_addr)) {
         this->_is_query_finished = false;
         this->_wg_id = -1;
         this->_query_start_time = MonotonicMillis();
@@ -53,12 +60,15 @@ public:
     ~QueryStatisticsCtx() = default;
 
     void collect_query_statistics(TQueryStatistics* tq_s);
+    void append_to_report(const std::string& query_id, QueryStatisticsReports& reports);
 
 public:
     std::vector<std::shared_ptr<QueryStatistics>> _qs_list;
     bool _is_query_finished;
+    bool _task_progress_unavailable = false;
     const TNetworkAddress _fe_addr;
     const TQueryType::type _query_type;
+    const std::optional<TNetworkAddress> _monitoring_fe_addr;
     int64_t _query_finish_time;
     int64_t _wg_id;
     int64_t _query_start_time;
@@ -76,11 +86,13 @@ public:
             std::vector<std::shared_ptr<TRuntimeProfileTree>> load_channel_profile, bool is_done);
 
     void register_query_statistics(std::string query_id, std::shared_ptr<QueryStatistics> qs_ptr,
-                                   TNetworkAddress fe_addr, TQueryType::type query_type);
+                                   TNetworkAddress fe_addr, TQueryType::type query_type,
+                                   std::optional<TNetworkAddress> monitoring_fe_addr);
 
     void report_runtime_query_statistics();
 
     void set_query_finished(std::string query_id);
+    void mark_task_progress_unavailable(const std::string& query_id);
 
     std::shared_ptr<QueryStatistics> get_runtime_query_statistics(std::string query_id);
 
@@ -104,6 +116,9 @@ public:
                                    std::shared_ptr<TRuntimeProfileTree> load_channel_profile_x);
 
 private:
+    void clear_finished_queries(const std::map<std::string, bool>& finished_queries,
+                                const std::map<TNetworkAddress, bool>& rpc_result);
+
     std::shared_mutex _qs_ctx_map_lock;
     std::map<std::string, std::unique_ptr<QueryStatisticsCtx>> _query_statistics_ctx_map;
 

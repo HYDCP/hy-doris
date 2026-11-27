@@ -100,6 +100,7 @@
 #include "runtime/exec_env.h"
 #include "runtime/fragment_mgr.h"
 #include "runtime/runtime_filter_mgr.h"
+#include "runtime/runtime_query_statistics_mgr.h"
 #include "runtime/runtime_state.h"
 #include "runtime/stream_load/new_load_stream_mgr.h"
 #include "runtime/stream_load/stream_load_context.h"
@@ -350,6 +351,7 @@ Status PipelineFragmentContext::prepare(const doris::TPipelineFragmentParams& re
         SCOPED_TIMER(_build_tasks_timer);
         // 6. Build pipeline tasks and initialize local state.
         RETURN_IF_ERROR(_build_pipeline_tasks(request, thread_pool));
+        _query_ctx->add_total_pipeline_tasks(_total_tasks.load(std::memory_order_relaxed));
     }
 
     _init_next_report_time();
@@ -1678,6 +1680,9 @@ Status PipelineFragmentContext::submit() {
         for (auto& t : task) {
             st = scheduler->schedule_task(t);
             if (!st) {
+                // Later instances can still submit tasks after this failure, so there is no reliable denominator.
+                _exec_env->runtime_query_statistics_mgr()->mark_task_progress_unavailable(
+                        print_id(_query_id));
                 cancel(Status::InternalError("submit context to executor fail"));
                 std::lock_guard<std::mutex> l(_task_mutex);
                 _total_tasks = submit_tasks;
@@ -1756,6 +1761,7 @@ void PipelineFragmentContext::close_a_pipeline(PipelineId pipeline_id) {
     }
     std::lock_guard<std::mutex> l(_task_mutex);
     ++_closed_tasks;
+    _query_ctx->finish_pipeline_task();
     if (_closed_tasks == _total_tasks) {
         _close_fragment_instance();
     }

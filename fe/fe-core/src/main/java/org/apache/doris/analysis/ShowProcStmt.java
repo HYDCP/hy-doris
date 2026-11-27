@@ -61,15 +61,15 @@ public class ShowProcStmt extends ShowStmt implements NotFallbackInParser {
 
     @Override
     public ShowResultSetMetaData getMetaData() {
-        ShowResultSetMetaData.Builder builder = ShowResultSetMetaData.builder();
-
-        ProcResult result = null;
         try {
-            result = node.fetchResult();
+            return getMetaData(node.fetchResult());
         } catch (AnalysisException e) {
-            return builder.build();
+            return ShowResultSetMetaData.builder().build();
         }
+    }
 
+    public static ShowResultSetMetaData getMetaData(ProcResult result) {
+        ShowResultSetMetaData.Builder builder = ShowResultSetMetaData.builder();
         for (String col : result.getColumnNames()) {
             builder.addColumn(new Column(col, ScalarType.createVarchar(30)));
         }

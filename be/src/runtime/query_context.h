@@ -194,6 +194,9 @@ public:
 
     void register_cpu_statistics();
 
+    void add_total_pipeline_tasks(int32_t tasks);
+    void finish_pipeline_task();
+
     std::shared_ptr<QueryStatistics> get_cpu_statistics() { return _cpu_statistics; }
 
     doris::pipeline::TaskScheduler* get_pipe_exec_scheduler();

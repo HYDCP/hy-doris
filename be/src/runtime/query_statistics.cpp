@@ -30,6 +30,13 @@ void QueryStatistics::merge(const QueryStatistics& other) {
     scan_rows += other.scan_rows;
     scan_bytes += other.scan_bytes;
     cpu_nanos += other.cpu_nanos;
+    _process_rows.fetch_add(other._process_rows.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
+    _finished_pipeline_tasks.fetch_add(
+            other._finished_pipeline_tasks.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+    _total_pipeline_tasks.fetch_add(other._total_pipeline_tasks.load(std::memory_order_relaxed),
+                                    std::memory_order_relaxed);
     shuffle_send_bytes += other.shuffle_send_bytes;
     shuffle_send_rows += other.shuffle_send_rows;
     _scan_bytes_from_local_storage += other._scan_bytes_from_local_storage;
@@ -62,6 +69,9 @@ void QueryStatistics::to_thrift(TQueryStatistics* statistics) const {
     statistics->__set_scan_bytes(scan_bytes);
     statistics->__set_scan_rows(scan_rows);
     statistics->__set_cpu_ms(cpu_nanos / NANOS_PER_MILLIS);
+    statistics->__set_process_rows(_process_rows.load(std::memory_order_relaxed));
+    statistics->__set_finished_tasks_num(_finished_pipeline_tasks.load(std::memory_order_relaxed));
+    statistics->__set_total_tasks_num(_total_pipeline_tasks.load(std::memory_order_relaxed));
     statistics->__set_returned_rows(returned_rows);
     statistics->__set_max_peak_memory_bytes(max_peak_memory_bytes);
     statistics->__set_current_used_memory_bytes(current_used_memory_bytes);

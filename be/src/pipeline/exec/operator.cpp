@@ -75,6 +75,7 @@
 #include "pipeline/local_exchange/local_exchange_sink_operator.h"
 #include "pipeline/local_exchange/local_exchange_source_operator.h"
 #include "pipeline/pipeline.h"
+#include "runtime/query_context.h"
 #include "util/debug_util.h"
 #include "util/runtime_profile.h"
 #include "util/string_util.h"
@@ -327,8 +328,7 @@ Status OperatorXBase::get_block_after_projects(RuntimeState* state, vectorized::
     Defer defer([&]() {
         if (status.ok()) {
             if (auto rows = block->rows()) {
-                COUNTER_UPDATE(local_state->_rows_returned_counter, rows);
-                COUNTER_UPDATE(local_state->_blocks_returned_counter, 1);
+                local_state->record_output_rows(rows);
             }
         }
     });
@@ -361,9 +361,13 @@ void PipelineXLocalStateBase::reached_limit(vectorized::Block* block, bool* eos)
         }
     });
 
-    if (auto rows = block->rows()) {
-        _num_rows_returned += rows;
-    }
+    _num_rows_returned += block->rows();
+}
+
+void PipelineXLocalStateBase::record_output_rows(int64_t rows) {
+    COUNTER_UPDATE(_rows_returned_counter, rows);
+    COUNTER_UPDATE(_blocks_returned_counter, 1);
+    _query_statistics->add_process_rows(rows);
 }
 
 std::string DataSinkOperatorXBase::debug_string(int indentation_level) const {

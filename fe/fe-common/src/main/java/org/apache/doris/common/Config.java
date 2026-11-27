@@ -2885,6 +2885,11 @@ public class Config extends ConfigBase {
     @ConfField(mutable = true)
     public static int be_report_query_statistics_timeout_ms = 60000;
 
+    @ConfField(mutable = true, description = {
+            "是否在当前查询列表中显示扩展统计和任务进度",
+            "Whether to display extended statistics and task progress in current-query lists"})
+    public static volatile boolean enable_extended_current_query_stats = false;
+
     @ConfField(mutable = true, masterOnly = true)
     public static int workload_group_max_num = 15;
 
