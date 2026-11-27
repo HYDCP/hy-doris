@@ -343,6 +343,10 @@ void QueryStatisticsCtx::collect_query_statistics(TQueryStatistics* tq_s) {
         tmp_qs.merge(*qs_ptr);
     }
     tmp_qs.to_thrift(tq_s);
+    if (_task_progress_unavailable) {
+        tq_s->__isset.total_tasks_num = false;
+        tq_s->__isset.finished_tasks_num = false;
+    }
     tq_s->__set_workload_group_id(_wg_id);
 }
 
@@ -471,16 +475,21 @@ void RuntimeQueryStatisticsMgr::report_runtime_query_statistics() {
         }
     }
 
-    // A finished query's last sample is needed by both the audit and monitoring FE.
     if (!finished_queries.empty()) {
-        std::lock_guard<std::shared_mutex> write_lock(_qs_ctx_map_lock);
-        for (const auto& [query_id, expired] : finished_queries) {
-            const auto& ctx = _query_statistics_ctx_map.at(query_id);
-            if (expired ||
-                (rpc_result.at(ctx->_fe_addr) &&
-                 (!ctx->_monitoring_fe_addr || rpc_result.at(*ctx->_monitoring_fe_addr)))) {
-                _query_statistics_ctx_map.erase(query_id);
-            }
+        clear_finished_queries(finished_queries, rpc_result);
+    }
+}
+
+void RuntimeQueryStatisticsMgr::clear_finished_queries(
+        const std::map<std::string, bool>& finished_queries,
+        const std::map<TNetworkAddress, bool>& rpc_result) {
+    std::lock_guard<std::shared_mutex> write_lock(_qs_ctx_map_lock);
+    for (const auto& [query_id, expired] : finished_queries) {
+        const auto& ctx = _query_statistics_ctx_map.at(query_id);
+        // A finished query's last sample is needed by both the audit and monitoring FE.
+        if (expired || (rpc_result.at(ctx->_fe_addr) &&
+                        (!ctx->_monitoring_fe_addr || rpc_result.at(*ctx->_monitoring_fe_addr)))) {
+            _query_statistics_ctx_map.erase(query_id);
         }
     }
 }
@@ -495,6 +504,11 @@ void RuntimeQueryStatisticsMgr::set_query_finished(std::string query_id) {
         qs_ptr->_is_query_finished = true;
         qs_ptr->_query_finish_time = MonotonicMillis();
     }
+}
+
+void RuntimeQueryStatisticsMgr::mark_task_progress_unavailable(const std::string& query_id) {
+    std::lock_guard<std::shared_mutex> write_lock(_qs_ctx_map_lock);
+    _query_statistics_ctx_map.at(query_id)->_task_progress_unavailable = true;
 }
 
 std::shared_ptr<QueryStatistics> RuntimeQueryStatisticsMgr::get_runtime_query_statistics(

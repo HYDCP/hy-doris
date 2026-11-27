@@ -100,6 +100,7 @@
 #include "runtime/exec_env.h"
 #include "runtime/fragment_mgr.h"
 #include "runtime/runtime_filter_mgr.h"
+#include "runtime/runtime_query_statistics_mgr.h"
 #include "runtime/runtime_state.h"
 #include "runtime/stream_load/new_load_stream_mgr.h"
 #include "runtime/stream_load/stream_load_context.h"
@@ -1679,10 +1680,11 @@ Status PipelineFragmentContext::submit() {
         for (auto& t : task) {
             st = scheduler->schedule_task(t);
             if (!st) {
+                // Later instances can still submit tasks after this failure, so there is no reliable denominator.
+                _exec_env->runtime_query_statistics_mgr()->mark_task_progress_unavailable(
+                        print_id(_query_id));
                 cancel(Status::InternalError("submit context to executor fail"));
                 std::lock_guard<std::mutex> l(_task_mutex);
-                _query_ctx->add_total_pipeline_tasks(submit_tasks -
-                                                     _total_tasks.load(std::memory_order_relaxed));
                 _total_tasks = submit_tasks;
                 break;
             }

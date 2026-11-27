@@ -106,4 +106,60 @@ TEST(QueryStatisticsProgressTest, ForwardedReportKeepsAuditAndReachesCoordinator
     EXPECT_TRUE(local_reports.at(audit_fe).contains("local"));
 }
 
+TEST(QueryStatisticsProgressTest, RetainsFinishedReportUntilBothDestinationsSucceedOrItExpires) {
+    TNetworkAddress audit_fe;
+    audit_fe.__set_hostname("audit");
+    TNetworkAddress monitoring_fe;
+    monitoring_fe.__set_hostname("monitoring");
+    RuntimeQueryStatisticsMgr manager;
+    for (const auto* id : {"retry", "expires", "running"}) {
+        manager.register_query_statistics(id, std::make_shared<QueryStatistics>(), audit_fe,
+                                          TQueryType::SELECT, monitoring_fe);
+    }
+    manager.set_query_finished("retry");
+    manager.set_query_finished("expires");
+    manager.clear_finished_queries({{"retry", false}, {"expires", true}},
+                                   {{audit_fe, true}, {monitoring_fe, false}});
+    EXPECT_NE(nullptr, manager.get_runtime_query_statistics("retry"));
+    EXPECT_EQ(nullptr, manager.get_runtime_query_statistics("expires"));
+    manager.clear_finished_queries({{"retry", false}}, {{audit_fe, false}, {monitoring_fe, true}});
+    EXPECT_NE(nullptr, manager.get_runtime_query_statistics("retry"));
+    manager.clear_finished_queries({{"retry", false}}, {{audit_fe, true}, {monitoring_fe, true}});
+    EXPECT_EQ(nullptr, manager.get_runtime_query_statistics("retry"));
+    EXPECT_NE(nullptr, manager.get_runtime_query_statistics("running"));
+}
+
+TEST(QueryStatisticsProgressTest, FailedSubmissionSuppressesOnlyTaskProgressOnSubsequentReports) {
+    TNetworkAddress audit_fe;
+    audit_fe.__set_hostname("audit");
+    TNetworkAddress monitoring_fe;
+    monitoring_fe.__set_hostname("monitoring");
+    RuntimeQueryStatisticsMgr manager;
+    auto counters = std::make_shared<QueryStatistics>();
+    counters->add_total_pipeline_tasks(2);
+    counters->add_process_rows(13);
+    manager.register_query_statistics("failed", counters, audit_fe, TQueryType::SELECT,
+                                      monitoring_fe);
+    manager.register_query_statistics("healthy", counters, audit_fe, TQueryType::SELECT,
+                                      monitoring_fe);
+    manager.mark_task_progress_unavailable("failed");
+    for (int i = 0; i < 2; ++i) {
+        counters->finish_pipeline_task();
+        QueryStatisticsReports reports;
+        for (const auto* id : {"failed", "healthy"}) {
+            manager._query_statistics_ctx_map.at(id)->append_to_report(id, reports);
+        }
+        for (const auto& addr : {audit_fe, monitoring_fe}) {
+            const auto& failed = reports.at(addr).at("failed");
+            EXPECT_FALSE(failed.__isset.total_tasks_num);
+            EXPECT_FALSE(failed.__isset.finished_tasks_num);
+            EXPECT_EQ(13, failed.process_rows);
+            const auto& healthy = reports.at(addr).at("healthy");
+            EXPECT_TRUE(healthy.__isset.total_tasks_num);
+            EXPECT_EQ(2, healthy.total_tasks_num);
+            EXPECT_EQ(i + 1, healthy.finished_tasks_num);
+        }
+    }
+}
+
 } // namespace doris

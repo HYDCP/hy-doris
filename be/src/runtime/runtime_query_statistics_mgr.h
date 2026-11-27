@@ -65,6 +65,7 @@ public:
 public:
     std::vector<std::shared_ptr<QueryStatistics>> _qs_list;
     bool _is_query_finished;
+    bool _task_progress_unavailable = false;
     const TNetworkAddress _fe_addr;
     const TQueryType::type _query_type;
     const std::optional<TNetworkAddress> _monitoring_fe_addr;
@@ -91,6 +92,7 @@ public:
     void report_runtime_query_statistics();
 
     void set_query_finished(std::string query_id);
+    void mark_task_progress_unavailable(const std::string& query_id);
 
     std::shared_ptr<QueryStatistics> get_runtime_query_statistics(std::string query_id);
 
@@ -114,6 +116,9 @@ public:
                                    std::shared_ptr<TRuntimeProfileTree> load_channel_profile_x);
 
 private:
+    void clear_finished_queries(const std::map<std::string, bool>& finished_queries,
+                                const std::map<TNetworkAddress, bool>& rpc_result);
+
     std::shared_mutex _qs_ctx_map_lock;
     std::map<std::string, std::unique_ptr<QueryStatisticsCtx>> _query_statistics_ctx_map;
 

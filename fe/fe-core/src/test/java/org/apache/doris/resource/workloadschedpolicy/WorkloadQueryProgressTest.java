@@ -18,14 +18,40 @@
 package org.apache.doris.resource.workloadschedpolicy;
 
 import org.apache.doris.common.Config;
+import org.apache.doris.thrift.TQueryOptions;
 import org.apache.doris.thrift.TQueryStatistics;
 import org.apache.doris.thrift.TReportWorkloadRuntimeStatusParams;
 
 import com.google.common.collect.ImmutableMap;
+import org.apache.thrift.protocol.TCompactProtocol;
+import org.apache.thrift.protocol.TField;
+import org.apache.thrift.protocol.TStruct;
+import org.apache.thrift.protocol.TType;
+import org.apache.thrift.transport.TMemoryBuffer;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 class WorkloadQueryProgressTest {
+    @Test
+    void forwardedReportingAndFileCacheOptionsUseDistinctWireFields() throws Exception {
+        TMemoryBuffer buffer = new TMemoryBuffer(64);
+        TCompactProtocol protocol = new TCompactProtocol(buffer);
+        protocol.writeStructBegin(new TStruct("TQueryOptions"));
+        protocol.writeFieldBegin(new TField("file_cache_query_limit_percent", TType.I32, (short) 1001));
+        protocol.writeI32(37);
+        protocol.writeFieldEnd();
+        protocol.writeFieldBegin(new TField("report_query_statistics_to_coordinator", TType.BOOL, (short) 30000));
+        protocol.writeBool(true);
+        protocol.writeFieldEnd();
+        protocol.writeFieldStop();
+        protocol.writeStructEnd();
+
+        TQueryOptions options = new TQueryOptions();
+        options.read(new TCompactProtocol(buffer));
+        Assertions.assertTrue(options.isReportQueryStatisticsToCoordinator());
+        Assertions.assertEquals(30000, TQueryOptions._Fields.REPORT_QUERY_STATISTICS_TO_COORDINATOR.getThriftFieldId());
+    }
+
     @Test
     void sumsProgressAcrossReportingBackends() {
         WorkloadRuntimeStatusMgr manager = new WorkloadRuntimeStatusMgr();
@@ -52,6 +78,20 @@ class WorkloadQueryProgressTest {
             Assertions.assertFalse(merged.isSetFinishedTasksNum());
             Assertions.assertEquals(9L, merged.getScanBytes());
         }
+    }
+
+    @Test
+    void failedSubmissionReplacesPreviouslyReportedTaskCounts() {
+        WorkloadRuntimeStatusMgr manager = new WorkloadRuntimeStatusMgr();
+        report(manager, 1L, new TQueryStatistics().setTotalTasksNum(2).setFinishedTasksNum(1));
+        report(manager, 2L, new TQueryStatistics().setTotalTasksNum(3).setFinishedTasksNum(3));
+        Assertions.assertEquals(5, manager.aggregateQueryStatistics(true).get("query").getTotalTasksNum());
+
+        report(manager, 1L, new TQueryStatistics().setProcessRows(13));
+        TQueryStatistics failed = manager.aggregateQueryStatistics(true).get("query");
+        Assertions.assertFalse(failed.isSetTotalTasksNum());
+        Assertions.assertFalse(failed.isSetFinishedTasksNum());
+        Assertions.assertEquals(13, failed.getProcessRows());
     }
 
     @Test
