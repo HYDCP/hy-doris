@@ -53,6 +53,19 @@ public class DropInfo implements Writable {
     @SerializedName(value = "recycleTime")
     private long recycleTime = 0;
 
+    @SerializedName(value = "recoveredTemporaryTable")
+    private Boolean recoveredTemporaryTable;
+
+    public static DropInfo forRecoveredTemporaryTable(long dbId, long tableId, String tableName) {
+        DropInfo info = new DropInfo(dbId, tableId, tableName, false, true, 0L);
+        info.recoveredTemporaryTable = true;
+        return info;
+    }
+
+    public boolean isRecoveredTemporaryTable() {
+        return Boolean.TRUE.equals(recoveredTemporaryTable);
+    }
+
     public DropInfo() {
     }
 

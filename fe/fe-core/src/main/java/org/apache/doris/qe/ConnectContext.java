@@ -251,7 +251,7 @@ public class ConnectContext {
     private TResultSinkType resultSinkType = TResultSinkType.MYSQL_PROTOCAL;
 
     // unique session id in the doris cluster, added in #40680
-    private String sessionId = "";
+    private volatile String sessionId = "";
 
     // These fields are guarded by this context's monitor. Match temporary tables by ID across replay and cleanup.
     private final Map<Long, Long> temporaryTableIdsToDbIds = new HashMap<>();
@@ -918,6 +918,9 @@ public class ConnectContext {
             txnEntry = null;
         }
         cleanupTemporaryTables(true);
+        // A legacy FE can still recover a recycled database with the old owner's tables.
+        // Alive-session reporting reads this ID directly from the connection registry.
+        sessionId = UUID.randomUUID().toString();
     }
 
     protected void deleteTempTable() {
@@ -1070,8 +1073,12 @@ public class ConnectContext {
     }
 
     private void forwardTemporaryTableDrop(String dbName, String innerName) throws Exception {
+        // A mode-1 legacy Master lowercases its input before reconstructing the owner's internal name.
+        // Forward the display name in that mode. DROP TEMPORARY checks the type under the database lock.
+        String tableName = Env.isStoredTableNamesLowerCase()
+                ? innerName.substring(sessionId.length() + FeNameFormat.TEMPORARY_TABLE_SIGN.length()) : innerName;
         String sql = String.format("DROP TEMPORARY TABLE IF EXISTS `internal`.`%s`.`%s` FORCE",
-                dbName.replace("`", "``"), innerName.replace("`", "``"));
+                dbName.replace("`", "``"), tableName.replace("`", "``"));
         MasterOpExecutor operation = new MasterOpExecutor(new OriginStatement(sql, 0), this,
                 RedirectStatus.FORWARD_WITH_SYNC, false);
         operation.executeTemporaryTableDrop();

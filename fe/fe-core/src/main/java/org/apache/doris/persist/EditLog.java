@@ -244,14 +244,7 @@ public class EditLog {
             System.exit(-1);
         }
 
-        txId += batch.size();
-        // update statistics, etc. (optional, can be added as needed)
-        if (txId >= Config.edit_log_roll_num) {
-            LOG.info("txId {} is equal to or larger than edit_log_roll_num {}, will roll edit.", txId,
-                    Config.edit_log_roll_num);
-            rollEditLog();
-            txId = 0;
-        }
+        countWrittenEntries(batch.size());
         if (MetricRepo.isInit) {
             MetricRepo.COUNTER_EDIT_LOG_WRITE.increase(Long.valueOf(batch.size()));
         }
@@ -380,7 +373,10 @@ public class EditLog {
                     if (Strings.isNullOrEmpty(info.getCtl()) || info.getCtl().equals(
                             InternalCatalog.INTERNAL_CATALOG_NAME)) {
                         Database db = Env.getCurrentInternalCatalog().getDbOrMetaException(info.getDbId());
-                        env.replayDropTable(db, info.getTableId(), info.isForceDrop(), info.getRecycleTime());
+                        // RECOVER DATABASE may already have discarded this temporary table during replay.
+                        if (!info.isRecoveredTemporaryTable() || db.getTableNullable(info.getTableId()) != null) {
+                            env.replayDropTable(db, info.getTableId(), info.isForceDrop(), info.getRecycleTime());
+                        }
                         DropTableRecord record = new DropTableRecord(logId, info);
                         env.getBinlogManager().addDropTableRecord(record);
                     } else {
@@ -1536,10 +1532,15 @@ public class EditLog {
         return req.logId;
     }
 
-    private synchronized long logEditDirectly(short op, Writable writable) {
+    @FunctionalInterface
+    private interface JournalWrite {
+        long write() throws IOException;
+    }
+
+    private synchronized long logEditDirectly(int count, JournalWrite operation) {
         long logId = -1;
         try {
-            logId = journal.write(op, writable);
+            logId = operation.write();
         } catch (Throwable t) {
             // Throwable contains all Exception and Error, such as IOException and
             // OutOfMemoryError
@@ -1550,8 +1551,12 @@ public class EditLog {
             System.exit(-1);
         }
 
-        // get a new transactionId
-        txId++;
+        countWrittenEntries(count);
+        return logId;
+    }
+
+    private synchronized void countWrittenEntries(int count) {
+        txId += count;
 
         if (txId >= Config.edit_log_roll_num) {
             LOG.info("txId {} is equal to or larger than edit_log_roll_num {}, will roll edit.", txId,
@@ -1559,8 +1564,6 @@ public class EditLog {
             rollEditLog();
             txId = 0;
         }
-
-        return logId;
     }
 
     /**
@@ -1591,7 +1594,7 @@ public class EditLog {
         if (Config.enable_batch_editlog && op != OperationType.OP_TIMESTAMP) {
             logId = logEditWithQueue(op, writable);
         } else {
-            logId = logEditDirectly(op, writable);
+            logId = logEditDirectly(1, () -> journal.write(op, writable));
         }
 
         // update statistics
@@ -1648,6 +1651,36 @@ public class EditLog {
 
     public void logRecoverDb(RecoverInfo info) {
         logEdit(OperationType.OP_RECOVER_DB, info);
+    }
+
+    public void logRecoverDb(RecoverInfo info, List<DropInfo> temporaryTables) {
+        if (temporaryTables.isEmpty()) {
+            logRecoverDb(info);
+            return;
+        }
+        info.markDiscardTemporaryTables();
+        if (!(journal instanceof BDBJEJournal)) {
+            // The single-FE local journal can recover from a partial write using the marker.
+            logRecoverDb(info);
+            temporaryTables.forEach(this::logDropTable);
+            return;
+        }
+
+        // An older FE ignores the marker. Commit the ordinary records in one BDB transaction
+        // so even a legacy replica elected during recovery receives every temporary DROP.
+        int count = 1 + temporaryTables.size();
+        long firstId = logEditDirectly(count, () -> {
+            JournalBatch batch = new JournalBatch(count);
+            batch.addJournal(OperationType.OP_RECOVER_DB, info);
+            for (DropInfo drop : temporaryTables) {
+                batch.addJournal(OperationType.OP_DROP_TABLE, drop);
+            }
+            return journal.write(batch);
+        });
+        for (int i = 0; i < temporaryTables.size(); i++) {
+            DropTableRecord record = new DropTableRecord(firstId + i + 1, temporaryTables.get(i));
+            Env.getCurrentEnv().getBinlogManager().addDropTableRecord(record);
+        }
     }
 
     public void logAlterDb(DatabaseInfo dbInfo) {

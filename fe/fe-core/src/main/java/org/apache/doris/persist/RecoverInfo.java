@@ -34,6 +34,10 @@ import java.io.IOException;
 public class RecoverInfo implements Writable, GsonPostProcessable {
     @SerializedName(value = "dbId")
     private long dbId;
+    // Absent on older RECOVER DATABASE records, whose temporary tables must be replayed as originally written.
+    @SerializedName(value = "discardTemporaryTables")
+    private Boolean discardTemporaryTables;
+
     @SerializedName(value = "newDbName")
     private String newDbName;
     @SerializedName(value = "tableId")
@@ -63,6 +67,14 @@ public class RecoverInfo implements Writable, GsonPostProcessable {
         this.newTableName = newTableName;
         this.partitionName = partitionName;
         this.newPartitionName = newPartitionName;
+    }
+
+    public boolean shouldDiscardTemporaryTables() {
+        return Boolean.TRUE.equals(discardTemporaryTables);
+    }
+
+    public void markDiscardTemporaryTables() {
+        discardTemporaryTables = true;
     }
 
     public long getDbId() {

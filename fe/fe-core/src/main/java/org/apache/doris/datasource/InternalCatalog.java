@@ -658,11 +658,21 @@ public class InternalCatalog implements CatalogIf<Database> {
             if (!Strings.isNullOrEmpty(newDbName)) {
                 db.setNameWithLock(newDbName);
             }
+            RecoverInfo recoverInfo = new RecoverInfo(db.getId(), -1L, -1L, newDbName, "", "", "", "");
+            List<Table> temporaryTables = tableList.stream().filter(Table::isTemporary).collect(Collectors.toList());
+            List<DropInfo> drops = new ArrayList<>(temporaryTables.size());
+            for (Table table : temporaryTables) {
+                // DROP DATABASE already ran the table drop hooks before recycling these objects.
+                db.unregisterTable(table.getId());
+                drops.add(DropInfo.forRecoveredTemporaryTable(db.getId(), table.getId(), table.getName()));
+            }
             fullNameToDb.put(db.getFullName(), db);
             idToDb.put(db.getId(), db);
-            // log
-            RecoverInfo recoverInfo = new RecoverInfo(db.getId(), -1L, -1L, newDbName, "", "", "", "");
-            Env.getCurrentEnv().getEditLog().logRecoverDb(recoverInfo);
+            Env.getCurrentEnv().getEditLog().logRecoverDb(recoverInfo, drops);
+            // Schedule physical erasure only after the compatibility DROP records are durable.
+            for (Table table : temporaryTables) {
+                Env.getCurrentRecycleBin().recycleTable(db.getId(), table, false, true, 0L);
+            }
             db.unmarkDropped();
         } finally {
             MetaLockUtils.writeUnlockTables(tableList);
@@ -751,9 +761,22 @@ public class InternalCatalog implements CatalogIf<Database> {
         long dbId = info.getDbId();
         String newDbName = info.getNewDbName();
         Database db = Env.getCurrentRecycleBin().replayRecoverDatabase(dbId);
+        // Apply AS to every restored object before putting the discarded tables back into the recycle bin.
+        if (!Strings.isNullOrEmpty(newDbName)) {
+            db.setNameWithLock(newDbName);
+        }
+        // Publish only permanent tables even while the following compatibility records are being replayed.
+        if (info.shouldDiscardTemporaryTables()) {
+            for (Table table : db.getTables()) {
+                if (table.isTemporary()) {
+                    db.unregisterTable(table.getId());
+                    Env.getCurrentRecycleBin().recycleTable(dbId, table, true, true, 0L);
+                }
+            }
+        }
 
         // add db to catalog
-        replayCreateDb(db, newDbName);
+        replayCreateDb(db, null);
         db.unmarkDropped();
         LOG.info("replay recover db[{}]", dbId);
     }

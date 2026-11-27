@@ -91,11 +91,12 @@ class ConnectContextTempTableTest {
     void retriesFailedResetWithoutRepeatingSuccessfulDrops() throws Exception {
         mockLocalCatalog(true);
         ConnectContext ctx = new ConnectContext();
+        String owner = ctx.getSessionId();
         ctx.addTemporaryTable(10L, 11L);
         ctx.addTemporaryTable(10L, 12L);
         new Expectations() {
             {
-                catalog.dropTemporaryTable(db, 11L, ctx.getSessionId());
+                catalog.dropTemporaryTable(db, 11L, owner);
                 result = new DdlException("injected DROP failure");
                 result = null;
                 times = 2;
@@ -105,12 +106,14 @@ class ConnectContextTempTableTest {
         ConnectProcessor processor = new MysqlConnectProcessor(ctx);
         processor.handleResetConnection();
         Assertions.assertEquals(MysqlStateType.ERR, ctx.getState().getStateType());
+        Assertions.assertEquals(owner, ctx.getSessionId());
         processor.handleResetConnection();
+        Assertions.assertNotEquals(owner, ctx.getSessionId());
         Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
 
         new Verifications() {
             {
-                catalog.dropTemporaryTable(db, 12L, ctx.getSessionId());
+                catalog.dropTemporaryTable(db, 12L, owner);
                 times = 1;
             }
         };
@@ -189,6 +192,8 @@ class ConnectContextTempTableTest {
                 result = client;
                 client.dropSessionTemporaryTable((TDropSessionTemporaryTableRequest) any);
                 result = new TApplicationException(TApplicationException.UNKNOWN_METHOD, "old FE");
+                Env.isStoredTableNamesLowerCase();
+                result = true;
                 db.getFullName();
                 result = "other_db";
                 db.getTableNullable(11L);
@@ -223,7 +228,7 @@ class ConnectContextTempTableTest {
         DdlException failure = Assertions.assertThrows(DdlException.class, ctx::resetTemporaryTables);
         Assertions.assertTrue(failure.getCause().getMessage().contains("injected forwarded error"));
         Assertions.assertEquals(1, sentSql.size());
-        Assertions.assertEquals("DROP TEMPORARY TABLE IF EXISTS `internal`.`other_db`.`" + internalName + "` FORCE",
+        Assertions.assertEquals("DROP TEMPORARY TABLE IF EXISTS `internal`.`other_db`.`tmp` FORCE",
                 sentSql.get(0));
 
         ctx.cleanup();
