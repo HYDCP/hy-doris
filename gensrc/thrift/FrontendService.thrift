@@ -970,6 +970,19 @@ struct TFrontendPingFrontendRequest {
    3: optional string deployMode
 }
 
+struct TDropSessionTemporaryTableRequest {
+   1: required i32 clusterId
+   2: required string token
+   3: required string sessionId
+   4: required i64 dbId
+   5: required i64 tableId
+}
+
+struct TDropSessionTemporaryTableResult {
+   1: required Status.TStatus status
+   2: required i64 maxJournalId
+}
+
 struct TFrontendReportAliveSessionRequest {
    1: required i32 clusterId
    2: required string token
@@ -1889,6 +1902,8 @@ service FrontendService {
     TStreamLoadMultiTablePutResult streamLoadMultiTablePut(1: TStreamLoadPutRequest request)
 
     Status.TStatus snapshotLoaderReport(1: TSnapshotLoaderReportRequest request)
+
+    TDropSessionTemporaryTableResult dropSessionTemporaryTable(1: TDropSessionTemporaryTableRequest request)
 
     TFrontendReportAliveSessionResult getAliveSessions(1: TFrontendReportAliveSessionRequest request)
 

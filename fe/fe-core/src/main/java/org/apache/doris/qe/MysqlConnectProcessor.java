@@ -23,6 +23,7 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.MysqlColType;
 import org.apache.doris.common.AuthenticationException;
 import org.apache.doris.common.ConnectionException;
+import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.Pair;
@@ -338,6 +339,13 @@ public class MysqlConnectProcessor extends ConnectProcessor {
                 .checkPassword(userName, ctx.remoteIP, password, authPluginData, currentUserIdentity);
         } catch (AuthenticationException e) {
             ctx.getState().setError(ErrorCode.ERR_ACCESS_DENIED_ERROR, "Authentication failed.");
+            return;
+        }
+        // Connector/J reauthenticates the same physical connection before lending it again.
+        try {
+            ctx.resetTemporaryTables();
+        } catch (DdlException e) {
+            ctx.getState().setError(e.getMysqlErrorCode(), e.getMessage());
             return;
         }
         ctx.setCurrentUserIdentity(currentUserIdentity.get(0));

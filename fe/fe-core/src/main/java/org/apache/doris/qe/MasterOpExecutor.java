@@ -21,14 +21,20 @@ import org.apache.doris.analysis.RedirectStatus;
 import org.apache.doris.analysis.TableName;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.ClientPool;
 import org.apache.doris.common.DdlException;
+import org.apache.doris.thrift.FrontendService;
+import org.apache.doris.thrift.TDropSessionTemporaryTableRequest;
+import org.apache.doris.thrift.TDropSessionTemporaryTableResult;
 import org.apache.doris.thrift.TGroupCommitInfo;
 import org.apache.doris.thrift.TMasterOpRequest;
 import org.apache.doris.thrift.TMasterOpResult;
 import org.apache.doris.thrift.TNetworkAddress;
+import org.apache.doris.thrift.TStatusCode;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.thrift.TApplicationException;
 
 /**
  * MasterOpExecutor is used to send request to Master FE.
@@ -71,6 +77,40 @@ public class MasterOpExecutor extends FEOpExecutor {
     public void executeTemporaryTableDrop() throws Exception {
         super.execute(true, false);
         waitOnReplaying();
+    }
+
+    // Only UNKNOWN_METHOD permits a fallback to SQL on an older Master.
+    boolean tryDropTemporaryTableById(long dbId, long tableId, boolean waitForReplay) throws Exception {
+        Env env = ctx.getEnv();
+        TDropSessionTemporaryTableRequest request = new TDropSessionTemporaryTableRequest(env.getClusterId(),
+                env.getToken(), ctx.getSessionId(), dbId, tableId);
+        FrontendService.Client client = ClientPool.frontendPool.borrowObject(feAddr, thriftTimeoutMs);
+        boolean transportOk = false;
+        TDropSessionTemporaryTableResult reply;
+        try {
+            reply = client.dropSessionTemporaryTable(request);
+            transportOk = true;
+        } catch (TApplicationException e) {
+            if (e.getType() == TApplicationException.UNKNOWN_METHOD) {
+                transportOk = true;
+                return false;
+            }
+            throw e;
+        } finally {
+            if (transportOk) {
+                ClientPool.frontendPool.returnObject(feAddr, client);
+            } else {
+                ClientPool.frontendPool.invalidateObject(feAddr, client);
+            }
+        }
+        if (reply.getStatus().getStatusCode() != TStatusCode.OK) {
+            throw new DdlException("Master rejected cleanup of temporary table " + tableId + ": "
+                    + reply.getStatus().getStatusCode() + " " + reply.getStatus().getErrorMsgs());
+        }
+        if (waitForReplay) {
+            env.getJournalObservable().waitOn(reply.getMaxJournalId(), journalWaitTimeoutMs);
+        }
+        return true;
     }
 
     boolean recordCreatedTemporaryTables(TableName awaitingReplay) {

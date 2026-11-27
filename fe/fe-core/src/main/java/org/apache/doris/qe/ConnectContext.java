@@ -937,7 +937,6 @@ public class ConnectContext {
             Map<Long, Long> snapshot;
             Map<TableName, Long> uncertain;
             Map<Long, TableName> awaitingReplay;
-            long journalId;
             synchronized (this) {
                 if (activeStatements != 0) {
                     if (strict) {
@@ -947,7 +946,6 @@ public class ConnectContext {
                 }
                 snapshot = new HashMap<>(temporaryTableIdsToDbIds);
                 uncertain = new HashMap<>(uncertainTempTableTargets);
-                journalId = temporaryTableJournalId;
                 awaitingReplay = new HashMap<>(temporaryTableTargetsAwaitingReplay);
             }
             if (snapshot.isEmpty() && uncertain.isEmpty()) {
@@ -955,22 +953,6 @@ public class ConnectContext {
             }
 
             Env currentEnv = Env.getCurrentEnv();
-            boolean replayFailed = false;
-            // A reply can arrive before a failed journal wait. Resolve its IDs only after replay.
-            if (journalId > 0 && !currentEnv.isMaster() && journalId > currentEnv.getReplayedJournalId()) {
-                int timeoutMs = (int) Math.min(Integer.MAX_VALUE, Math.max(1, getExecTimeout()) * 1000L);
-                try {
-                    currentEnv.getJournalObservable().waitOn(journalId, timeoutMs);
-                } catch (DdlException e) {
-                    if (strict) {
-                        throw e;
-                    }
-                    // A physical close cannot retry. Reach the Master for confirmed creates still awaiting replay.
-                    replayFailed = true;
-                    LOG.warn("Journal {} unavailable during temporary table cleanup for session {}", journalId,
-                            sessionId, e);
-                }
-            }
             InternalCatalog catalog = currentEnv.getInternalCatalog();
             DdlException failure = strict && !uncertain.isEmpty()
                     ? new DdlException("The result of a forwarded temporary table statement is unknown") : null;
@@ -978,15 +960,13 @@ public class ConnectContext {
                 long tableId = entry.getKey();
                 long dbId = entry.getValue();
                 try {
-                    Database db = catalog.getDbNullable(dbId);
-                    if (replayFailed && awaitingReplay.containsKey(tableId)) {
-                        cleanupTemporaryTableByTarget(currentEnv, catalog, awaitingReplay.get(tableId), dbId);
-                    } else if (db != null) {
-                        if (currentEnv.isMaster()) {
+                    if (currentEnv.isMaster()) {
+                        Database db = catalog.getDbNullable(dbId);
+                        if (db != null) {
                             catalog.dropTemporaryTable(db, tableId, sessionId);
-                        } else {
-                            forwardTemporaryTableDrop(db, tableId);
                         }
+                    } else {
+                        dropForwardedTemporaryTable(dbId, tableId, strict, awaitingReplay.get(tableId));
                     }
                     removeTemporaryTable(tableId);
                 } catch (Exception e) {
@@ -1022,9 +1002,33 @@ public class ConnectContext {
         }
     }
 
-    private void forwardTemporaryTableDrop(Database db, long tableId) throws Exception {
-        Table table = db.getTableNullable(tableId);
+    private void dropForwardedTemporaryTable(long dbId, long tableId, boolean strict, TableName awaitingReplay)
+            throws Exception {
+        MasterOpExecutor operation = new MasterOpExecutor(this);
+        if (operation.tryDropTemporaryTableById(dbId, tableId, strict)) {
+            return;
+        }
+
+        // A legacy Master accepts only names. Replay its current journal before resolving the IDs locally.
+        InternalCatalog catalog = getEnv().getInternalCatalog();
+        Exception replayFailure = null;
+        try {
+            operation.syncJournal();
+        } catch (Exception e) {
+            if (strict) {
+                throw e;
+            }
+            replayFailure = e;
+        }
+        Database db = catalog.getDbNullable(dbId);
+        Table table = db == null ? null : db.getTableNullable(tableId);
         if (table == null) {
+            if (replayFailure != null) {
+                if (awaitingReplay == null) {
+                    throw replayFailure;
+                }
+                cleanupTemporaryTableByTarget(getEnv(), catalog, awaitingReplay, dbId);
+            }
             return;
         }
         if (!table.isTemporary() || !sessionId.equals(Util.getTempTableSessionId(table.getName()))) {

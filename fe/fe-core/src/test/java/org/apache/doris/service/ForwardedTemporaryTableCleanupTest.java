@@ -19,10 +19,16 @@ package org.apache.doris.service;
 
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.KeysType;
+import org.apache.doris.catalog.OlapTable;
+import org.apache.doris.catalog.SinglePartitionInfo;
+import org.apache.doris.common.FeNameFormat;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.MysqlConnectProcessor;
 import org.apache.doris.system.Frontend;
+import org.apache.doris.thrift.TDropSessionTemporaryTableRequest;
+import org.apache.doris.thrift.TDropSessionTemporaryTableResult;
 import org.apache.doris.thrift.TFrontendReportAliveSessionResult;
 import org.apache.doris.thrift.TMasterOpRequest;
 import org.apache.doris.thrift.TMasterOpResult;
@@ -37,6 +43,57 @@ import org.mockito.Mockito;
 import java.util.Collections;
 
 class ForwardedTemporaryTableCleanupTest {
+    @Test
+    void dropsOnlyOwnedIdAfterRenameAndAcknowledgesRepeats() throws Exception {
+        Env env = Mockito.mock(Env.class, Mockito.RETURNS_DEEP_STUBS);
+        InternalCatalog catalog = Mockito.mock(InternalCatalog.class);
+        Mockito.when(env.getInternalCatalog()).thenReturn(catalog);
+        Mockito.when(env.isMaster()).thenReturn(true);
+        Mockito.when(env.isReady()).thenReturn(true);
+        Mockito.when(env.getClusterId()).thenReturn(7);
+        Mockito.when(env.getToken()).thenReturn("test-token");
+        Mockito.when(env.getMaxJournalId()).thenReturn(43L);
+        Database db = new Database(10L, "original");
+        Mockito.when(catalog.getDbNullable(10L)).thenReturn(db);
+        Mockito.doCallRealMethod().when(catalog).dropTemporaryTable(Mockito.eq(db), Mockito.anyLong(),
+                Mockito.anyString());
+        Mockito.doAnswer(call -> {
+            OlapTable table = call.getArgument(1);
+            db.unregisterTable(table.getId());
+            return true;
+        }).when(catalog).unprotectDropTable(Mockito.eq(db), Mockito.any(), Mockito.eq(true),
+                Mockito.eq(false), Mockito.eq(0L));
+        FrontendServiceImpl service = Mockito.mock(FrontendServiceImpl.class, Mockito.CALLS_REAL_METHODS);
+        TDropSessionTemporaryTableRequest request = new TDropSessionTemporaryTableRequest(7, "test-token",
+                "owner", 10L, 11L);
+        try (MockedStatic<Env> mocked = Mockito.mockStatic(Env.class)) {
+            mocked.when(Env::getCurrentEnv).thenReturn(env);
+            OlapTable owned = new OlapTable(11L, "owner" + FeNameFormat.TEMPORARY_TABLE_SIGN + "tmp", true,
+                    Collections.emptyList(), KeysType.DUP_KEYS, new SinglePartitionInfo(), null, null);
+            OlapTable permanent = new OlapTable(12L, "tmp", Collections.emptyList(), KeysType.DUP_KEYS,
+                    new SinglePartitionInfo(), null);
+            db.registerTable(owned);
+            db.registerTable(permanent);
+            db.setNameWithLock("renamed");
+
+            Assertions.assertEquals(TStatusCode.NOT_AUTHORIZED, service.dropSessionTemporaryTable(
+                    request.deepCopy().setToken("invalid")).getStatus().getStatusCode());
+            Assertions.assertEquals(TStatusCode.INTERNAL_ERROR, service.dropSessionTemporaryTable(
+                    request.deepCopy().setSessionId("another-session")).getStatus().getStatusCode());
+            Assertions.assertEquals(TStatusCode.INTERNAL_ERROR, service.dropSessionTemporaryTable(
+                    request.deepCopy().setTableId(12L)).getStatus().getStatusCode());
+            Assertions.assertSame(owned, db.getTableNullable(11L));
+            TDropSessionTemporaryTableResult response = service.dropSessionTemporaryTable(request);
+            Assertions.assertEquals(TStatusCode.OK, response.getStatus().getStatusCode());
+            Assertions.assertEquals(43L, response.getMaxJournalId());
+            Assertions.assertNull(db.getTableNullable(11L));
+            Assertions.assertEquals(TStatusCode.OK, service.dropSessionTemporaryTable(request).getStatus()
+                    .getStatusCode());
+            Assertions.assertSame(permanent, db.getTableNullable(12L));
+            Mockito.verify(catalog).unprotectDropTable(db, owned, true, false, 0L);
+        }
+    }
+
     @Test
     void reportsCreatedIdsToOriginWithoutChangingLegacyReplies() throws Exception {
         Env env = Mockito.mock(Env.class);

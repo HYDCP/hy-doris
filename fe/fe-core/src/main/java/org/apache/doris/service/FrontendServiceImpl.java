@@ -156,6 +156,8 @@ import org.apache.doris.thrift.TDescribeTablesParams;
 import org.apache.doris.thrift.TDescribeTablesResult;
 import org.apache.doris.thrift.TDropPlsqlPackageRequest;
 import org.apache.doris.thrift.TDropPlsqlStoredProcedureRequest;
+import org.apache.doris.thrift.TDropSessionTemporaryTableRequest;
+import org.apache.doris.thrift.TDropSessionTemporaryTableResult;
 import org.apache.doris.thrift.TEncryptionAlgorithm;
 import org.apache.doris.thrift.TEncryptionKey;
 import org.apache.doris.thrift.TFeResult;
@@ -2474,6 +2476,37 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             return new TStatus(TStatusCode.OK);
         }
         return new TStatus(TStatusCode.CANCELLED);
+    }
+
+    @Override
+    public TDropSessionTemporaryTableResult dropSessionTemporaryTable(TDropSessionTemporaryTableRequest request) {
+        Env env = Env.getCurrentEnv();
+        TStatus status = checkMaster();
+        TDropSessionTemporaryTableResult result = new TDropSessionTemporaryTableResult(status, 0L);
+        if (status.getStatusCode() != TStatusCode.OK) {
+            return result;
+        }
+        if (!env.isReady()) {
+            status.setStatusCode(TStatusCode.ILLEGAL_STATE);
+            status.addToErrorMsgs("Master catalog is not ready");
+        } else if (request.getClusterId() != env.getClusterId() || Strings.isNullOrEmpty(request.getToken())
+                || !request.getToken().equals(env.getToken())) {
+            status.setStatusCode(TStatusCode.NOT_AUTHORIZED);
+            status.addToErrorMsgs("Invalid FE cluster credentials");
+        } else {
+            try {
+                InternalCatalog catalog = env.getInternalCatalog();
+                Database db = catalog.getDbNullable(request.getDbId());
+                if (db != null) {
+                    catalog.dropTemporaryTable(db, request.getTableId(), request.getSessionId());
+                }
+                result.setMaxJournalId(env.getMaxJournalId());
+            } catch (DdlException e) {
+                status.setStatusCode(TStatusCode.INTERNAL_ERROR);
+                status.addToErrorMsgs(e.getMessage());
+            }
+        }
+        return result;
     }
 
     @Override
