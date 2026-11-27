@@ -3349,25 +3349,27 @@ public class StmtExecutor {
         // after success create table insert data
         try {
             parsedStmt = ctasStmt.getInsertStmt();
+            Table createdTable = ctasStmt.getCreateTableStmt().getCreatedTable();
+            if (createdTable != null) {
+                ((NativeInsertStmt) parsedStmt).setCtasTargetTableId(createdTable.getId());
+            }
             parsedStmt.setUserInfo(context.getCurrentUserIdentity());
             execute();
             if (MysqlStateType.ERR.equals(context.getState().getStateType())) {
                 LOG.warn("CTAS insert data error, stmt={}", ctasStmt.toSql());
-                handleCtasRollback(ctasStmt.getCreateTableStmt().getDbTbl());
+                handleCtasRollback(ctasStmt.getCreateTableStmt());
             }
         } catch (Exception e) {
             LOG.warn("CTAS insert data error, stmt={}", ctasStmt.toSql(), e);
             context.getState().setError(ErrorCode.ERR_UNKNOWN_ERROR, "Unexpected exception: " + e.getMessage());
-            handleCtasRollback(ctasStmt.getCreateTableStmt().getDbTbl());
+            handleCtasRollback(ctasStmt.getCreateTableStmt());
         }
     }
 
-    private void handleCtasRollback(TableName table) {
+    private void handleCtasRollback(CreateTableStmt createTable) {
         if (context.getSessionVariable().isDropTableIfCtasFailed()) {
-            // insert error drop table
-            DropTableStmt dropTableStmt = new DropTableStmt(true, false, table, true);
             try {
-                DdlExecutor.execute(context.getEnv(), dropTableStmt);
+                context.getEnv().rollbackCtas(createTable, true);
             } catch (Exception ex) {
                 LOG.warn("CTAS drop table error, stmt={}", parsedStmt.toSql(), ex);
                 context.getState().setError(ErrorCode.ERR_UNKNOWN_ERROR, "Unexpected exception: " + ex.getMessage());

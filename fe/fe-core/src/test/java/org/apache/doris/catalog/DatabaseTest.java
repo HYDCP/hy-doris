@@ -21,10 +21,13 @@ import org.apache.doris.catalog.MaterializedIndex.IndexState;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ExceptionChecker;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.FeNameFormat;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.jmockit.Deencapsulation;
+import org.apache.doris.common.util.Util;
 import org.apache.doris.persist.CreateTableInfo;
 import org.apache.doris.persist.EditLog;
+import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.thrift.TStorageType;
 
 import com.google.common.collect.ImmutableList;
@@ -41,6 +44,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 
 public class DatabaseTest {
@@ -78,6 +82,69 @@ public class DatabaseTest {
                 result = FeConstants.meta_version;
             }
         };
+    }
+
+    @Test
+    public void temporaryTableLookupDoesNotRequirePermanentName() {
+        new Expectations() {
+            {
+                Env.isTableNamesCaseInsensitive();
+                result = true;
+                minTimes = 0;
+            }
+        };
+        ConnectContext session = new ConnectContext();
+        session.setThreadLocalInfo();
+        try {
+            String innerName = Util.generateTempTableInnerName("Tmp_Orders");
+            OlapTable temp = new OlapTable(2000L, innerName, true, ImmutableList.of(), KeysType.DUP_KEYS,
+                    new SinglePartitionInfo(), null, null);
+            Assert.assertTrue(db.registerTable(temp));
+            Assert.assertSame(temp, db.getTableNullable("tmp_orders"));
+            String mixedCaseInnerName = innerName.replace(FeNameFormat.TEMPORARY_TABLE_SIGN, "_#Temp#_");
+            Assert.assertSame(temp, db.getTemporaryTableNullable(innerName));
+            Assert.assertSame(temp, db.getTemporaryTableNullable(mixedCaseInnerName));
+            Assert.assertNull(db.getNonTempTableNullable(innerName));
+            Assert.assertNull(db.getNonTempTableNullable(mixedCaseInnerName));
+
+            OlapTable permanent = new OlapTable(2001L, "TMP_ORDERS", ImmutableList.of(), KeysType.DUP_KEYS,
+                    new SinglePartitionInfo(), null);
+            Assert.assertTrue(db.registerTable(permanent));
+            Assert.assertSame(temp, db.getTableNullable("Tmp_Orders"));
+            Assert.assertSame(permanent, db.getNonTempTableNullable("Tmp_Orders"));
+            new ConnectContext().setThreadLocalInfo();
+            Assert.assertNull(db.getTemporaryTableNullable("tmp_orders"));
+            Assert.assertSame(permanent, db.getTableNullable("tmp_orders"));
+        } finally {
+            ConnectContext.remove();
+        }
+    }
+
+    @Test
+    public void lookupTemporaryTableInLowerCaseStorageMode() {
+        new Expectations() {
+            {
+                Env.isStoredTableNamesLowerCase();
+                result = true;
+                minTimes = 0;
+            }
+        };
+        new ConnectContext().setThreadLocalInfo();
+        try {
+            String innerName = Util.generateTempTableInnerName("tmp_orders");
+            OlapTable temp = new OlapTable(2000L, innerName, true, ImmutableList.of(), KeysType.DUP_KEYS,
+                    new SinglePartitionInfo(), null, null);
+            Assert.assertTrue(db.registerTable(temp));
+            Assert.assertFalse(db.registerTable(temp));
+            Assert.assertSame(temp, db.getTableNullable("TMP_ORDERS"));
+            String lowerCaseInnerName = innerName.toLowerCase(Locale.ROOT);
+            String mixedCaseInnerName = innerName.replace(FeNameFormat.TEMPORARY_TABLE_SIGN, "_#Temp#_");
+            Assert.assertSame(temp, db.getTemporaryTableNullable(lowerCaseInnerName));
+            Assert.assertSame(temp, db.getTemporaryTableNullable(mixedCaseInnerName));
+            Assert.assertNull(db.getNonTempTableNullable(lowerCaseInnerName));
+        } finally {
+            ConnectContext.remove();
+        }
     }
 
     @Test

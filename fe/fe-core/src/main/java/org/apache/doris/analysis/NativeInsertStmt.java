@@ -128,6 +128,7 @@ public class NativeInsertStmt extends InsertStmt {
     private final Map<String, Expr> exprByName = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
 
     protected Table targetTable;
+    private Long ctasTargetTableId;
 
     private DatabaseIf db;
     private long transactionId;
@@ -290,7 +291,7 @@ public class NativeInsertStmt extends InsertStmt {
         String ctlName = tblName.getCtl();
         // check exist
         DatabaseIf db = analyzer.getEnv().getCatalogMgr().getCatalog(tblName.getCtl()).getDbOrAnalysisException(dbName);
-        TableIf table = db.getTableOrAnalysisException(tblName.getTbl());
+        TableIf table = resolveInsertTarget(db);
 
         // check access
         if (!Env.getCurrentEnv().getAccessManager()
@@ -423,12 +424,23 @@ public class NativeInsertStmt extends InsertStmt {
         }
     }
 
+    public void setCtasTargetTableId(long tableId) {
+        ctasTargetTableId = tableId;
+    }
+
+    private TableIf resolveInsertTarget(DatabaseIf db) throws AnalysisException {
+        if (db instanceof Database && ctasTargetTableId != null) {
+            return db.getTableOrAnalysisException(ctasTargetTableId.longValue());
+        }
+        return db.getTableOrAnalysisException(tblName.getTbl());
+    }
+
     protected void initTargetTable(Analyzer analyzer) throws AnalysisException {
         if (targetTable == null) {
             DatabaseIf db = analyzer.getEnv().getCatalogMgr()
                     .getCatalog(tblName.getCtl()).getDbOrAnalysisException(tblName.getDb());
             if (db instanceof Database) {
-                targetTable = (Table) db.getTableOrAnalysisException(tblName.getTbl());
+                targetTable = (Table) resolveInsertTarget(db);
             } else if (db instanceof JdbcExternalDatabase) {
                 JdbcExternalTable jdbcTable = (JdbcExternalTable) db.getTableOrAnalysisException(tblName.getTbl());
                 targetTable = jdbcTable.getJdbcTable();

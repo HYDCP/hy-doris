@@ -25,6 +25,7 @@ import org.apache.doris.catalog.GeneratedColumnInfo;
 import org.apache.doris.catalog.Index;
 import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.PrimitiveType;
+import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.catalog.VariantField;
 import org.apache.doris.catalog.VariantType;
@@ -82,6 +83,8 @@ public class CreateTableStmt extends DdlStmt implements NotFallbackInParser {
     protected boolean ifNotExists;
     private boolean isExternal;
     private boolean isTemp;
+    private Table createdTable;
+    private long createdTableDbId;
     protected TableName tableName;
     protected List<ColumnDef> columnDefs;
     private List<IndexDef> indexDefs;
@@ -229,6 +232,19 @@ public class CreateTableStmt extends DdlStmt implements NotFallbackInParser {
 
     public boolean isExternal() {
         return isExternal;
+    }
+
+    public Table getCreatedTable() {
+        return createdTable;
+    }
+
+    public long getCreatedTableDbId() {
+        return createdTableDbId;
+    }
+
+    public void setCreatedTable(long dbId, Table table) {
+        createdTableDbId = dbId;
+        createdTable = table;
     }
 
     public boolean isTemp() {

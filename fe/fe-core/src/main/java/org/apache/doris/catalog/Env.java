@@ -4360,8 +4360,25 @@ public class Env {
     public void dropTable(DropTableStmt stmt) throws DdlException {
         CatalogIf<?> catalogIf = catalogMgr.getCatalogOrException(stmt.getCatalogName(),
                 catalog -> new DdlException(("Unknown catalog " + catalog)));
+        if (stmt.isMustTemporary() && !(catalogIf instanceof InternalCatalog)) {
+            if (!stmt.isSetIfExists()) {
+                ErrorReport.reportDdlException(ErrorCode.ERR_UNKNOWN_TABLE, stmt.getTableName(), stmt.getDbName());
+            }
+            return;
+        }
         catalogIf.dropTable(stmt.getDbName(), stmt.getTableName(), stmt.isView(), stmt.isMaterializedView(),
                 stmt.isSetIfExists(), stmt.isMustTemporary(), stmt.isForceDrop());
+    }
+
+    public void rollbackCtas(CreateTableStmt createTable, boolean ifExists) throws DdlException {
+        Table createdTable = createTable.getCreatedTable();
+        if (createdTable != null) {
+            getInternalCatalog().rollbackCreatedTable(createTable.getCreatedTableDbId(), createdTable);
+        } else if (InternalCatalog.INTERNAL_CATALOG_NAME.equals(createTable.getDbTbl().getCtl())) {
+            throw new DdlException("Cannot roll back internal CTAS without the created table identity");
+        } else {
+            dropTable(new DropTableStmt(ifExists, createTable.isTemp(), createTable.getDbTbl(), true));
+        }
     }
 
     public void replayDropTable(Database db, long tableId, boolean isForceDrop,

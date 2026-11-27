@@ -60,7 +60,6 @@ import org.apache.doris.nereids.trees.plans.physical.PhysicalOneRowRelation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalSink;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalUnion;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
-import org.apache.doris.nereids.util.RelationUtil;
 import org.apache.doris.planner.DataSink;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.ConnectContext.ConnectType;
@@ -167,11 +166,10 @@ public class InsertIntoTableCommand extends Command implements NeedAuditEncrypti
     public AbstractInsertExecutor initPlan(ConnectContext ctx, StmtExecutor stmtExecutor,
                                            boolean needBeginTransaction) throws Exception {
         List<String> qualifiedTargetTableName = InsertUtils.getTargetTableQualified(originLogicalQuery, ctx);
-
         AbstractInsertExecutor insertExecutor;
         int retryTimes = 0;
         while (++retryTimes < Math.max(ctx.getSessionVariable().dmlPlanRetryTimes, 3)) {
-            TableIf targetTableIf = RelationUtil.getTable(qualifiedTargetTableName, ctx.getEnv());
+            TableIf targetTableIf = InsertUtils.getTargetTable(originLogicalQuery, qualifiedTargetTableName, ctx);
             // check auth
             if (!Env.getCurrentEnv().getAccessManager()
                     .checkTblPriv(ConnectContext.get(), targetTableIf.getDatabase().getCatalog().getName(),
@@ -195,7 +193,7 @@ public class InsertIntoTableCommand extends Command implements NeedAuditEncrypti
             }
 
             // lock after plan and check does table's schema changed to ensure we lock table order by id.
-            TableIf newestTargetTableIf = RelationUtil.getTable(qualifiedTargetTableName, ctx.getEnv());
+            TableIf newestTargetTableIf = InsertUtils.getTargetTable(originLogicalQuery, qualifiedTargetTableName, ctx);
             newestTargetTableIf.readLock();
             try {
                 if (targetTableIf.getId() != newestTargetTableIf.getId()) {
