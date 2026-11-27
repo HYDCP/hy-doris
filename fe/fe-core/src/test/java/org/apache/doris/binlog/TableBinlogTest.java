@@ -17,6 +17,7 @@
 
 package org.apache.doris.binlog;
 
+import org.apache.doris.common.Config;
 import org.apache.doris.thrift.TBinlog;
 
 import com.google.common.collect.Lists;
@@ -256,4 +257,82 @@ public class TableBinlogTest {
         Assert.assertEquals(expiredTime, dummy.getCommitSeq());
     }
 
+    @Test
+    public void testTtlGcLimitPerRound() {
+        new MockUp<BinlogUtils>() {
+            @Mock
+            public long getExpiredMs(long direct) {
+                return direct;
+            }
+        };
+
+        // all binlogs are expired by ttl
+        long expiredTime = baseNum + totalBinlogNum;
+        BinlogConfigCache binlogConfigCache = BinlogTestUtils.newMockBinlogConfigCache(dbId, tableId, expiredTime);
+        List<TBinlog> testBinlogs = newTestBinlogs();
+        TableBinlog tableBinlog = newTableBinlog(binlogConfigCache, testBinlogs);
+
+        long oldLimit = Config.max_binlog_gc_num_per_round;
+        Config.max_binlog_gc_num_per_round = 4;
+        try {
+            // recycled in 3 rounds: 4 + 4 + 2
+            long[] expectedCommitSeqs = {baseNum + 3, baseNum + 7, baseNum + totalBinlogNum - 1};
+            for (long expectedCommitSeq : expectedCommitSeqs) {
+                BinlogTombstone tombstone = tableBinlog.gc();
+                Assert.assertFalse(tombstone.isDbBinlogTomstone());
+                Assert.assertEquals(expectedCommitSeq, tombstone.getCommitSeq());
+                Assert.assertEquals(expectedCommitSeq, tableBinlog.getDummyBinlog().getCommitSeq());
+                for (TBinlog binlog : testBinlogs) {
+                    Assert.assertEquals(binlog.getCommitSeq() <= expectedCommitSeq ? 0 : 1, binlog.getTableRef());
+                }
+            }
+            Assert.assertNull(tableBinlog.gc());
+
+            // a non-positive limit fails the gc instead of stopping it silently
+            Config.max_binlog_gc_num_per_round = 0;
+            TableBinlog invalidLimitTableBinlog = newTableBinlog(binlogConfigCache, newTestBinlogs());
+            Assert.assertThrows(IllegalArgumentException.class, invalidLimitTableBinlog::gc);
+
+            // the replay is not limited
+            Config.max_binlog_gc_num_per_round = 1;
+            List<TBinlog> replayBinlogs = newTestBinlogs();
+            TableBinlog replayTableBinlog = newTableBinlog(binlogConfigCache, replayBinlogs);
+            replayTableBinlog.replayGc(baseNum + 7);
+            Assert.assertEquals(baseNum + 7, replayTableBinlog.getDummyBinlog().getCommitSeq());
+            for (TBinlog binlog : replayBinlogs) {
+                Assert.assertEquals(binlog.getCommitSeq() <= baseNum + 7 ? 0 : 1, binlog.getTableRef());
+            }
+        } finally {
+            Config.max_binlog_gc_num_per_round = oldLimit;
+        }
+    }
+
+    @Test
+    public void testRemoveExpiredPrefix() {
+        List<Long> list = Lists.newArrayList(1L, 2L, 3L, 1L, 5L);
+        // stop at the first element that is not expired, even if a later one is expired
+        Assert.assertEquals(2, BinlogUtils.removeExpiredPrefix(list, v -> v <= 2L));
+        Assert.assertEquals(Lists.newArrayList(3L, 1L, 5L), list);
+        Assert.assertEquals(0, BinlogUtils.removeExpiredPrefix(list, v -> v <= 2L));
+        Assert.assertEquals(Lists.newArrayList(3L, 1L, 5L), list);
+        Assert.assertEquals(3, BinlogUtils.removeExpiredPrefix(list, v -> true));
+        Assert.assertTrue(list.isEmpty());
+        Assert.assertEquals(0, BinlogUtils.removeExpiredPrefix(list, v -> true));
+    }
+
+    private List<TBinlog> newTestBinlogs() {
+        List<TBinlog> binlogs = Lists.newArrayList();
+        for (int i = 0; i < totalBinlogNum; ++i) {
+            binlogs.add(BinlogTestUtils.newBinlog(dbId, tableId, baseNum + i, baseNum + i));
+        }
+        return binlogs;
+    }
+
+    private TableBinlog newTableBinlog(BinlogConfigCache binlogConfigCache, List<TBinlog> binlogs) {
+        TableBinlog tableBinlog = new TableBinlog(binlogConfigCache, binlogs.get(0), dbId, tableId);
+        for (TBinlog binlog : binlogs) {
+            tableBinlog.addBinlog(binlog);
+        }
+        return tableBinlog;
+    }
 }

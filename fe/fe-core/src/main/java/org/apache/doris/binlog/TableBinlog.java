@@ -21,6 +21,7 @@ import org.apache.doris.catalog.BinlogConfig;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Table;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.proc.BaseProcResult;
 import org.apache.doris.thrift.TBinlog;
@@ -28,6 +29,7 @@ import org.apache.doris.thrift.TBinlogType;
 import org.apache.doris.thrift.TStatus;
 import org.apache.doris.thrift.TStatusCode;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
@@ -198,7 +200,10 @@ public class TableBinlog {
         }
     }
 
-    private Pair<TBinlog, Long> getLastUpsertAndLargestCommitSeq(BinlogComparator checker) {
+    // At most maxExpiredNum binlogs are recycled, the rest are left to the next round so that the
+    // write lock is not held for a long time.
+    private Pair<TBinlog, Long> getLastUpsertAndLargestCommitSeq(BinlogComparator checker, long maxExpiredNum) {
+        Preconditions.checkArgument(maxExpiredNum > 0, "max_binlog_gc_num_per_round must be greater than 0");
         if (binlogs.size() <= 1) {
             return null;
         }
@@ -207,19 +212,25 @@ public class TableBinlog {
         TBinlog dummyBinlog = iter.next();
         TBinlog tombstoneUpsert = null;
         TBinlog lastExpiredBinlog = null;
+        long expiredNum = 0;
         while (iter.hasNext()) {
             TBinlog binlog = iter.next();
-            if (checker.isExpired(binlog)) {
-                lastExpiredBinlog = binlog;
-                --binlog.table_ref;
-                binlogSize -= BinlogUtils.getApproximateMemoryUsage(binlog);
-                if (binlog.getType() == TBinlogType.UPSERT) {
-                    tombstoneUpsert = binlog;
-                }
-                iter.remove();
-            } else {
+            if (!checker.isExpired(binlog)) {
                 break;
             }
+            if (expiredNum >= maxExpiredNum) {
+                LOG.info("gc table binlog reaches the limit {}, the rest are recycled in the next round. "
+                        + "dbId: {}, tableId: {}", maxExpiredNum, dbId, tableId);
+                break;
+            }
+            lastExpiredBinlog = binlog;
+            --binlog.table_ref;
+            binlogSize -= BinlogUtils.getApproximateMemoryUsage(binlog);
+            if (binlog.getType() == TBinlogType.UPSERT) {
+                tombstoneUpsert = binlog;
+            }
+            iter.remove();
+            ++expiredNum;
         }
 
         if (lastExpiredBinlog == null) {
@@ -230,10 +241,7 @@ public class TableBinlog {
         dummyBinlog.setCommitSeq(expiredCommitSeq);
         dummyBinlog.setTimestamp(lastExpiredBinlog.getTimestamp());
 
-        Iterator<Pair<Long, Long>> timeIterator = timestamps.iterator();
-        while (timeIterator.hasNext() && timeIterator.next().first <= expiredCommitSeq) {
-            timeIterator.remove();
-        }
+        BinlogUtils.removeExpiredPrefix(timestamps, ts -> ts.first <= expiredCommitSeq);
 
         lockedBinlogs.entrySet().removeIf(ent -> ent.getValue() <= expiredCommitSeq);
         return Pair.of(tombstoneUpsert, expiredCommitSeq);
@@ -247,7 +255,9 @@ public class TableBinlog {
         lock.writeLock().lock();
         try {
             BinlogComparator check = (binlog) -> binlog.getCommitSeq() <= expiredCommitSeq;
-            tombstoneInfo = getLastUpsertAndLargestCommitSeq(check);
+            // The binlogs of a table are a subset of the db binlogs, so a table recycles at most the
+            // binlogs recycled by the db gc, which already limits the recycled number.
+            tombstoneInfo = getLastUpsertAndLargestCommitSeq(check, Long.MAX_VALUE);
         } finally {
             lock.writeLock().unlock();
         }
@@ -329,7 +339,7 @@ public class TableBinlog {
                         || maxBytes < binlogSize
                         || maxHistoryNums < binlogs.size();
             };
-            tombstoneInfo = getLastUpsertAndLargestCommitSeq(check);
+            tombstoneInfo = getLastUpsertAndLargestCommitSeq(check, Config.max_binlog_gc_num_per_round);
         } finally {
             lock.writeLock().unlock();
         }
@@ -355,7 +365,8 @@ public class TableBinlog {
         lock.writeLock().lock();
         try {
             BinlogComparator checker = (binlog) -> binlog.getCommitSeq() <= largestExpiredCommitSeq;
-            getLastUpsertAndLargestCommitSeq(checker);
+            // The tombstone is bounded by the master, replay it exactly.
+            getLastUpsertAndLargestCommitSeq(checker, Long.MAX_VALUE);
         } finally {
             lock.writeLock().unlock();
         }

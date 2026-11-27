@@ -17,6 +17,7 @@
 
 package org.apache.doris.binlog;
 
+import org.apache.doris.common.Config;
 import org.apache.doris.common.Pair;
 import org.apache.doris.persist.RecoverInfo;
 import org.apache.doris.persist.ReplaceTableOperationLog;
@@ -426,6 +427,91 @@ public class DbBinlogTest {
         // check tombstone
         Assert.assertTrue(tombstone.isDbBinlogTomstone());
         Assert.assertEquals(expiredTime, tombstone.getCommitSeq());
+    }
+
+    private DBBinlog newDbBinlogWithEnable(MockBinlogConfigCache binlogConfigCache, List<TBinlog> binlogs) {
+        DBBinlog dbBinlog = new DBBinlog(binlogConfigCache, binlogs.get(0));
+        for (TBinlog binlog : binlogs) {
+            dbBinlog.addBinlog(binlog, null);
+        }
+        return dbBinlog;
+    }
+
+    private List<TBinlog> newTestBinlogs() {
+        List<TBinlog> binlogs = Lists.newArrayList();
+        for (int i = 0; i < totalBinlogNum; ++i) {
+            long tableId = baseTableId + (i / tableNum);
+            binlogs.add(BinlogTestUtils.newBinlog(dbId, tableId, baseNum + i, baseNum + i));
+        }
+        return binlogs;
+    }
+
+    private long getDbDummyCommitSeq(DBBinlog dbBinlog) {
+        List<TBinlog> allBinlogs = Lists.newArrayList();
+        dbBinlog.getAllBinlogs(allBinlogs);
+        for (TBinlog binlog : allBinlogs) {
+            if (binlog.getType() == TBinlogType.DUMMY && binlog.getBelong() < 0) {
+                return binlog.getCommitSeq();
+            }
+        }
+        Assert.fail("db dummy binlog not found");
+        return -1;
+    }
+
+    // A syncer locks the latest binlog (e.g. before a full sync), so that all the binlogs before it
+    // become expired at once. The gc recycles at most max_binlog_gc_num_per_round binlogs in a round.
+    @Test
+    public void testDbGcLimitPerRoundAfterLockLatestBinlog() {
+        // no binlog is expired by ttl, only by the lock
+        long expiredTime = 0L;
+        Map<String, Long> ttlMap = Maps.newHashMap();
+        for (int i = 0; i < tableNum; ++i) {
+            ttlMap.put(String.format("%d_%d", dbId, baseTableId + i), expiredTime);
+        }
+        MockBinlogConfigCache binlogConfigCache = BinlogTestUtils.newMockBinlogConfigCache(ttlMap);
+        binlogConfigCache.addDbBinlogConfig(dbId, true, expiredTime);
+        for (int i = 0; i < tableNum; i++) {
+            binlogConfigCache.addTableBinlogConfig(dbId, baseTableId + i, true, expiredTime);
+        }
+
+        List<TBinlog> testBinlogs = newTestBinlogs();
+        DBBinlog dbBinlog = newDbBinlogWithEnable(binlogConfigCache, testBinlogs);
+        long lastCommitSeq = baseNum + totalBinlogNum - 1;
+        Assert.assertEquals(lastCommitSeq, (long) dbBinlog.lockBinlog(-1, "job", -1).second);
+
+        long oldLimit = Config.max_binlog_gc_num_per_round;
+        Config.max_binlog_gc_num_per_round = 4;
+        try {
+            // all binlogs before the locked one are expired, they are recycled in 3 rounds: 4 + 4 + 1
+            List<BinlogTombstone> tombstones = Lists.newArrayList();
+            long[] expectedCommitSeqs = {baseNum + 3, baseNum + 7, lastCommitSeq - 1};
+            for (long expectedCommitSeq : expectedCommitSeqs) {
+                BinlogTombstone tombstone = dbBinlog.gc();
+                Assert.assertTrue(tombstone.isDbBinlogTomstone());
+                Assert.assertEquals(expectedCommitSeq, tombstone.getCommitSeq());
+                Assert.assertEquals(expectedCommitSeq, getDbDummyCommitSeq(dbBinlog));
+                for (TBinlog binlog : testBinlogs) {
+                    Assert.assertEquals(binlog.getCommitSeq() <= expectedCommitSeq ? 0 : 1, binlog.getTableRef());
+                }
+                tombstones.add(tombstone);
+            }
+            // the locked binlog is kept
+            Assert.assertNull(dbBinlog.gc());
+            Assert.assertEquals(TStatusCode.OK,
+                    dbBinlog.getBinlog(-1, lastCommitSeq - 1, 1).first.getStatusCode());
+
+            // the replay is not limited, it recycles exactly the binlogs in the tombstone
+            Config.max_binlog_gc_num_per_round = 1;
+            List<TBinlog> replayBinlogs = newTestBinlogs();
+            DBBinlog replayDbBinlog = newDbBinlogWithEnable(binlogConfigCache, replayBinlogs);
+            replayDbBinlog.replayGc(tombstones.get(1));
+            Assert.assertEquals(baseNum + 7, getDbDummyCommitSeq(replayDbBinlog));
+            for (TBinlog binlog : replayBinlogs) {
+                Assert.assertEquals(binlog.getCommitSeq() <= baseNum + 7 ? 0 : 1, binlog.getTableRef());
+            }
+        } finally {
+            Config.max_binlog_gc_num_per_round = oldLimit;
+        }
     }
 
     private DBBinlog newEnabledDbBinlog(long tableId) {

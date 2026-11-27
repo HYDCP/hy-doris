@@ -526,39 +526,38 @@ public class BinlogManager {
         return Pair.of(result.first, null);
     }
 
-    // get binlogs by dbId, return the first N binlogs, which first binlog.version > prevCommitSeq
-    public Pair<TStatus, List<TBinlog>> getBinlog(long dbId, long tableId, long prevCommitSeq, long numAcquired) {
-        TStatus status = new TStatus(TStatusCode.OK);
+    // Only look up the DBBinlog under the lock. The callers access the DBBinlog after the lock is
+    // released, so that a reader waiting for a busy DBBinlog (e.g. a long gc) does not hold this lock,
+    // which would block the writers of this lock, and then all readers of all dbs queued behind them.
+    private DBBinlog getDbBinlog(long dbId) {
         lock.readLock().lock();
         try {
-            DBBinlog dbBinlog = dbBinlogMap.get(dbId);
-            if (dbBinlog == null) {
-                status.setStatusCode(TStatusCode.BINLOG_NOT_FOUND_DB);
-                LOG.warn("dbBinlog not found. dbId: {}", dbId);
-                return Pair.of(status, null);
-            }
-
-            return dbBinlog.getBinlog(tableId, prevCommitSeq, numAcquired);
+            return dbBinlogMap.get(dbId);
         } finally {
             lock.readLock().unlock();
         }
     }
 
+    // get binlogs by dbId, return the first N binlogs, which first binlog.version > prevCommitSeq
+    public Pair<TStatus, List<TBinlog>> getBinlog(long dbId, long tableId, long prevCommitSeq, long numAcquired) {
+        DBBinlog dbBinlog = getDbBinlog(dbId);
+        if (dbBinlog == null) {
+            TStatus status = new TStatus(TStatusCode.BINLOG_NOT_FOUND_DB);
+            LOG.warn("dbBinlog not found. dbId: {}", dbId);
+            return Pair.of(status, null);
+        }
+        return dbBinlog.getBinlog(tableId, prevCommitSeq, numAcquired);
+    }
+
     // get binlog by dbId, return first binlog.version > version
     public Pair<TStatus, BinlogLagInfo> getBinlogLag(long dbId, long tableId, long prevCommitSeq) {
-        TStatus status = new TStatus(TStatusCode.OK);
-        lock.readLock().lock();
-        try {
-            DBBinlog dbBinlog = dbBinlogMap.get(dbId);
-            if (dbBinlog == null) {
-                status.setStatusCode(TStatusCode.BINLOG_NOT_FOUND_DB);
-                LOG.warn("dbBinlog not found. dbId: {}", dbId);
-                return Pair.of(status, null);
-            }
-            return dbBinlog.getBinlogLag(tableId, prevCommitSeq);
-        } finally {
-            lock.readLock().unlock();
+        DBBinlog dbBinlog = getDbBinlog(dbId);
+        if (dbBinlog == null) {
+            TStatus status = new TStatus(TStatusCode.BINLOG_NOT_FOUND_DB);
+            LOG.warn("dbBinlog not found. dbId: {}", dbId);
+            return Pair.of(status, null);
         }
+        return dbBinlog.getBinlogLag(tableId, prevCommitSeq);
     }
 
     public Pair<TStatus, Long> lockBinlog(long dbId, long tableId,
@@ -566,14 +565,7 @@ public class BinlogManager {
         LOG.debug("lock binlog. dbId: {}, tableId: {}, jobUniqueId: {}, lockCommitSeq: {}",
                 dbId, tableId, jobUniqueId, lockCommitSeq);
 
-        DBBinlog dbBinlog = null;
-        lock.readLock().lock();
-        try {
-            dbBinlog = dbBinlogMap.get(dbId);
-        } finally {
-            lock.readLock().unlock();
-        }
-
+        DBBinlog dbBinlog = getDbBinlog(dbId);
         if (dbBinlog == null) {
             LOG.warn("db binlog not found. dbId: {}", dbId);
             return Pair.of(new TStatus(TStatusCode.BINLOG_NOT_FOUND_DB), -1L);
@@ -583,44 +575,29 @@ public class BinlogManager {
 
     // get the dropped partitions of the db.
     public List<Pair<Long, Long>> getDroppedPartitions(long dbId) {
-        lock.readLock().lock();
-        try {
-            DBBinlog dbBinlog = dbBinlogMap.get(dbId);
-            if (dbBinlog == null) {
-                return Lists.newArrayList();
-            }
-            return dbBinlog.getDroppedPartitions();
-        } finally {
-            lock.readLock().unlock();
+        DBBinlog dbBinlog = getDbBinlog(dbId);
+        if (dbBinlog == null) {
+            return Lists.newArrayList();
         }
+        return dbBinlog.getDroppedPartitions();
     }
 
     // get the dropped tables of the db.
     public List<Pair<Long, Long>> getDroppedTables(long dbId) {
-        lock.readLock().lock();
-        try {
-            DBBinlog dbBinlog = dbBinlogMap.get(dbId);
-            if (dbBinlog == null) {
-                return Lists.newArrayList();
-            }
-            return dbBinlog.getDroppedTables();
-        } finally {
-            lock.readLock().unlock();
+        DBBinlog dbBinlog = getDbBinlog(dbId);
+        if (dbBinlog == null) {
+            return Lists.newArrayList();
         }
+        return dbBinlog.getDroppedTables();
     }
 
     // get the dropped indexes of the db.
     public List<Pair<Long, Long>> getDroppedIndexes(long dbId) {
-        lock.readLock().lock();
-        try {
-            DBBinlog dbBinlog = dbBinlogMap.get(dbId);
-            if (dbBinlog == null) {
-                return Lists.newArrayList();
-            }
-            return dbBinlog.getDroppedIndexes();
-        } finally {
-            lock.readLock().unlock();
+        DBBinlog dbBinlog = getDbBinlog(dbId);
+        if (dbBinlog == null) {
+            return Lists.newArrayList();
         }
+        return dbBinlog.getDroppedIndexes();
     }
 
     public List<BinlogTombstone> gc() {
@@ -853,13 +830,16 @@ public class BinlogManager {
         BaseProcResult result = new BaseProcResult();
         result.setNames(TITLE_NAMES);
 
+        List<DBBinlog> dbBinlogs;
         lock.readLock().lock();
         try {
-            for (DBBinlog dbBinlog : dbBinlogMap.values()) {
-                dbBinlog.getBinlogInfo(result);
-            }
+            dbBinlogs = Lists.newArrayList(dbBinlogMap.values());
         } finally {
             lock.readLock().unlock();
+        }
+
+        for (DBBinlog dbBinlog : dbBinlogs) {
+            dbBinlog.getBinlogInfo(result);
         }
 
         return result;
