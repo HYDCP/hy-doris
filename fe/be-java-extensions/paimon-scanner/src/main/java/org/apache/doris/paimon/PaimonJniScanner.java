@@ -37,9 +37,11 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.TimeZone;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 public class PaimonJniScanner extends JniScanner {
@@ -50,6 +52,7 @@ public class PaimonJniScanner extends JniScanner {
     private final Map<String, String> hadoopOptionParams;
     private final String paimonSplit;
     private final String paimonPredicate;
+    private final AtomicLong remoteBytes;
     private Table table;
     private RecordReader<InternalRow> reader;
     private final PaimonColumnValue columnValue = new PaimonColumnValue();
@@ -65,6 +68,7 @@ public class PaimonJniScanner extends JniScanner {
             LOG.debug("params:{}", params);
         }
         this.params = params;
+        remoteBytes = Boolean.parseBoolean(params.get("collect_remote_scan_bytes")) ? new AtomicLong() : null;
         String[] requiredFields = params.get("required_fields").split(",");
         String[] requiredTypes = params.get("columns_types").split("#");
         ColumnType[] columnTypes = new ColumnType[requiredTypes.length];
@@ -217,9 +221,17 @@ public class PaimonJniScanner extends JniScanner {
         return null;
     }
 
-    private void initTable() {
+    @Override
+    public Map<String, String> getStatistics() {
+        return remoteBytes == null ? Collections.emptyMap()
+                : Collections.singletonMap("bytes:RemoteScanBytes", Long.toString(remoteBytes.get()));
+    }
+
+    private void initTable() throws IOException, ClassNotFoundException {
         Preconditions.checkState(params.containsKey("serialized_table"));
-        table = PaimonUtils.deserialize(params.get("serialized_table"));
+        String serialized = params.get("serialized_table");
+        table = remoteBytes == null ? PaimonUtils.deserialize(serialized)
+                : PaimonUtils.deserializeTable(serialized, remoteBytes);
         paimonAllFieldNames = PaimonUtils.getFieldNames(this.table.rowType());
         if (LOG.isDebugEnabled()) {
             LOG.debug("paimonAllFieldNames:{}", paimonAllFieldNames);

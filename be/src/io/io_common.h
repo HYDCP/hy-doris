@@ -19,6 +19,9 @@
 
 #include <gen_cpp/Types_types.h>
 
+#include <atomic>
+#include <memory>
+
 namespace doris {
 
 enum class ReaderType : uint8_t {
@@ -88,6 +91,8 @@ struct IOContext {
     const TUniqueId* query_id = nullptr;             // Ref
     FileCacheStatistics* file_cache_stats = nullptr; // Ref
     FileReaderStats* file_reader_stats = nullptr;    // Ref
+    // A blocking storage read may finish on a prefetch thread during scanner shutdown.
+    std::shared_ptr<std::atomic<int64_t>> remote_scan_bytes = nullptr;
     bool is_inverted_index = false;
     // if is_dryrun, read IO will download data to cache but return no data to reader
     // useful to skip cache data read from local disk to accelarate warm up

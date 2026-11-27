@@ -17,11 +17,13 @@
 
 #include "paimon_jni_reader.h"
 
+#include <charconv>
 #include <map>
 
 #include "runtime/descriptors.h"
 #include "runtime/runtime_state.h"
 #include "runtime/types.h"
+#include "util/jni-util.h"
 #include "vec/core/types.h"
 namespace doris {
 class RuntimeProfile;
@@ -84,9 +86,37 @@ PaimonJniReader::PaimonJniReader(const std::vector<SlotDescriptor*>& file_slot_d
             params[HADOOP_OPTION_PREFIX + kv.first] = kv.second;
         }
     }
+    params["collect_remote_scan_bytes"] = "true";
     int64_t self_split_weight = range.__isset.self_split_weight ? range.self_split_weight : -1;
     _jni_connector = std::make_unique<JniConnector>("org/apache/doris/paimon/PaimonJniScanner",
                                                     params, column_names, self_split_weight);
+}
+
+int64_t PaimonJniReader::take_remote_read_bytes() {
+    JNIEnv* env = nullptr;
+    std::map<std::string, std::string> stats;
+    auto status = JniUtil::GetJNIEnv(&env);
+    if (status.ok()) {
+        status = _jni_connector->get_statistics(env, &stats);
+    }
+    if (!status.ok()) {
+        LOG(WARNING) << "Failed to read Paimon scan statistics: " << status;
+        return 0;
+    }
+    auto it = stats.find("bytes:RemoteScanBytes");
+    if (it == stats.end()) {
+        return 0;
+    }
+    const auto& value = it->second;
+    int64_t bytes;
+    auto [pos, error] = std::from_chars(value.data(), value.data() + value.size(), bytes);
+    if (error != std::errc() || pos != value.data() + value.size() ||
+        bytes < _reported_remote_bytes) {
+        return 0;
+    }
+    int64_t delta = bytes - _reported_remote_bytes;
+    _reported_remote_bytes = bytes;
+    return delta;
 }
 
 Status PaimonJniReader::get_next_block(Block* block, size_t* read_rows, bool* eof) {

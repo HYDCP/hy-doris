@@ -4012,18 +4012,46 @@ TEST_F(BlockFileCacheTest, cached_remote_file_reader_concurrent) {
     io::FileReaderOptions opts;
     opts.cache_type = io::cache_type_from_string("file_block_cache");
     opts.is_doris_table = true;
-    bool flag1 = false;
-    auto reader = std::make_shared<CachedRemoteFileReader>(local_reader, opts);
+    // Back the simulated storage file with local test data. Only reads through this leaf are remote.
+    class StorageReader : public FileReader {
+    public:
+        explicit StorageReader(FileReaderSPtr local) : _local(std::move(local)) {}
+        Status close() override { return _local->close(); }
+        const Path& path() const override { return _local->path(); }
+        size_t size() const override { return _local->size(); }
+        bool closed() const override { return _local->closed(); }
+
+    protected:
+        bool reads_remote_storage() const override { return true; }
+        Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
+                            const IOContext* ctx) override {
+            return _local->read_at(offset, result, bytes_read, ctx);
+        }
+
+    private:
+        FileReaderSPtr _local;
+    };
+    auto reader = std::make_shared<CachedRemoteFileReader>(
+            std::make_shared<StorageReader>(local_reader), opts);
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool waiter_entered = false;
+    auto first = std::make_shared<std::atomic<int64_t>>(0);
+    auto second = std::make_shared<std::atomic<int64_t>>(0);
     auto sp = SyncPoint::get_instance();
     sp->enable_processing();
     Defer defer {[sp] {
         sp->clear_call_back("CachedRemoteFileReader::DOWNLOADING");
         sp->clear_call_back("CachedRemoteFileReader::EMPTY");
     }};
-    sp->set_call_back("CachedRemoteFileReader::DOWNLOADING", [&](auto&&) { flag1 = true; });
+    sp->set_call_back("CachedRemoteFileReader::DOWNLOADING", [&](auto&&) {
+        std::lock_guard lock(mutex);
+        waiter_entered = true;
+        cv.notify_one();
+    });
     sp->set_call_back("CachedRemoteFileReader::EMPTY", [&](auto&&) {
-        while (!flag1) {
-        }
+        std::unique_lock lock(mutex);
+        EXPECT_TRUE(cv.wait_for(lock, std::chrono::seconds(10), [&] { return waiter_entered; }));
     });
     std::thread thread([&]() {
         std::string buffer;
@@ -4031,6 +4059,7 @@ TEST_F(BlockFileCacheTest, cached_remote_file_reader_concurrent) {
         IOContext io_ctx;
         FileCacheStatistics stats;
         io_ctx.file_cache_stats = &stats;
+        io_ctx.remote_scan_bytes = first;
         size_t bytes_read {0};
         ASSERT_TRUE(reader->read_at(100, Slice(buffer.data(), buffer.size()), &bytes_read, &io_ctx)
                             .ok());
@@ -4041,6 +4070,7 @@ TEST_F(BlockFileCacheTest, cached_remote_file_reader_concurrent) {
     IOContext io_ctx;
     FileCacheStatistics stats;
     io_ctx.file_cache_stats = &stats;
+    io_ctx.remote_scan_bytes = second;
     size_t bytes_read {0};
     ASSERT_TRUE(
             reader->read_at(100, Slice(buffer.data(), buffer.size()), &bytes_read, &io_ctx).ok());
@@ -4048,6 +4078,10 @@ TEST_F(BlockFileCacheTest, cached_remote_file_reader_concurrent) {
     if (thread.joinable()) {
         thread.join();
     }
+    auto first_bytes = first->load();
+    auto second_bytes = second->load();
+    EXPECT_EQ(0, std::min(first_bytes, second_bytes));
+    EXPECT_GE(std::max(first_bytes, second_bytes), 64_kb);
     EXPECT_TRUE(reader->close().ok());
     EXPECT_TRUE(reader->closed());
     std::this_thread::sleep_for(std::chrono::seconds(1));

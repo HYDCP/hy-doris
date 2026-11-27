@@ -288,6 +288,7 @@ enum TWorkloadMetricType {
     BE_SCAN_ROWS = 1
     BE_SCAN_BYTES = 2
     QUERY_BE_MEMORY_BYTES = 3
+    BE_SCAN_BYTES_FROM_REMOTE_STORAGE = 5
 }
 
 enum TCompareOperator {

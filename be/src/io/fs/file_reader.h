@@ -91,6 +91,7 @@ public:
     virtual const std::string& get_data_dir_path() { return VIRTUAL_REMOTE_DATA_DIR; }
 
 protected:
+    virtual bool reads_remote_storage() const { return false; }
     virtual Status read_at_impl(size_t offset, Slice result, size_t* bytes_read,
                                 const IOContext* io_ctx) = 0;
 };

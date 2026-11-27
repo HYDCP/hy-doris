@@ -28,6 +28,7 @@
 #include "gtest/gtest_pred_impl.h"
 #include "io/fs/file_reader_writer_fwd.h"
 #include "io/fs/local_file_system.h"
+#include "io/io_common.h"
 #include "runtime/exec_env.h"
 #include "util/stopwatch.hpp"
 #include "util/threadpool.h"
@@ -115,6 +116,31 @@ private:
     bool _closed = false;
     io::Path _path = "/tmp/mock";
 };
+
+TEST(BufferedReaderRemoteBytesTest, CountsPrefetchOnceAndExcludesCacheHits) {
+    class RemoteReader : public MockOffsetFileReader {
+    public:
+        using MockOffsetFileReader::MockOffsetFileReader;
+        bool reads_remote_storage() const override { return true; }
+    };
+
+    io::IOContext owner {.remote_scan_bytes = std::make_shared<std::atomic<int64_t>>(0)};
+    io::IOContext waiter {.remote_scan_bytes = std::make_shared<std::atomic<int64_t>>(0)};
+    io::InMemoryFileReader reader(std::make_shared<RemoteReader>(1024));
+    char data[16];
+    size_t bytes_read;
+    ASSERT_TRUE(reader.read_at(0, Slice(data, sizeof(data)), &bytes_read, &owner).ok());
+    EXPECT_EQ(16, bytes_read);
+    EXPECT_EQ(1024, owner.remote_scan_bytes->load());
+    ASSERT_TRUE(reader.read_at(8, Slice(data, sizeof(data)), &bytes_read, &waiter).ok());
+    EXPECT_EQ(16, bytes_read);
+    EXPECT_EQ(0, waiter.remote_scan_bytes->load());
+    ASSERT_TRUE(reader.read_at(8, Slice(data, sizeof(data)), &bytes_read, &owner).ok());
+    EXPECT_EQ(1024, owner.remote_scan_bytes->load());
+    MockOffsetFileReader local(1024);
+    ASSERT_TRUE(local.read_at(0, Slice(data, sizeof(data)), &bytes_read, &waiter).ok());
+    EXPECT_EQ(0, waiter.remote_scan_bytes->load());
+}
 
 class TestingRangeCacheFileReader : public io::FileReader {
 public:
