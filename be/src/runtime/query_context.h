@@ -32,6 +32,7 @@
 #include "common/object_pool.h"
 #include "runtime/exec_env.h"
 #include "runtime/memory/mem_tracker_limiter.h"
+#include "runtime/query_source.h"
 #include "runtime/query_statistics.h"
 #include "runtime/runtime_filter_mgr.h"
 #include "runtime/runtime_predicate.h"
@@ -60,16 +61,6 @@ struct ReportStatusRequest {
     std::string load_error_url;
     std::function<void(const Status&)> cancel_fn;
 };
-
-enum class QuerySource {
-    INTERNAL_FRONTEND,
-    STREAM_LOAD,
-    GROUP_COMMIT_LOAD,
-    ROUTINE_LOAD,
-    EXTERNAL_CONNECTOR
-};
-
-const std::string toString(QuerySource query_source);
 
 // Save the common components of fragments in a query.
 // Some components like DescriptorTbl may be very large

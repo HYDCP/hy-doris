@@ -3166,6 +3166,9 @@ public class Coordinator implements CoordInterface {
                     params.setNumSenders(instanceExecParams.size());
                     params.setCoord(coordAddress);
                     params.setCurrentConnectFe(currentConnectFE);
+                    if (context != null) {
+                        params.setResourceInfo(context.getResourceInfo());
+                    }
                     params.setQueryGlobals(queryGlobals);
                     params.setQueryOptions(queryOptions);
                     params.query_options.setMemLimit(memLimit);

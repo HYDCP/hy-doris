@@ -22,14 +22,35 @@ import org.apache.doris.analysis.ImportColumnsStmt;
 import org.apache.doris.analysis.ImportWhereStmt;
 import org.apache.doris.analysis.SqlParser;
 import org.apache.doris.analysis.SqlScanner;
+import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.common.util.SqlParserUtils;
+import org.apache.doris.load.routineload.RoutineLoadJob;
+import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.task.StreamLoadTask;
 
 import org.junit.Assert;
 import org.junit.Test;
+import org.mockito.Mockito;
 
 import java.io.StringReader;
 
 public class StreamLoadPlannerTest {
+    @Test
+    public void testRoutineLoadUsesJobOwner() {
+        RoutineLoadJob job = Mockito.mock(RoutineLoadJob.class);
+        UserIdentity owner = UserIdentity.createAnalyzedUserIdentWithIp("job_owner", "%");
+        Mockito.when(job.getUserIdentity()).thenReturn(owner);
+        ConnectContext scheduler = new ConnectContext();
+        scheduler.setCurrentUserIdentity(UserIdentity.createAnalyzedUserIdentWithIp("other_user", "%"));
+
+        Assert.assertEquals("job_owner", StreamLoadPlanner.getLoadResourceInfo(job, null).getUser());
+        Assert.assertEquals("job_owner", StreamLoadPlanner.getLoadResourceInfo(job, scheduler).getUser());
+        Assert.assertEquals("other_user",
+                StreamLoadPlanner.getLoadResourceInfo(Mockito.mock(StreamLoadTask.class), scheduler).getUser());
+        Mockito.when(job.getUserIdentity()).thenReturn(null);
+        Assert.assertNull(StreamLoadPlanner.getLoadResourceInfo(job, scheduler));
+    }
+
     @Test
     public void testParseStmt() throws Exception {
         String sql = new String("COLUMNS (k1, k2, k3=abc(), k4=default_value())");

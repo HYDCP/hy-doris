@@ -59,6 +59,7 @@ import org.apache.doris.thrift.TPipelineInstanceParams;
 import org.apache.doris.thrift.TQueryGlobals;
 import org.apache.doris.thrift.TQueryOptions;
 import org.apache.doris.thrift.TQueryType;
+import org.apache.doris.thrift.TResourceInfo;
 import org.apache.doris.thrift.TScanRangeLocations;
 import org.apache.doris.thrift.TScanRangeParams;
 import org.apache.doris.thrift.TUniqueId;
@@ -91,6 +92,13 @@ public class StreamLoadPlanner {
 
     private ScanNode scanNode;
     private TupleDescriptor tupleDesc;
+
+    static TResourceInfo getLoadResourceInfo(LoadTaskInfo taskInfo, ConnectContext context) {
+        if (taskInfo instanceof RoutineLoadJob) {
+            return ConnectContext.getResourceInfo(((RoutineLoadJob) taskInfo).getUserIdentity());
+        }
+        return context == null ? null : context.getResourceInfo();
+    }
 
     public StreamLoadPlanner(Database db, OlapTable destTable, LoadTaskInfo taskInfo) {
         this.db = db;
@@ -341,6 +349,7 @@ public class StreamLoadPlanner {
         fragment.finalize(null);
 
         TPipelineFragmentParams params = new TPipelineFragmentParams();
+        params.setResourceInfo(getLoadResourceInfo(taskInfo, ConnectContext.get()));
         params.setProtocolVersion(PaloInternalServiceVersion.V1);
         params.setFragment(fragment.toThrift());
 

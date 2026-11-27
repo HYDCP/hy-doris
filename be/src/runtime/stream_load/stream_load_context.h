@@ -36,6 +36,7 @@
 #include "common/status.h"
 #include "common/utils.h"
 #include "runtime/exec_env.h"
+#include "runtime/query_source.h"
 #include "runtime/stream_load/stream_load_executor.h"
 #include "runtime/thread_context.h"
 #include "util/byte_buffer.h"
@@ -94,7 +95,8 @@ class StreamLoadContext {
     ENABLE_FACTORY_CREATOR(StreamLoadContext);
 
 public:
-    StreamLoadContext(ExecEnv* exec_env) : id(UniqueId::gen_uid()), _exec_env(exec_env) {
+    StreamLoadContext(ExecEnv* exec_env, QuerySource source = QuerySource::STREAM_LOAD)
+            : id(UniqueId::gen_uid()), query_source(source), _exec_env(exec_env) {
         start_millis = UnixMillis();
     }
 
@@ -147,6 +149,7 @@ public:
 
     // id for each load
     UniqueId id;
+    const QuerySource query_source;
 
     std::string db;
     int64_t db_id = -1;
