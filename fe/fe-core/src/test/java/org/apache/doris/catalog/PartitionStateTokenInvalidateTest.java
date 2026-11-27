@@ -20,6 +20,7 @@ package org.apache.doris.catalog;
 import org.apache.doris.analysis.AdminSetReplicaStatusStmt;
 import org.apache.doris.analysis.BackupStmt.BackupContent;
 import org.apache.doris.analysis.RollupRenameClause;
+import org.apache.doris.backup.BackupJob;
 import org.apache.doris.backup.BackupJobInfo;
 import org.apache.doris.backup.BackupMeta;
 import org.apache.doris.backup.SnapshotInfo;
@@ -426,6 +427,38 @@ public class PartitionStateTokenInvalidateTest {
                 Maps.newHashMap());
         Assertions.assertEquals("dddd",
                 info.getOlapTableInfo(table.getName()).getPartInfo(partition.getName()).stateToken);
+    }
+
+    @Test
+    public void testBackupRecordsNoTokenOfAPartitionTaintedDuringIt() {
+        Config.restore_state_token_track = true;
+        name("eeee");
+        BackupMeta meta = new BackupMeta(Lists.newArrayList(table), Lists.newArrayList());
+        Map<Long, SnapshotInfo> snapshots = Maps.newHashMap();
+        for (MaterializedIndex index : partition.getMaterializedIndices(MaterializedIndex.IndexExtState.VISIBLE)) {
+            for (Tablet tablet : index.getTablets()) {
+                snapshots.put(tablet.getId(), new SnapshotInfo(db.getId(), table.getId(), partition.getId(),
+                        index.getId(), tablet.getId(), 1L, 0, "/p", Lists.newArrayList()));
+            }
+        }
+        // the metadata (and the token) is copied before the snapshots are taken
+        BackupJobInfo info = BackupJobInfo.fromCatalog(1L, "l", db.getFullName(), db.getId(), BackupContent.ALL,
+                meta, snapshots, Maps.newHashMap());
+        BackupJob job = new BackupJob();
+        Deencapsulation.setField(job, "env", env);
+        Deencapsulation.setField(job, "dbId", db.getId());
+        Deencapsulation.setField(job, "jobInfo", info);
+        BackupJobInfo.BackupPartitionInfo partInfo = info.getOlapTableInfo(table.getName())
+                .getPartInfo(partition.getName());
+
+        // not tainted when all snapshots are taken: the token is kept
+        job.omitStateTokenOfTaintedPartitions();
+        Assertions.assertEquals("eeee", partInfo.stateToken);
+
+        // a replica lost and recovered as an empty one at the same version before its snapshot was taken
+        PartitionStateToken.taint(partition);
+        job.omitStateTokenOfTaintedPartitions();
+        Assertions.assertNull(partInfo.stateToken);
     }
 
     // a new partition of the test table, at the initial version

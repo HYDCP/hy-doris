@@ -29,6 +29,7 @@ import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
 import org.apache.doris.catalog.OdbcTable;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.Table;
@@ -55,6 +56,7 @@ import org.apache.doris.thrift.TFinishTaskRequest;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TTaskType;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
@@ -956,6 +958,41 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                          "repo__" + repoId, label + "__" + createTimeStr).normalize();
     }
 
+    /**
+     * The tokens of the job info are those of the partitions copied before the snapshots were taken. A partition
+     * tainted since then (a replica lost and recovered as an empty one at the same version, see
+     * Env#taintPartitionOfLostReplica) may have its snapshot taken from that replica: its token does not name the
+     * data of the backup, record none. Called when all snapshots are taken; a partition still tainted from before the
+     * copy has no token in the job info already.
+     */
+    @VisibleForTesting
+    public void omitStateTokenOfTaintedPartitions() {
+        Database db = env.getInternalCatalog().getDbNullable(dbId);
+        if (db == null) {
+            return;
+        }
+        for (BackupJobInfo.BackupOlapTableInfo tblInfo : jobInfo.backupOlapTableObjects.values()) {
+            Table tbl = db.getTableNullable(tblInfo.id);
+            if (!(tbl instanceof OlapTable)) {
+                continue;
+            }
+            OlapTable olapTbl = (OlapTable) tbl;
+            olapTbl.readLock();
+            try {
+                for (BackupJobInfo.BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
+                    Partition part = olapTbl.getPartition(partInfo.id);
+                    if (partInfo.stateToken != null && part != null && PartitionStateToken.isTainted(part)) {
+                        LOG.info("partition {} is tainted after its metadata was copied, no state token in the backup."
+                                + " {}", part.getId(), this);
+                        partInfo.stateToken = null;
+                    }
+                }
+            } finally {
+                olapTbl.readUnlock();
+            }
+        }
+    }
+
     private void saveMetaInfo(boolean replay) {
         String createTimeStr = TimeUtils.longToTimeString(createTime,
                 TimeUtils.getDatetimeFormatWithHyphenWithTimeZone());
@@ -1026,6 +1063,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
 
             jobInfo = BackupJobInfo.fromCatalog(createTime, label, dbName, dbId,
                     getContent(), backupMeta, filteredSnapshotInfos, tableCommitSeqMap);
+            omitStateTokenOfTaintedPartitions();
             if (LOG.isDebugEnabled()) {
                 LOG.debug("job info: {}. {}", jobInfo, this);
             }
