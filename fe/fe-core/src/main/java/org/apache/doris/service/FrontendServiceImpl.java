@@ -72,6 +72,7 @@ import org.apache.doris.common.Pair;
 import org.apache.doris.common.PatternMatcher;
 import org.apache.doris.common.PatternMatcherException;
 import org.apache.doris.common.Status;
+import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.common.ThriftServerContext;
 import org.apache.doris.common.ThriftServerEventProcessor;
 import org.apache.doris.common.UserException;
@@ -318,9 +319,12 @@ import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -334,9 +338,13 @@ public class FrontendServiceImpl implements FrontendService.Iface {
     private static final Logger LOG = LogManager.getLogger(FrontendServiceImpl.class);
 
     private static final String NOT_MASTER_ERR_MSG = "FE is not master";
+    private static final Executor TEMPORARY_TABLE_ORIGIN_CHECK_EXECUTOR = ThreadPoolManager.newDaemonFixedThreadPool(
+            ClientPool.TEMPORARY_TABLE_ORIGIN_CHECK_THREADS, 256, "temporary-table-origin-check", false,
+            new ThreadPoolExecutor.AbortPolicy());
 
     private MasterImpl masterImpl;
     private ExecuteEnv exeEnv;
+    private final Executor temporaryTableOriginCheckExecutor;
     // key is txn id,value is index of plan fragment instance, it's used by multi
     // table request plan
     private ConcurrentHashMap<Long, AtomicInteger> multiTableFragmentInstanceIdIndexMap =
@@ -374,8 +382,13 @@ public class FrontendServiceImpl implements FrontendService.Iface {
     }
 
     public FrontendServiceImpl(ExecuteEnv exeEnv) {
+        this(exeEnv, TEMPORARY_TABLE_ORIGIN_CHECK_EXECUTOR);
+    }
+
+    FrontendServiceImpl(ExecuteEnv exeEnv, Executor temporaryTableOriginCheckExecutor) {
         masterImpl = new MasterImpl();
         this.exeEnv = exeEnv;
+        this.temporaryTableOriginCheckExecutor = temporaryTableOriginCheckExecutor;
     }
 
     @Override
@@ -1258,6 +1271,8 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             proxyQueryIdToConnCtx.put(params.getQueryId(), context);
             clearCallback = () -> proxyQueryIdToConnCtx.remove(params.getQueryId());
         }
+        boolean checkTemporaryTableOrigin = params.isSetTempTableOriginConnectionId();
+        Map<Long, Long> createdTemporaryTables = Collections.emptyMap();
         TMasterOpResult result;
         try {
             result = processor.proxyExecute(params);
@@ -1266,27 +1281,43 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             } else {
                 context.getState().setOk();
             }
+            if (checkTemporaryTableOrigin) {
+                result.setMaxJournalId(Env.getCurrentEnv().getMaxJournalId());
+            }
         } finally {
             ConnectContext.remove();
             clearCallback.run();
-            if (params.isSetTempTableOriginConnectionId()) {
-                try {
-                    cleanupLateTemporaryTables(fe, params.getTempTableOriginConnectionId(), context);
-                } catch (RuntimeException e) {
-                    LOG.warn("Could not finish temporary table cleanup for {}", context.getSessionId(), e);
+            if (checkTemporaryTableOrigin) {
+                createdTemporaryTables = context.snapshotTemporaryTables();
+                if (!createdTemporaryTables.isEmpty()) {
+                    scheduleLateTemporaryTableCleanup(fe, params.getTempTableOriginConnectionId(),
+                            context.getSessionId(), createdTemporaryTables);
                 }
             }
         }
-        if (params.isSetTempTableOriginConnectionId()) {
-            result.setCreatedTemporaryTableDbIds(context.snapshotTemporaryTables());
-            result.setMaxJournalId(Env.getCurrentEnv().getMaxJournalId());
+        if (checkTemporaryTableOrigin) {
+            result.setCreatedTemporaryTableDbIds(createdTemporaryTables);
         }
         return result;
     }
 
-    void cleanupLateTemporaryTables(Frontend origin, int connectionId, ConnectContext proxy) {
-        Map<Long, Long> tables = proxy.snapshotTemporaryTables();
-        if (tables.isEmpty() || !isTemporaryTableOriginClosed(origin, connectionId, proxy.getSessionId())) {
+    private void scheduleLateTemporaryTableCleanup(Frontend origin, int connectionId, String sessionId,
+            Map<Long, Long> tables) {
+        try {
+            temporaryTableOriginCheckExecutor.execute(() -> {
+                try {
+                    cleanupLateTemporaryTables(origin, connectionId, sessionId, tables);
+                } catch (RuntimeException e) {
+                    LOG.warn("Could not finish temporary table cleanup for {}", sessionId, e);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            LOG.warn("Temporary table origin check queue is full, skipping cleanup for session {}", sessionId);
+        }
+    }
+
+    void cleanupLateTemporaryTables(Frontend origin, int connectionId, String sessionId, Map<Long, Long> tables) {
+        if (!isTemporaryTableOriginClosed(origin, connectionId, sessionId)) {
             return;
         }
 
@@ -1300,10 +1331,10 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             Database db = catalog.getDbNullable(entry.getValue().longValue());
             if (db != null) {
                 try {
-                    catalog.dropTemporaryTable(db, tableId, proxy.getSessionId());
+                    catalog.dropTemporaryTable(db, tableId, sessionId);
                 } catch (DdlException e) {
-                    LOG.warn("Could not clean late temporary table {} for disconnected session {}",
-                            tableId, proxy.getSessionId(), e);
+                    LOG.warn("Could not clean late temporary table {} for disconnected session {}", tableId, sessionId,
+                            e);
                 }
             }
         }

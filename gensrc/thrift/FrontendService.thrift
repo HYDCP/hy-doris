@@ -609,7 +609,8 @@ struct TMasterOpRequest {
 
     // temporary table
     1002: optional string sessionId
-    1003: optional i32 tempTableOriginConnectionId
+    // Downstream extension. Leave upstream forwarding field IDs available for backports.
+    5001: optional i32 tempTableOriginConnectionId
 }
 
 struct TColumnDefinition {
@@ -642,7 +643,8 @@ struct TMasterOpResult {
     10: optional i64 groupCommitLoadBeId;
     11: optional i64 affectedRows;
     // Temporary tables registered by this forwarded statement: table ID -> database ID.
-    12: optional map<i64,i64> createdTemporaryTableDbIds;
+    // Downstream extension. Leave upstream forwarding field IDs available for backports.
+    5001: optional map<i64,i64> createdTemporaryTableDbIds;
 }
 
 struct TUpdateExportTaskStatusRequest {

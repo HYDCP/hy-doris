@@ -26,6 +26,8 @@ import org.apache.commons.pool2.impl.GenericKeyedObjectPoolConfig;
 
 
 public class ClientPool {
+    public static final int TEMPORARY_TABLE_ORIGIN_CHECK_THREADS = 4;
+
     static GenericKeyedObjectPoolConfig heartbeatConfig = new GenericKeyedObjectPoolConfig();
     static int heartbeatTimeoutMs = Config.heartbeat_interval_second * 1000;
 
@@ -67,7 +69,7 @@ public class ClientPool {
             new GenericPool<>("FrontendService", heartbeatConfig, heartbeatTimeoutMs,
                     Config.thrift_server_type.equalsIgnoreCase(ThriftServer.THREADED_SELECTOR));
     public static final GenericPool<FrontendService.Client> frontendSessionCheckPool =
-            new GenericPool<>("FrontendService", heartbeatConfig, 1000,
+            new GenericPool<>("FrontendService", frontendSessionCheckConfig(), 1000,
                     Config.thrift_server_type.equalsIgnoreCase(ThriftServer.THREADED_SELECTOR));
     public static GenericPool<FrontendService.Client> frontendPool =
             new GenericPool("FrontendService", backendConfig, Config.backend_rpc_timeout_ms,
@@ -76,4 +78,12 @@ public class ClientPool {
             new GenericPool("BackendService", backendConfig, Config.backend_rpc_timeout_ms);
     public static GenericPool<TPaloBrokerService.Client> brokerPool =
             new GenericPool("TPaloBrokerService", brokerPoolConfig, brokerTimeoutMs);
+
+    private static GenericKeyedObjectPoolConfig frontendSessionCheckConfig() {
+        GenericKeyedObjectPoolConfig config = new GenericKeyedObjectPoolConfig();
+        config.setMaxIdlePerKey(TEMPORARY_TABLE_ORIGIN_CHECK_THREADS);
+        config.setMaxTotalPerKey(TEMPORARY_TABLE_ORIGIN_CHECK_THREADS);
+        config.setMaxWaitMillis(500);
+        return config;
+    }
 }

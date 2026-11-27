@@ -34,13 +34,28 @@ import org.apache.doris.thrift.TMasterOpRequest;
 import org.apache.doris.thrift.TMasterOpResult;
 import org.apache.doris.thrift.TStatusCode;
 
+import org.apache.thrift.TBase;
+import org.apache.thrift.TException;
+import org.apache.thrift.protocol.TBinaryProtocol;
+import org.apache.thrift.protocol.TField;
+import org.apache.thrift.protocol.TProtocolUtil;
+import org.apache.thrift.protocol.TType;
+import org.apache.thrift.transport.TMemoryBuffer;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.MockedConstruction;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 
 class ForwardedTemporaryTableCleanupTest {
     @Test
@@ -97,11 +112,13 @@ class ForwardedTemporaryTableCleanupTest {
     }
 
     @Test
-    void reportsCreatedIdsToOriginWithoutChangingLegacyReplies() throws Exception {
+    void reportsCreatedIdsBeforeCheckingOriginAndSkipsOrdinaryRequests() throws Exception {
         Env env = Mockito.mock(Env.class);
         Frontend origin = Mockito.mock(Frontend.class);
         Mockito.when(env.checkFeExist("origin", 9010)).thenReturn(origin);
-        FrontendServiceImpl service = Mockito.mock(FrontendServiceImpl.class, Mockito.CALLS_REAL_METHODS);
+        Mockito.when(env.getMaxJournalId()).thenReturn(43L);
+        Executor originChecks = Mockito.mock(Executor.class);
+        FrontendServiceImpl service = Mockito.spy(new FrontendServiceImpl(null, originChecks));
         Mockito.doReturn(false).when(service).isTemporaryTableOriginClosed(origin, 7, "owner");
         TMasterOpRequest request = new TMasterOpRequest().setClientNodeHost("origin").setClientNodePort(9010)
                 .setSessionId("owner").setTempTableOriginConnectionId(7);
@@ -115,11 +132,24 @@ class ForwardedTemporaryTableCleanupTest {
                             });
                         })) {
             mocked.when(Env::getCurrentEnv).thenReturn(env);
-            Assertions.assertEquals(Collections.singletonMap(11L, 10L),
-                    service.forward(request).getCreatedTemporaryTableDbIds());
+            TMasterOpResult result = service.forward(request);
+            Assertions.assertEquals(Collections.singletonMap(11L, 10L), result.getCreatedTemporaryTableDbIds());
+            Assertions.assertEquals(43L, result.getMaxJournalId());
+            Mockito.verify(service, Mockito.never()).isTemporaryTableOriginClosed(origin, 7, "owner");
+
+            ArgumentCaptor<Runnable> backgroundTask = ArgumentCaptor.forClass(Runnable.class);
+            Mockito.verify(originChecks).execute(backgroundTask.capture());
+            backgroundTask.getValue().run();
+            Mockito.verify(service).isTemporaryTableOriginClosed(origin, 7, "owner");
+
+            Mockito.doThrow(new RejectedExecutionException()).when(originChecks).execute(Mockito.any(Runnable.class));
+            Assertions.assertEquals(result, service.forward(request));
+            Mockito.verify(service).isTemporaryTableOriginClosed(origin, 7, "owner");
+
             request.unsetTempTableOriginConnectionId();
             Assertions.assertFalse(service.forward(request).isSetCreatedTemporaryTableDbIds());
-            Assertions.assertEquals(2, processors.constructed().size());
+            Assertions.assertEquals(3, processors.constructed().size());
+            Mockito.verify(originChecks, Mockito.times(2)).execute(Mockito.any(Runnable.class));
         }
     }
 
@@ -136,32 +166,53 @@ class ForwardedTemporaryTableCleanupTest {
         FrontendServiceImpl service = Mockito.mock(FrontendServiceImpl.class, Mockito.CALLS_REAL_METHODS);
         try (MockedStatic<Env> mocked = Mockito.mockStatic(Env.class)) {
             mocked.when(Env::getCurrentEnv).thenReturn(env);
-            ConnectContext proxy = new ConnectContext(null, true, "original-session");
-            Mockito.doReturn(true).when(service).isTemporaryTableOriginClosed(origin, 7, proxy.getSessionId());
-
-            // The close path observes no table before the forwarded CREATE registers it.
-            service.cleanupLateTemporaryTables(origin, 7, proxy);
-            Mockito.verifyNoInteractions(catalog);
-            proxy.addTemporaryTable(10L, 11L);
-            service.cleanupLateTemporaryTables(origin, 7, proxy);
-            Mockito.verify(catalog).dropTemporaryTable(database, 11L, proxy.getSessionId());
+            String sessionId = "original-session";
+            Map<Long, Long> tables = Collections.singletonMap(11L, 10L);
+            Mockito.doReturn(true).when(service).isTemporaryTableOriginClosed(origin, 7, sessionId);
+            service.cleanupLateTemporaryTables(origin, 7, sessionId, tables);
+            Mockito.verify(catalog).dropTemporaryTable(database, 11L, sessionId);
         }
     }
 
     @Test
     void leavesLateTableWhileOriginConnectionIsStillAlive() throws Exception {
-        ConnectContext proxy;
         Env env = Mockito.mock(Env.class);
-        try (MockedStatic<Env> mocked = Mockito.mockStatic(Env.class)) {
-            mocked.when(Env::getCurrentEnv).thenReturn(env);
-            proxy = new ConnectContext(null, true, "original-session");
-        }
-        proxy.addTemporaryTable(10L, 11L);
         Frontend origin = Mockito.mock(Frontend.class);
         FrontendServiceImpl service = Mockito.mock(FrontendServiceImpl.class, Mockito.CALLS_REAL_METHODS);
-        Mockito.doReturn(false).when(service).isTemporaryTableOriginClosed(origin, 7, proxy.getSessionId());
-        service.cleanupLateTemporaryTables(origin, 7, proxy);
-        Mockito.verify(env, Mockito.never()).getInternalCatalog();
+        String sessionId = "original-session";
+        Mockito.doReturn(false).when(service).isTemporaryTableOriginClosed(origin, 7, sessionId);
+        try (MockedStatic<Env> mocked = Mockito.mockStatic(Env.class)) {
+            mocked.when(Env::getCurrentEnv).thenReturn(env);
+            service.cleanupLateTemporaryTables(origin, 7, sessionId, Collections.singletonMap(11L, 10L));
+            Mockito.verifyNoInteractions(env);
+        }
+    }
+
+    @Test
+    void preservesOrdinaryForwardingFieldsAndUsesSeparateThriftIdsForTemporaryTables() throws TException {
+        TMasterOpRequest request = new TMasterOpRequest("user", "db", "SELECT 1");
+        TMasterOpResult result = new TMasterOpResult(43L, ByteBuffer.wrap(new byte[0]));
+
+        Assertions.assertEquals(Arrays.asList((short) 1, (short) 2, (short) 3), serializedFieldIds(request));
+        Assertions.assertEquals(Arrays.asList((short) 1, (short) 2), serializedFieldIds(result));
+        Assertions.assertEquals(Arrays.asList((short) 1, (short) 2, (short) 3, (short) 5001),
+                serializedFieldIds(request.setTempTableOriginConnectionId(7)));
+        Assertions.assertEquals(Arrays.asList((short) 1, (short) 2, (short) 5001),
+                serializedFieldIds(result.setCreatedTemporaryTableDbIds(Collections.singletonMap(11L, 10L))));
+    }
+
+    private List<Short> serializedFieldIds(TBase<?, ?> value) throws TException {
+        TBinaryProtocol protocol = new TBinaryProtocol(new TMemoryBuffer(128));
+        value.write(protocol);
+        List<Short> ids = new ArrayList<>();
+        protocol.readStructBegin();
+        for (TField field = protocol.readFieldBegin(); field.type != TType.STOP; field = protocol.readFieldBegin()) {
+            ids.add(field.id);
+            TProtocolUtil.skip(protocol, field.type);
+            protocol.readFieldEnd();
+        }
+        protocol.readStructEnd();
+        return ids;
     }
 
     @Test
