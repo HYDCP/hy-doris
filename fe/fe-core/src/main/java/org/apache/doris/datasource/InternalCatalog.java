@@ -995,14 +995,18 @@ public class InternalCatalog implements CatalogIf<Database> {
 
     public void rollbackCreatedTable(long dbId, Table table) throws DdlException {
         Database db = getDbNullable(dbId);
-        if (db != null && db.writeLockIfExist()) {
-            try {
-                if (db.getTableNullable(table.getId()) == table) {
-                    dropTableInternal(db, table, false, true, null, null);
-                }
-            } finally {
-                db.writeUnlock();
+        if (db == null || !db.writeLockIfExist()) {
+            LOG.info("Skip CTAS rollback because database {} was dropped, table {}", dbId, table.getId());
+            return;
+        }
+        try {
+            if (db.getTableNullable(table.getId()) == table) {
+                dropTableInternal(db, table, false, true, null, null);
+            } else {
+                LOG.info("Skip CTAS rollback because table {} no longer matches in database {}", table.getId(), dbId);
             }
+        } finally {
+            db.writeUnlock();
         }
     }
 

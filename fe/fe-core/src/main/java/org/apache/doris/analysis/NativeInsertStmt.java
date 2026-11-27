@@ -291,7 +291,7 @@ public class NativeInsertStmt extends InsertStmt {
         String ctlName = tblName.getCtl();
         // check exist
         DatabaseIf db = analyzer.getEnv().getCatalogMgr().getCatalog(tblName.getCtl()).getDbOrAnalysisException(dbName);
-        TableIf table = db.getTableOrAnalysisException(tblName.getTbl());
+        TableIf table = resolveInsertTarget(db);
 
         // check access
         if (!Env.getCurrentEnv().getAccessManager()
@@ -428,14 +428,19 @@ public class NativeInsertStmt extends InsertStmt {
         ctasTargetTableId = tableId;
     }
 
+    private TableIf resolveInsertTarget(DatabaseIf db) throws AnalysisException {
+        if (db instanceof Database && ctasTargetTableId != null) {
+            return db.getTableOrAnalysisException(ctasTargetTableId.longValue());
+        }
+        return db.getTableOrAnalysisException(tblName.getTbl());
+    }
+
     protected void initTargetTable(Analyzer analyzer) throws AnalysisException {
         if (targetTable == null) {
             DatabaseIf db = analyzer.getEnv().getCatalogMgr()
                     .getCatalog(tblName.getCtl()).getDbOrAnalysisException(tblName.getDb());
             if (db instanceof Database) {
-                targetTable = ctasTargetTableId == null
-                        ? (Table) db.getTableOrAnalysisException(tblName.getTbl())
-                        : (Table) db.getTableOrAnalysisException(ctasTargetTableId.longValue());
+                targetTable = (Table) resolveInsertTarget(db);
             } else if (db instanceof JdbcExternalDatabase) {
                 JdbcExternalTable jdbcTable = (JdbcExternalTable) db.getTableOrAnalysisException(tblName.getTbl());
                 targetTable = jdbcTable.getJdbcTable();
