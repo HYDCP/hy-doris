@@ -24,6 +24,7 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.common.ClientPool;
 import org.apache.doris.common.DdlException;
+import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.FeNameFormat;
 import org.apache.doris.common.GenericPool;
 import org.apache.doris.common.jmockit.Deencapsulation;
@@ -509,6 +510,19 @@ class ConnectContextTempTableTest {
     @Test
     void legacyCreateReplayTimeoutAllowsReuseAfterTableIsFound(@Mocked Table table,
             @Mocked GenericPool<FrontendService.Client> pool, @Mocked FrontendService.Client client) throws Exception {
+        assertLegacyCreateReplayTimeoutAllowsReuse(new TMasterOpResult().setStatusCode(0), table, client);
+    }
+
+    @Test
+    void legacyDuplicateCreateReplayTimeoutAllowsTwoResets(@Mocked Table table,
+            @Mocked GenericPool<FrontendService.Client> pool, @Mocked FrontendService.Client client) throws Exception {
+        TMasterOpResult duplicate = new TMasterOpResult().setStatusCode(ErrorCode.ERR_TABLE_EXISTS_ERROR.getCode())
+                .setErrMessage("Table 'tmp' already exists");
+        assertLegacyCreateReplayTimeoutAllowsReuse(duplicate, table, client);
+    }
+
+    private void assertLegacyCreateReplayTimeoutAllowsReuse(TMasterOpResult createReply, Table table,
+            FrontendService.Client client) throws Exception {
         mockLocalCatalog(false);
         ConnectContext ctx = new ConnectContext();
         ctx.setEnv(env);
@@ -530,8 +544,8 @@ class ConnectContextTempTableTest {
                 FRONTEND_POOL.borrowObject((TNetworkAddress) any, anyInt);
                 result = client;
                 client.forward((TMasterOpRequest) any);
-                result = new TMasterOpResult().setStatusCode(0).setMaxJournalId(42L);
-                times = 3; // CREATE, legacy cleanup sync, DROP
+                result = createReply.setMaxJournalId(42L);
+                result = new TMasterOpResult().setStatusCode(0).setMaxJournalId(43L);
                 env.isReady();
                 result = true;
                 env.getReplayedJournalId();
@@ -544,6 +558,7 @@ class ConnectContextTempTableTest {
                 env.getJournalObservable().waitOn(42L, anyInt);
                 result = new DdlException("CREATE replay timeout");
                 result = null;
+                times = 2;
                 catalog.getDbNullable("old_db");
                 result = db;
                 db.getId();
@@ -560,23 +575,32 @@ class ConnectContextTempTableTest {
                 result = true;
                 client.dropSessionTemporaryTable((TDropSessionTemporaryTableRequest) any);
                 result = new TApplicationException(TApplicationException.UNKNOWN_METHOD, "legacy Master");
+                times = 1;
                 db.getTableNullable(11L);
                 result = table;
                 result = null;
             }
         };
         try {
+            StmtExecutor create = forwardedCreate(ctx);
             Exception error = Assertions.assertThrows(Exception.class,
-                    () -> Deencapsulation.invoke(forwardedCreate(ctx), "forwardToMaster"));
+                    () -> Deencapsulation.invoke(create, "forwardToMaster"));
             Assertions.assertTrue(error.getMessage().contains("CREATE replay timeout"));
+            Assertions.assertEquals(createReply.getStatusCode(), create.getProxyStatusCode());
             Assertions.assertEquals(Collections.singletonMap(11L, 10L), ctx.snapshotTemporaryTables());
             MysqlConnectProcessor processor = new MysqlConnectProcessor(ctx);
             processor.handleResetConnection();
-            Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
+            Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType(), ctx.getState().getErrorMessage());
             Assertions.assertNotEquals(owner, ctx.getSessionId());
             Assertions.assertTrue(ctx.snapshotTemporaryTables().isEmpty());
             processor.handleResetConnection();
             Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
+            new Verifications() {
+                {
+                    client.forward((TMasterOpRequest) any);
+                    times = 3; // CREATE, legacy cleanup sync, and one DROP across both resets
+                }
+            };
         } finally {
             ConnectContext.remove();
         }

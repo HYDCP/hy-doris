@@ -113,8 +113,12 @@ public class MasterOpExecutor extends FEOpExecutor {
         return true;
     }
 
-    long getSuccessfulCreateJournalId() {
-        return result != null && result.isSetMaxJournalId() && getStatusCode() == 0 ? result.getMaxJournalId() : -1L;
+    long getAcknowledgedCreateJournalId() {
+        if (result == null || !result.isSetStatusCode() || !result.isSetMaxJournalId()) {
+            return -1L;
+        }
+        // A legacy Master also reports its journal position when the CREATE finishes with a SQL error.
+        return result.getMaxJournalId();
     }
 
     boolean recordCreatedTemporaryTables(TableName awaitingReplay) {

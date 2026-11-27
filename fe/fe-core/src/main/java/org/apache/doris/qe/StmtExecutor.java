@@ -1343,7 +1343,7 @@ public class StmtExecutor {
         } catch (Exception e) {
             if (tempTableTarget != null && masterOpExecutor.wasStatementRpcAttempted()
                     && !masterOpExecutor.recordCreatedTemporaryTables(tempTableTarget)) {
-                long journalId = masterOpExecutor.getSuccessfulCreateJournalId();
+                long journalId = masterOpExecutor.getAcknowledgedCreateJournalId();
                 // Keep the acknowledgement even when a name resolves: a renamed database may have
                 // left a different table of this session under the original database ID.
                 context.trackUnresolvedTemporaryTable(tempTableTarget, originalDb, journalId);
@@ -1366,7 +1366,7 @@ public class StmtExecutor {
                 if (masterOpExecutor.getStatusCode() == 0) {
                     // A name match in the original database cannot identify which database the Master used.
                     context.trackUnresolvedTemporaryTable(tempTableTarget, originalDb,
-                            masterOpExecutor.getSuccessfulCreateJournalId());
+                            masterOpExecutor.getAcknowledgedCreateJournalId());
                 }
             }
         } else if (masterOpExecutor.getStatusCode() == 0 && parsedStmt instanceof DropTableStmt) {
