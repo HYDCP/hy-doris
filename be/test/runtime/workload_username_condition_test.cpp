@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include "runtime/stream_load/stream_load_context.h"
 #include "runtime/workload_management/workload_sched_policy.h"
 
 namespace doris {
@@ -43,6 +44,18 @@ TEST(WorkloadUsernameConditionTest, RequiresUsernameAndOtherMetric) {
     EXPECT_TRUE(policy.is_match(&query));
     query.metric_map[QUERY_TIME] = "100";
     EXPECT_FALSE(policy.is_match(&query));
+}
+
+TEST(WorkloadUsernameConditionTest, WalReplayDoesNotMatchItsInternalAdmin) {
+    StreamLoadContext replay(nullptr, QuerySource::GROUP_COMMIT_LOAD);
+    StreamLoadContext client(nullptr);
+    for (auto* ctx : {&replay, &client}) {
+        ctx->auth.user = "admin";
+        ctx->wal_id = 42;
+        WorkloadQueryInfo info {};
+        info.set_username(ctx->query_source, ctx->auth.user);
+        EXPECT_EQ(info.metric_map.contains(USERNAME), ctx == &client);
+    }
 }
 
 TEST(WorkloadUsernameConditionTest, SharedGroupCommitHasNoPolicyUsername) {

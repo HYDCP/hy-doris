@@ -659,7 +659,10 @@ public class ConnectContext {
     }
 
     public TResourceInfo getResourceInfo() {
-        UserIdentity identity = getCurrentUserIdentity();
+        return getResourceInfo(getCurrentUserIdentity());
+    }
+
+    public static TResourceInfo getResourceInfo(UserIdentity identity) {
         if (identity == null || Strings.isNullOrEmpty(identity.getQualifiedUser())) {
             return null;
         }
