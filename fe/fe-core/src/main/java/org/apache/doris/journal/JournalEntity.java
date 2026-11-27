@@ -24,6 +24,7 @@ import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.backup.BackupJob;
 import org.apache.doris.backup.Repository;
 import org.apache.doris.backup.RestoreJob;
+import org.apache.doris.backup.RestoreJobStateChange;
 import org.apache.doris.blockrule.SqlBlockRule;
 import org.apache.doris.catalog.BrokerMgr;
 import org.apache.doris.catalog.Database;
@@ -321,6 +322,11 @@ public class JournalEntity implements Writable {
             }
             case OperationType.OP_RESTORE_JOB: {
                 data = RestoreJob.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_RESTORE_JOB_STATE: {
+                data = RestoreJobStateChange.read(in);
                 isRead = true;
                 break;
             }
