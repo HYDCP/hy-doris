@@ -1343,9 +1343,16 @@ public class StmtExecutor {
         } catch (Exception e) {
             if (tempTableTarget != null && masterOpExecutor.wasStatementRpcAttempted()
                     && !masterOpExecutor.recordCreatedTemporaryTables(tempTableTarget)) {
-                context.markTemporaryTableDdlUncertain(tempTableTarget, originalDb);
+                long journalId = masterOpExecutor.getSuccessfulCreateJournalId();
+                // Keep the acknowledgement even when a name resolves: a renamed database may have
+                // left a different table of this session under the original database ID.
+                context.trackUnresolvedTemporaryTable(tempTableTarget, originalDb, journalId);
                 try {
-                    new MasterOpExecutor(context).syncJournal();
+                    if (journalId >= 0) {
+                        masterOpExecutor.waitOnReplaying();
+                    } else {
+                        new MasterOpExecutor(context).syncJournal();
+                    }
                     recordForwardedTemporaryTable(tempTableTarget, originalDb);
                 } catch (Exception syncException) {
                     e.addSuppressed(syncException);
@@ -1358,7 +1365,8 @@ public class StmtExecutor {
                     && !recordForwardedTemporaryTable(tempTableTarget, originalDb)
                     && masterOpExecutor.getStatusCode() == 0) {
                 // An older Master did not report IDs, and the original name is no longer resolvable.
-                context.markTemporaryTableDdlUncertain(tempTableTarget, originalDb);
+                context.trackUnresolvedTemporaryTable(tempTableTarget, originalDb,
+                        masterOpExecutor.getSuccessfulCreateJournalId());
             }
         } else if (masterOpExecutor.getStatusCode() == 0 && parsedStmt instanceof DropTableStmt) {
             DropTableStmt drop = (DropTableStmt) parsedStmt;

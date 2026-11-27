@@ -113,6 +113,10 @@ public class MasterOpExecutor extends FEOpExecutor {
         return true;
     }
 
+    long getSuccessfulCreateJournalId() {
+        return result != null && result.isSetMaxJournalId() && getStatusCode() == 0 ? result.getMaxJournalId() : -1L;
+    }
+
     boolean recordCreatedTemporaryTables(TableName awaitingReplay) {
         if (result == null || !result.isSetCreatedTemporaryTableDbIds()) {
             return false;
@@ -143,7 +147,7 @@ public class MasterOpExecutor extends FEOpExecutor {
         }
     }
 
-    private void waitOnReplaying() throws DdlException {
+    void waitOnReplaying() throws DdlException {
         LOG.info("forwarding to master get result max journal id: {}", result.maxJournalId);
         ctx.getEnv().getJournalObservable().waitOn(result.maxJournalId, journalWaitTimeoutMs);
     }

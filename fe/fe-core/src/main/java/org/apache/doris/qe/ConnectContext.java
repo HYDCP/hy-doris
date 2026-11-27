@@ -97,6 +97,7 @@ import org.xnio.StreamConnection;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -258,7 +259,9 @@ public class ConnectContext {
     private int activeStatements;
     private long temporaryTableJournalId;
     private final Map<Long, TableName> temporaryTableTargetsAwaitingReplay = new HashMap<>();
-    private final Map<TableName, Long> uncertainTempTableTargets = new HashMap<>();
+    // Keyed by qualified name and original database ID for disconnect cleanup. A negative journal ID
+    // means the statement RPC did not return a successful CREATE acknowledgement.
+    private final Map<Pair<TableName, Long>, Long> unresolvedTemporaryTables = new HashMap<>();
     private final ReentrantLock tempTableCleanupLock = new ReentrantLock();
 
     // internal call like `insert overwrite` need skipAuth
@@ -938,7 +941,7 @@ public class ConnectContext {
         tempTableCleanupLock.lock();
         try {
             Map<Long, Long> snapshot;
-            Map<TableName, Long> uncertain;
+            Map<Pair<TableName, Long>, Long> unresolved;
             Map<Long, TableName> awaitingReplay;
             synchronized (this) {
                 if (activeStatements != 0) {
@@ -948,17 +951,23 @@ public class ConnectContext {
                     return;
                 }
                 snapshot = new HashMap<>(temporaryTableIdsToDbIds);
-                uncertain = new HashMap<>(uncertainTempTableTargets);
+                unresolved = new HashMap<>(unresolvedTemporaryTables);
                 awaitingReplay = new HashMap<>(temporaryTableTargetsAwaitingReplay);
             }
-            if (snapshot.isEmpty() && uncertain.isEmpty()) {
+            if (snapshot.isEmpty() && unresolved.isEmpty()) {
                 return;
             }
 
             Env currentEnv = Env.getCurrentEnv();
             InternalCatalog catalog = currentEnv.getInternalCatalog();
-            DdlException failure = strict && !uncertain.isEmpty()
-                    ? new DdlException("The result of a forwarded temporary table statement is unknown") : null;
+            DdlException failure = null;
+            if (strict && !unresolved.isEmpty()) {
+                try {
+                    reconcileLegacyTemporaryTables(currentEnv, unresolved, snapshot);
+                } catch (DdlException e) {
+                    failure = e;
+                }
+            }
             for (Map.Entry<Long, Long> entry : snapshot.entrySet()) {
                 long tableId = entry.getKey();
                 long dbId = entry.getValue();
@@ -982,12 +991,11 @@ public class ConnectContext {
                 }
             }
             if (!strict) {
-                for (Map.Entry<TableName, Long> entry : uncertain.entrySet()) {
-                    TableName target = entry.getKey();
+                for (Pair<TableName, Long> target : unresolved.keySet()) {
                     try {
-                        cleanupTemporaryTableByTarget(currentEnv, catalog, target, entry.getValue());
+                        cleanupTemporaryTableByTarget(currentEnv, catalog, target.first, target.second);
                         synchronized (this) {
-                            uncertainTempTableTargets.remove(target);
+                            unresolvedTemporaryTables.remove(target);
                         }
                     } catch (Exception e) {
                         LOG.warn("Failed to clean unconfirmed temporary table {} for session {}", target, sessionId, e);
@@ -1003,6 +1011,38 @@ public class ConnectContext {
         } finally {
             tempTableCleanupLock.unlock();
         }
+    }
+
+    private void reconcileLegacyTemporaryTables(Env env, Map<Pair<TableName, Long>, Long> unresolved,
+            Map<Long, Long> snapshot) throws DdlException {
+        if (unresolved.values().stream().anyMatch(journalId -> journalId < 0)) {
+            throw new DdlException("The result of a forwarded temporary table statement is unknown");
+        }
+        long journalId = Collections.max(unresolved.values());
+        if (!env.isReady() || (env.isMaster() ? env.getMaxJournalId() : env.getReplayedJournalId()) < journalId) {
+            throw new DdlException("Cannot reset until temporary table CREATE journal " + journalId + " is replayed");
+        }
+
+        // Temporary tables cannot be renamed, but databases can be renamed and their names reused.
+        // Look up only the acknowledged names in each database's index.
+        Set<String> innerNames = Sets.newHashSet();
+        for (Pair<TableName, Long> target : unresolved.keySet()) {
+            innerNames.add(sessionId + FeNameFormat.TEMPORARY_TABLE_SIGN + target.first.getTbl());
+        }
+        Map<Long, Long> owned = new HashMap<>();
+        for (Database database : env.getInternalCatalog().getDbs()) {
+            for (String innerName : innerNames) {
+                Table table = database.getTemporaryTableNullable(innerName);
+                if (table != null && sessionId.equals(Util.getTempTableSessionId(table.getName()))) {
+                    owned.put(table.getId(), database.getId());
+                }
+            }
+        }
+        synchronized (this) {
+            temporaryTableIdsToDbIds.putAll(owned);
+            unresolvedTemporaryTables.keySet().removeAll(unresolved.keySet());
+        }
+        snapshot.putAll(owned);
     }
 
     private void dropForwardedTemporaryTable(long dbId, long tableId, boolean strict, TableName awaitingReplay)
@@ -1816,8 +1856,11 @@ public class ConnectContext {
         temporaryTableTargetsAwaitingReplay.keySet().retainAll(temporaryTableIdsToDbIds.keySet());
     }
 
-    synchronized void markTemporaryTableDdlUncertain(TableName target, Database originalDb) {
-        uncertainTempTableTargets.put(target, originalDb == null ? null : originalDb.getId());
+    synchronized void trackUnresolvedTemporaryTable(TableName target, Database originalDb, long journalId) {
+        Pair<TableName, Long> key = Pair.of(target, originalDb == null ? null : originalDb.getId());
+        // A later acknowledgement for this name cannot settle an earlier lost reply.
+        unresolvedTemporaryTables.merge(key, journalId, (previous, next) ->
+                previous < 0 || next < 0 ? -1L : Math.max(previous, next));
     }
 
     public synchronized Map<Long, Long> snapshotTemporaryTables() {
