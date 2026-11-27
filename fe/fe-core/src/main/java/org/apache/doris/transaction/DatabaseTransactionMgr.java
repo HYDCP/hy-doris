@@ -197,6 +197,16 @@ public class DatabaseTransactionMgr {
 
     }
 
+    TransactionStatus getTransactionStatusForTemporaryTableReset(long transactionId) {
+        readLock();
+        try {
+            TransactionState state = unprotectedGetTransactionState(transactionId);
+            return state == null ? null : state.getTransactionStatus();
+        } finally {
+            readUnlock();
+        }
+    }
+
     private TransactionState unprotectedGetTransactionState(Long transactionId) {
         TransactionState transactionState = idToRunningTransactionState.get(transactionId);
         if (transactionState != null) {

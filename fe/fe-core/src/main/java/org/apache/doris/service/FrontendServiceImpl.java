@@ -281,6 +281,8 @@ import org.apache.doris.thrift.TUpdateFollowerPartitionStatsCacheRequest;
 import org.apache.doris.thrift.TUpdateFollowerStatsCacheRequest;
 import org.apache.doris.thrift.TWaitingTxnStatusRequest;
 import org.apache.doris.thrift.TWaitingTxnStatusResult;
+import org.apache.doris.transaction.GlobalTransactionMgr;
+import org.apache.doris.transaction.GlobalTransactionMgrIface;
 import org.apache.doris.transaction.SubTransactionState;
 import org.apache.doris.transaction.TabletCommitInfo;
 import org.apache.doris.transaction.TransactionState;
@@ -2674,6 +2676,9 @@ public class FrontendServiceImpl implements FrontendService.Iface {
 
     @Override
     public TWaitingTxnStatusResult waitingTxnStatus(TWaitingTxnStatusRequest request) throws TException {
+        if (request.isCheckExpiredTxnForTemporaryTableReset()) {
+            return checkExpiredTxnForTemporaryTableReset(request);
+        }
         TWaitingTxnStatusResult result = new TWaitingTxnStatusResult();
         result.setStatus(new TStatus());
         try {
@@ -2687,6 +2692,26 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             result.status.addToErrorMsgs(e.getMessage());
         }
         return result;
+    }
+
+    private TWaitingTxnStatusResult checkExpiredTxnForTemporaryTableReset(TWaitingTxnStatusRequest request) {
+        TWaitingTxnStatusResult result = new TWaitingTxnStatusResult();
+        GlobalTransactionMgrIface txnManager = Env.getCurrentGlobalTransactionMgr();
+        if (!(txnManager instanceof GlobalTransactionMgr) || request.getDbId() <= 0 || request.getTxnId() <= 0) {
+            return result.setStatus(new TStatus(TStatusCode.INVALID_ARGUMENT));
+        }
+        try {
+            TransactionStatus status = ((GlobalTransactionMgr) txnManager)
+                    .getTransactionStatusForTemporaryTableReset(request.getDbId(), request.getTxnId());
+            if (status == null) {
+                return result.setStatus(new TStatus(TStatusCode.NOT_FOUND));
+            }
+            return result.setStatus(new TStatus(TStatusCode.OK)).setTxnStatusId(status.value());
+        } catch (AnalysisException e) {
+            TStatus status = new TStatus(TStatusCode.INTERNAL_ERROR);
+            status.addToErrorMsgs(e.getMessage());
+            return result.setStatus(status);
+        }
     }
 
     @Override

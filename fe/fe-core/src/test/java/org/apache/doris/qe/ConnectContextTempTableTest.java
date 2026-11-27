@@ -43,7 +43,10 @@ import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TTxnParams;
 import org.apache.doris.thrift.TWaitingTxnStatusRequest;
 import org.apache.doris.thrift.TWaitingTxnStatusResult;
+import org.apache.doris.transaction.GlobalTransactionMgr;
 import org.apache.doris.transaction.TransactionEntry;
+import org.apache.doris.transaction.TransactionNotFoundException;
+import org.apache.doris.transaction.TransactionState;
 import org.apache.doris.transaction.TransactionStatus;
 
 import com.google.common.collect.ImmutableList;
@@ -253,7 +256,8 @@ class ConnectContextTempTableTest {
     }
 
     @Test
-    void followerRetainsTransactionAfterMasterRejectsRollback() {
+    void followerRetainsRunningTransactionAfterMasterRejectsRollback(
+            @Mocked GenericPool<FrontendService.Client> pool, @Mocked FrontendService.Client client) throws Exception {
         mockLocalCatalog(false);
         ConnectContext ctx = new ConnectContext();
         ctx.setEnv(env);
@@ -261,6 +265,9 @@ class ConnectContextTempTableTest {
         TransactionEntry txn = new TransactionEntry();
         txn.setTxnConf(new TTxnParams().setNeedTxn(true).setTxnId(-1));
         Deencapsulation.setField(txn, "isTransactionBegan", true);
+        Deencapsulation.setField(txn, "dbId", 10L);
+        Deencapsulation.setField(txn, "transactionId", 19L);
+        Deencapsulation.setField(txn, "timeoutTimestamp", 1L);
         ctx.setTxnEntry(txn);
         ctx.addTemporaryTable(10L, 11L);
         new MockUp<FEOpExecutor>() {
@@ -272,6 +279,17 @@ class ConnectContextTempTableTest {
             @Mock
             protected TMasterOpResult forward(TMasterOpRequest request) {
                 return new TMasterOpResult().setStatusCode(1105).setErrMessage("injected remote rollback failure");
+            }
+        };
+        new Expectations() {
+            {
+                FRONTEND_POOL.borrowObject((TNetworkAddress) any, anyInt);
+                result = client;
+                client.waitingTxnStatus(new TWaitingTxnStatusRequest().setDbId(10L).setTxnId(19L)
+                        .setCheckExpiredTxnForTemporaryTableReset(true));
+                result = new TWaitingTxnStatusResult().setStatus(new TStatus(TStatusCode.OK))
+                        .setTxnStatusId(TransactionStatus.PREPARE.value());
+                times = 1;
             }
         };
         try {
@@ -290,8 +308,54 @@ class ConnectContextTempTableTest {
     }
 
     @Test
+    void masterResetsTwiceAfterExpiredTransactionWasPurged(@Mocked GlobalTransactionMgr txnManager) throws Exception {
+        mockLocalCatalog(true);
+        ConnectContext ctx = new ConnectContext();
+        TransactionEntry txn = new TransactionEntry(new TTxnParams().setNeedTxn(true).setTxnId(-1), db, null);
+        Deencapsulation.setField(txn, "isTransactionBegan", true);
+        Deencapsulation.setField(txn, "dbId", 10L);
+        Deencapsulation.setField(txn, "transactionId", 19L);
+        Deencapsulation.setField(txn, "timeoutTimestamp", 1L);
+        Deencapsulation.setField(txn, "transactionState", new TransactionState());
+        ctx.setTxnEntry(txn);
+        ctx.addTemporaryTable(10L, 11L);
+        String owner = ctx.getSessionId();
+        new Expectations() {
+            {
+                Env.getCurrentGlobalTransactionMgr();
+                result = txnManager;
+                db.getId();
+                result = 10L;
+                txnManager.abortTransaction(10L, 19L, "user rollback");
+                result = new TransactionNotFoundException("transaction not found", 19L);
+                times = 1;
+                txnManager.getTransactionStatusForTemporaryTableReset(10L, 19L);
+                result = null;
+                times = 1;
+                catalog.dropTemporaryTable(db, 11L, owner);
+                times = 1;
+            }
+        };
+
+        assertTwoSuccessfulResets(ctx);
+    }
+
+    @Test
     void followerResetsTwiceAfterMasterConfirmsTransactionAborted(
             @Mocked GenericPool<FrontendService.Client> pool, @Mocked FrontendService.Client client) throws Exception {
+        assertFollowerResetsAfterRollbackError(client, false, new TWaitingTxnStatusResult()
+                .setStatus(new TStatus(TStatusCode.OK)).setTxnStatusId(TransactionStatus.ABORTED.value()));
+    }
+
+    @Test
+    void followerResetsTwiceAfterMasterConfirmsExpiredTransactionWasPurged(
+            @Mocked GenericPool<FrontendService.Client> pool, @Mocked FrontendService.Client client) throws Exception {
+        assertFollowerResetsAfterRollbackError(client, true, new TWaitingTxnStatusResult()
+                .setStatus(new TStatus(TStatusCode.NOT_FOUND)));
+    }
+
+    private void assertFollowerResetsAfterRollbackError(FrontendService.Client client, boolean expired,
+            TWaitingTxnStatusResult txnStatus) throws Exception {
         mockLocalCatalog(false);
         ConnectContext ctx = new ConnectContext();
         ctx.setEnv(env);
@@ -302,6 +366,11 @@ class ConnectContextTempTableTest {
         Deencapsulation.setField(txn, "dbId", 10L);
         Deencapsulation.setField(txn, "transactionId", 19L);
         ctx.setTxnEntry(txn);
+        TWaitingTxnStatusRequest request = new TWaitingTxnStatusRequest().setDbId(10L).setTxnId(19L);
+        if (expired) {
+            Deencapsulation.setField(txn, "timeoutTimestamp", 1L);
+            request.setCheckExpiredTxnForTemporaryTableReset(true);
+        }
         ctx.addTemporaryTable(10L, 11L);
         new MockUp<FEOpExecutor>() {
             @Mock
@@ -316,9 +385,8 @@ class ConnectContextTempTableTest {
                 client.forward((TMasterOpRequest) any);
                 result = new TMasterOpResult().setStatusCode(1105).setErrMessage("transaction not found");
                 times = 1;
-                client.waitingTxnStatus(new TWaitingTxnStatusRequest().setDbId(10L).setTxnId(19L));
-                result = new TWaitingTxnStatusResult().setStatus(new TStatus(TStatusCode.OK))
-                        .setTxnStatusId(TransactionStatus.ABORTED.value());
+                client.waitingTxnStatus(request);
+                result = txnStatus;
                 times = 1;
                 client.dropSessionTemporaryTable((TDropSessionTemporaryTableRequest) any);
                 result = new TDropSessionTemporaryTableResult(new TStatus(TStatusCode.OK), 42L);
@@ -328,17 +396,20 @@ class ConnectContextTempTableTest {
             }
         };
         try {
-            MysqlConnectProcessor processor = new MysqlConnectProcessor(ctx);
-            processor.handleResetConnection();
-            Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType(),
-                    ctx.getState().getErrorMessage());
-            Assertions.assertNull(ctx.getTxnEntry());
-            Assertions.assertTrue(ctx.snapshotTemporaryTables().isEmpty());
-            processor.handleResetConnection();
-            Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
+            assertTwoSuccessfulResets(ctx);
         } finally {
             ConnectContext.remove();
         }
+    }
+
+    private void assertTwoSuccessfulResets(ConnectContext ctx) {
+        MysqlConnectProcessor processor = new MysqlConnectProcessor(ctx);
+        processor.handleResetConnection();
+        Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType(), ctx.getState().getErrorMessage());
+        Assertions.assertNull(ctx.getTxnEntry());
+        Assertions.assertTrue(ctx.snapshotTemporaryTables().isEmpty());
+        processor.handleResetConnection();
+        Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
     }
 
     @Test

@@ -1033,6 +1033,8 @@ struct TWaitingTxnStatusRequest {
     1: optional i64 db_id
     2: optional i64 txn_id
     3: optional string label
+    // Downstream, read-only check. NOT_FOUND requires confirmation from the ready Master.
+    5001: optional bool checkExpiredTxnForTemporaryTableReset
 }
 
 struct TWaitingTxnStatusResult {

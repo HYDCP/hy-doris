@@ -115,15 +115,20 @@ public class MasterOpExecutor extends FEOpExecutor {
         waitOnReplaying();
     }
 
-    public boolean isTemporaryTableResetTransactionAborted(long dbId, long txnId) throws Exception {
+    public boolean canResetTemporaryTableTransaction(long dbId, long txnId, boolean checkExpired) throws Exception {
+        TWaitingTxnStatusRequest request = new TWaitingTxnStatusRequest().setDbId(dbId).setTxnId(txnId);
+        if (checkExpired) {
+            request.setCheckExpiredTxnForTemporaryTableReset(true);
+        }
         FrontendService.Client client = ClientPool.frontendPool.borrowObject(feAddr, getThriftTimeoutMs());
         boolean transportOk = false;
         try {
-            TWaitingTxnStatusResult reply = client.waitingTxnStatus(
-                    new TWaitingTxnStatusRequest().setDbId(dbId).setTxnId(txnId));
+            TWaitingTxnStatusResult reply = client.waitingTxnStatus(request);
             transportOk = true;
-            return reply.getStatus().getStatusCode() == TStatusCode.OK && reply.isSetTxnStatusId()
-                    && reply.getTxnStatusId() == TransactionStatus.ABORTED.value();
+            TStatusCode status = reply.getStatus().getStatusCode();
+            return (checkExpired && status == TStatusCode.NOT_FOUND)
+                    || (status == TStatusCode.OK && reply.isSetTxnStatusId()
+                            && reply.getTxnStatusId() == TransactionStatus.ABORTED.value());
         } finally {
             if (transportOk) {
                 ClientPool.frontendPool.returnObject(feAddr, client);

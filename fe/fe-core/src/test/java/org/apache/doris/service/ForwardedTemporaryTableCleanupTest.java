@@ -24,6 +24,7 @@ import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.SinglePartitionInfo;
 import org.apache.doris.common.FeNameFormat;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.persist.EditLog;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.MysqlConnectProcessor;
 import org.apache.doris.system.Frontend;
@@ -33,6 +34,13 @@ import org.apache.doris.thrift.TFrontendReportAliveSessionResult;
 import org.apache.doris.thrift.TMasterOpRequest;
 import org.apache.doris.thrift.TMasterOpResult;
 import org.apache.doris.thrift.TStatusCode;
+import org.apache.doris.thrift.TWaitingTxnStatusRequest;
+import org.apache.doris.transaction.GlobalTransactionMgr;
+import org.apache.doris.transaction.TransactionState;
+import org.apache.doris.transaction.TransactionState.LoadJobSourceType;
+import org.apache.doris.transaction.TransactionState.TxnCoordinator;
+import org.apache.doris.transaction.TransactionState.TxnSourceType;
+import org.apache.doris.transaction.TransactionStatus;
 
 import org.apache.thrift.TBase;
 import org.apache.thrift.TException;
@@ -213,6 +221,57 @@ class ForwardedTemporaryTableCleanupTest {
         }
         protocol.readStructEnd();
         return ids;
+    }
+
+    @Test
+    void onlyReadyMasterConfirmsPurgedTransactionForTemporaryTableReset() throws Exception {
+        Env env = Mockito.mock(Env.class);
+        InternalCatalog catalog = Mockito.mock(InternalCatalog.class);
+        Mockito.when(env.getInternalCatalog()).thenReturn(catalog);
+        Mockito.when(env.getEditLog()).thenReturn(Mockito.mock(EditLog.class));
+        Mockito.when(env.isMaster()).thenReturn(true);
+        Mockito.when(env.isReady()).thenReturn(true);
+        Database db = new Database(10L, "db");
+        Mockito.when(catalog.getDbNullable(10L)).thenReturn(db);
+        Mockito.when(catalog.getDbOrAnalysisException(10L)).thenReturn(db);
+        Mockito.when(catalog.getDbNullable(20L)).thenReturn(new Database(20L, "no_transaction_manager"));
+        GlobalTransactionMgr txnManager = new GlobalTransactionMgr(env);
+        txnManager.addDatabaseTransactionMgr(10L);
+        TransactionState aborted = new TransactionState(10L, Collections.emptyList(), 19L, "aborted", null,
+                LoadJobSourceType.INSERT_STREAMING, new TxnCoordinator(TxnSourceType.FE, 0L, "localhost", 0L), -1L, 1L);
+        TWaitingTxnStatusRequest request = new TWaitingTxnStatusRequest().setDbId(10L).setTxnId(19L)
+                .setCheckExpiredTxnForTemporaryTableReset(true);
+        FrontendServiceImpl service = new FrontendServiceImpl(null);
+        try (MockedStatic<Env> mocked = Mockito.mockStatic(Env.class)) {
+            mocked.when(Env::getCurrentEnv).thenReturn(env);
+            mocked.when(Env::getCurrentInternalCatalog).thenReturn(catalog);
+            mocked.when(Env::getCurrentGlobalTransactionMgr).thenReturn(txnManager);
+
+            txnManager.replayUpsertTransactionState(aborted);
+            Assertions.assertEquals(TransactionStatus.PREPARE.value(),
+                    service.waitingTxnStatus(request).getTxnStatusId());
+            aborted.setTransactionStatus(TransactionStatus.ABORTED);
+            aborted.setFinishTime(1L);
+            txnManager.replayUpsertTransactionState(aborted);
+            Assertions.assertEquals(TransactionStatus.ABORTED.value(),
+                    service.waitingTxnStatus(request).getTxnStatusId());
+            txnManager.removeExpiredAndTimeoutTxns();
+            Assertions.assertEquals(TStatusCode.NOT_FOUND, service.waitingTxnStatus(request).getStatus()
+                    .getStatusCode());
+            Assertions.assertEquals(TStatusCode.INTERNAL_ERROR,
+                    service.waitingTxnStatus(new TWaitingTxnStatusRequest().setDbId(10L).setTxnId(19L))
+                            .getStatus().getStatusCode());
+            Assertions.assertEquals(TStatusCode.INTERNAL_ERROR, service.waitingTxnStatus(request.deepCopy()
+                    .setDbId(20L)).getStatus().getStatusCode());
+
+            Mockito.when(env.isReady()).thenReturn(false);
+            Assertions.assertEquals(TStatusCode.INTERNAL_ERROR, service.waitingTxnStatus(request).getStatus()
+                    .getStatusCode());
+            Mockito.when(env.isReady()).thenReturn(true);
+            Mockito.when(env.isMaster()).thenReturn(false);
+            Assertions.assertEquals(TStatusCode.INTERNAL_ERROR, service.waitingTxnStatus(request).getStatus()
+                    .getStatusCode());
+        }
     }
 
     @Test

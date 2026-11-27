@@ -338,14 +338,34 @@ public class TransactionEntry {
     }
 
     public void abortTransactionForTemporaryTableReset(long deadline) throws Exception {
+        // An allocated, expired transaction ID must be absent on the ready Master before
+        // we can proceed without a retained ABORTED record.
+        boolean checkExpired = isTransactionBegan && dbId > 0 && transactionId > 0
+                && timeoutTimestamp > 0 && timeoutTimestamp <= System.currentTimeMillis();
         if (!isTransactionBegan || Env.getCurrentEnv().isMaster() || Config.isCloudMode()) {
             try {
                 abortTransaction();
             } catch (TransactionNotFoundException e) {
-                TransactionState state = Env.getCurrentGlobalTransactionMgr().getTransactionState(dbId, transactionId);
-                if (!isTransactionBegan || state == null || state.getTransactionStatus() != TransactionStatus.ABORTED) {
+                if (!isTransactionBegan) {
                     throw e;
                 }
+                GlobalTransactionMgrIface txnManager = Env.getCurrentGlobalTransactionMgr();
+                TransactionState state = txnManager.getTransactionState(dbId, transactionId);
+                if (state != null && state.getTransactionStatus() == TransactionStatus.ABORTED) {
+                    return;
+                }
+                if (checkExpired && txnManager instanceof GlobalTransactionMgr) {
+                    try {
+                        TransactionStatus status = ((GlobalTransactionMgr) txnManager)
+                                .getTransactionStatusForTemporaryTableReset(dbId, transactionId);
+                        if (status == null || status == TransactionStatus.ABORTED) {
+                            return;
+                        }
+                    } catch (AnalysisException statusFailure) {
+                        e.addSuppressed(statusFailure);
+                    }
+                }
+                throw e;
             }
             return;
         }
@@ -354,14 +374,14 @@ public class TransactionEntry {
         try {
             executor.executeCheckingSqlStatus();
         } catch (DdlException e) {
-            boolean aborted;
+            boolean canReset;
             try {
-                aborted = executor.isTemporaryTableResetTransactionAborted(dbId, transactionId);
+                canReset = executor.canResetTemporaryTableTransaction(dbId, transactionId, checkExpired);
             } catch (Exception statusFailure) {
                 e.addSuppressed(statusFailure);
                 throw e;
             }
-            if (!aborted) {
+            if (!canReset) {
                 throw e;
             }
         }
