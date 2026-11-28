@@ -344,6 +344,25 @@ public class TransactionEntry {
                 && timeoutTimestamp > 0 && timeoutTimestamp <= System.currentTimeMillis();
         if (!isTransactionBegan || Env.getCurrentEnv().isMaster() || Config.isCloudMode()) {
             try {
+                if (isTransactionBegan && transactionState == null && !Config.isCloudMode()) {
+                    // A connection retained on a promoted Follower has transaction IDs but no local state.
+                    GlobalTransactionMgr txnManager = (GlobalTransactionMgr) Env.getCurrentGlobalTransactionMgr();
+                    TransactionStatus status = txnManager.getTransactionStatusForTemporaryTableReset(dbId,
+                            transactionId);
+                    if (status == TransactionStatus.ABORTED) {
+                        return;
+                    }
+                    if (status == null) {
+                        throw new TransactionNotFoundException("transaction not found", transactionId);
+                    }
+                    if (status != TransactionStatus.PREPARE && status != TransactionStatus.PRECOMMITTED) {
+                        throw new DdlException("Cannot roll back transaction " + transactionId + " in state " + status);
+                    }
+                    transactionState = txnManager.getTransactionState(dbId, transactionId);
+                    if (transactionState == null) {
+                        throw new TransactionNotFoundException("transaction not found", transactionId);
+                    }
+                }
                 abortTransaction();
             } catch (TransactionNotFoundException e) {
                 if (!isTransactionBegan) {
