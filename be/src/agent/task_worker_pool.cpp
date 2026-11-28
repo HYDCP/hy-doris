@@ -147,6 +147,30 @@ void remove_task_info(const TTaskType::type task_type, int64_t signature) {
 }
 
 void finish_task(const TFinishTaskRequest& finish_task_request) {
+    // Debug point: the report of the task is lost, to see the FE resend the task. Params: task_type (the TTaskType
+    // value, any if unset), times (how many reports are lost after the debug point is added, default 1).
+    DBUG_EXECUTE_IF("WorkPool.finish_task.lost", {
+        static std::mutex lost_mutex;
+        static std::weak_ptr<DebugPoint> lost_for;
+        static int lost_times = 0;
+        auto ptype = dp->param<int>("task_type", -1);
+        if (ptype < 0 || ptype == static_cast<int>(finish_task_request.task_type)) {
+            std::lock_guard lock(lost_mutex);
+            // a debug point added again is another object; an expired weak_ptr never equals a live one,
+            // so the count is reset even if the address is reused
+            if (lost_for.lock() != dp) {
+                lost_for = dp;
+                lost_times = 0;
+            }
+            if (lost_times < dp->param<int>("times", 1)) {
+                ++lost_times;
+                LOG(INFO) << "debug point " << DP_NAME << ": the report of task type "
+                          << finish_task_request.task_type
+                          << " signature=" << finish_task_request.signature << " is lost";
+                return;
+            }
+        }
+    });
     // Return result to FE
     TMasterResult result;
     uint32_t try_time = 0;
@@ -1377,8 +1401,25 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     string snapshot_path;
     bool allow_incremental_clone = false; // not used
     std::vector<string> snapshot_files;
-    Status status = engine.snapshot_mgr()->make_snapshot(snapshot_request, &snapshot_path,
-                                                         &allow_incremental_clone);
+    const bool local_source =
+            snapshot_request.__isset.restore_local_source && snapshot_request.restore_local_source;
+    LocalSourceStats local_source_stats;
+    Status status;
+    // The local source is loaded into the tablet by the snapshot task itself: with restore_kept_load, a kept
+    // partition.
+    const bool load_local_source = local_source && snapshot_request.__isset.restore_kept_load &&
+                                   snapshot_request.restore_kept_load;
+    if (load_local_source) {
+        SnapshotLoader loader(engine, ExecEnv::GetInstance(),
+                              snapshot_request.__isset.job_id ? snapshot_request.job_id : 0,
+                              snapshot_request.tablet_id);
+        status = loader.make_local_source_snapshot_and_load(snapshot_request, &snapshot_path,
+                                                            &local_source_stats);
+    } else {
+        status = engine.snapshot_mgr()->make_snapshot(snapshot_request, &snapshot_path,
+                                                      &allow_incremental_clone,
+                                                      local_source ? &local_source_stats : nullptr);
+    }
     if (status.ok() && snapshot_request.__isset.list_files) {
         // list and save all snapshot files
         // snapshot_path like: data/snapshot/20180417205230.1.86400

@@ -41,6 +41,7 @@ import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.PartitionInfo;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.catalog.PartitionType;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Table;
@@ -138,6 +139,7 @@ import org.apache.doris.thrift.TBackend;
 import org.apache.doris.thrift.TBeginTxnRequest;
 import org.apache.doris.thrift.TBeginTxnResult;
 import org.apache.doris.thrift.TBinlog;
+import org.apache.doris.thrift.TCcrPartitionSource;
 import org.apache.doris.thrift.TCheckAuthRequest;
 import org.apache.doris.thrift.TCheckAuthResult;
 import org.apache.doris.thrift.TColumnDef;
@@ -1294,7 +1296,8 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         checkPasswordAndPrivs(user, passwd, db, null, clientIp, predicate);
     }
 
-    private void checkPasswordAndPrivs(String user, String passwd, String db, List<String> tables,
+    // returns the identity of the user, whose privileges were checked
+    private UserIdentity checkPasswordAndPrivs(String user, String passwd, String db, List<String> tables,
             String clientIp, PrivPredicate predicate) throws AuthenticationException {
 
         final String fullUserName = ClusterNamespace.getNameFromFullName(user);
@@ -1310,7 +1313,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                         "Access denied; you need (at least one of) the (" + predicate.toString()
                                 + ") privilege(s) for this operation");
             }
-            return;
+            return currentUser.get(0);
         }
 
         for (String tbl : tables) {
@@ -1322,6 +1325,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                                 + ") privilege(s) for this operation");
             }
         }
+        return currentUser.get(0);
     }
 
     private void checkPassword(String user, String passwd, String clientIp)
@@ -1880,7 +1884,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         }
 
         try {
-            if (!commitTxnImpl(request)) {
+            if (!commitTxnImpl(request, result)) {
                 // committed success but not visible
                 status.setStatusCode(TStatusCode.PUBLISH_TIMEOUT);
                 status.addToErrorMsgs("transaction commit successfully, BUT data will be visible later");
@@ -1898,9 +1902,76 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         return result;
     }
 
+    /**
+     * The CCR sources of the partitions the transaction writes (see PartitionStateToken), kept in the transaction
+     * state only if the master tracks the state tokens and the request was authenticated by a password of a user
+     * with the ADMIN privilege. Otherwise they are ignored and the transaction is a local write.
+     */
+    private void acceptCcrPartitionSources(TCommitTxnRequest request, TransactionState transactionState,
+            UserIdentity currentUser) {
+        if (!request.isSetCcrPartitionSources() || request.getCcrPartitionSources().isEmpty()) {
+            return;
+        }
+        if (!Config.restore_state_token_track) {
+            return;
+        }
+        if (!Env.getCurrentEnv().getAccessManager().checkGlobalPriv(currentUser, PrivPredicate.ADMIN)) {
+            LOG.info("ignore the ccr partition sources of txn {}: user {} has no ADMIN privilege",
+                    request.getTxnId(), request.getUser());
+            return;
+        }
+        Map<Long, TransactionState.CcrPartitionSource> sources = Maps.newHashMap();
+        for (TCcrPartitionSource src : request.getCcrPartitionSources()) {
+            // a write gives a source partition a new token, never EMPTY (the name of a partition that never had a
+            // visible transaction): such a source is not taken
+            if (!src.isSetTargetPartitionId() || !src.isSetToken() || !src.isSetPrevToken()
+                    || PartitionStateToken.EMPTY.equals(src.getToken())) {
+                continue;
+            }
+            sources.put(src.getTargetPartitionId(), new TransactionState.CcrPartitionSource(
+                    src.getSrcPartitionId(), src.getSrcVersion(), src.getPrevToken(), src.getToken()));
+        }
+        transactionState.setCcrPartitionSources(sources.isEmpty() ? null : sources);
+    }
+
+    /**
+     * Tells ccr-syncer the target partitions of the commit that did not continue the state token of their CCR source
+     * (see TransactionState#getCcrNotContinuousPartitionIds). The FE only tells, it does nothing about it. The
+     * tokens are set when the transaction is made visible. If it is not visible when the commit returns (ccr-syncer
+     * commits with only_commit by default, or the publish timed out), the partitions that no transaction before
+     * this one is still to change are told by the token they have now, and the others are not told this time (see
+     * TransactionState#getCcrNotContinuousPartitionIdsBeforeVisible).
+     */
+    // null if the transaction is not visible
+    private static List<Long> getCcrNotContinuousPartitionIdsIfVisible(TransactionState transactionState) {
+        // the tokens are set with the lock of the transaction state, when it is set visible
+        synchronized (transactionState) {
+            return transactionState.getTransactionStatus() == TransactionStatus.VISIBLE
+                    ? transactionState.getCcrNotContinuousPartitionIds() : null;
+        }
+    }
+
+    private static void setCcrNotContinuousPartitions(TCommitTxnResult result, TransactionState transactionState,
+            Database db) {
+        List<Long> ids = getCcrNotContinuousPartitionIdsIfVisible(transactionState);
+        if (ids == null) {
+            ids = transactionState.getCcrNotContinuousPartitionIdsBeforeVisible(db);
+            // made visible in between: the partitions are at the version of the transaction and were not told
+            List<Long> visibleIds = getCcrNotContinuousPartitionIdsIfVisible(transactionState);
+            if (visibleIds != null) {
+                ids = visibleIds;
+            }
+        }
+        if (!ids.isEmpty()) {
+            LOG.info("the ccr partition sources of txn {} are not continued in partitions {}",
+                    transactionState.getTransactionId(), ids);
+            result.setCcrNotContinuousPartitionIds(ids);
+        }
+    }
+
     // return true if commit success and publish success, return false if publish
     // timeout
-    private boolean commitTxnImpl(TCommitTxnRequest request) throws UserException {
+    private boolean commitTxnImpl(TCommitTxnRequest request, TCommitTxnResult result) throws UserException {
         /// Check required arg: user, passwd, db, txn_id, commit_infos
         if (!request.isSetUser()) {
             throw new UserException("user is not set");
@@ -1959,8 +2030,9 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             checkToken(request.getToken());
         } else {
             List<String> tables = tableList.stream().map(Table::getName).collect(Collectors.toList());
-            checkPasswordAndPrivs(request.getUser(), request.getPasswd(), request.getDb(), tables,
-                    request.getUserIp(), PrivPredicate.LOAD);
+            UserIdentity currentUser = checkPasswordAndPrivs(request.getUser(), request.getPasswd(),
+                    request.getDb(), tables, request.getUserIp(), PrivPredicate.LOAD);
+            acceptCcrPartitionSources(request, transactionState, currentUser);
         }
 
         // Step 4: get timeout
@@ -1986,11 +2058,13 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                     .commitAndPublishTransaction(db, request.getTxnId(),
                             subTransactionStates, timeoutMs);
         } else if (!request.isOnlyCommit()) {
-            return Env.getCurrentGlobalTransactionMgr()
+            boolean visible = Env.getCurrentGlobalTransactionMgr()
                     .commitAndPublishTransaction(db, tableList,
                             request.getTxnId(),
                             TabletCommitInfo.fromThrift(request.getCommitInfos()), timeoutMs,
                             TxnCommitAttachment.fromThrift(request.getTxnCommitAttachment()));
+            setCcrNotContinuousPartitions(result, transactionState, db);
+            return visible;
         } else {
             // single table commit, so don't need to wait for publish.
             Env.getCurrentGlobalTransactionMgr()
@@ -1998,6 +2072,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                             request.getTxnId(),
                             TabletCommitInfo.fromThrift(request.getCommitInfos()), timeoutMs,
                             TxnCommitAttachment.fromThrift(request.getTxnCommitAttachment()));
+            setCcrNotContinuousPartitions(result, transactionState, db);
             return true;
         }
     }
@@ -2441,6 +2516,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         result.setRpcPort(0);
         result.setReplayedJournalId(0);
         result.setVersion(Version.DORIS_BUILD_VERSION + "-" + Version.DORIS_BUILD_SHORT_HASH);
+        result.setPartitionStateTokenCapability(PartitionStateToken.CAPABILITY);
         if (isReady) {
             if (request.getClusterId() != Env.getCurrentEnv().getClusterId()) {
                 result.setStatus(TFrontendPingFrontendStatusCode.FAILED);

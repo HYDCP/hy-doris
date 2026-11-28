@@ -37,12 +37,14 @@ import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.OlapTable.OlapTableState;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Partition.PartitionState;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.UserException;
+import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.task.AgentTask;
 import org.apache.doris.task.AgentTaskQueue;
@@ -806,5 +808,136 @@ public class IndexChangeJobTest {
 
         schemaChangeHandler.runAfterCatalogReady();
         Assert.assertEquals(AlterJobV2.JobState.CANCELLED, jobV2.getJobState());
+    }
+
+    // Gives the partition of the test table a state token on the given catalog and returns the partition.
+    private static Partition givePartitionStateToken(Env env) throws UserException {
+        Database db = env.getInternalCatalog().getDbOrDdlException(CatalogTestUtil.testDbId1);
+        OlapTable olapTable = (OlapTable) db.getTableOrDdlException(CatalogTestUtil.testTableId1);
+        Partition partition = olapTable.getPartition(CatalogTestUtil.testPartitionId1);
+        partition.setStateToken(new PartitionStateToken("aaaa", partition.getVisibleVersion(),
+                partition.getVisibleVersionTime()));
+        Assert.assertEquals("aaaa", PartitionStateToken.effective(partition));
+        return partition;
+    }
+
+    // Creates an inverted index on the test table of the master and a BUILD INDEX job of it, in WAITING_TXN.
+    private static IndexChangeJob createBuildIndexJob(SchemaChangeHandler schemaChangeHandler) throws UserException {
+        Database db = masterEnv.getInternalCatalog().getDbOrDdlException(CatalogTestUtil.testDbId1);
+        OlapTable olapTable = (OlapTable) db.getTableOrDdlException(CatalogTestUtil.testTableId1);
+        String indexName = "index1";
+        TableName tableName = new TableName(masterEnv.getInternalCatalog().getName(), db.getName(),
+                olapTable.getName());
+        IndexDef indexDef = new IndexDef(indexName, false,
+                Lists.newArrayList(olapTable.getBaseSchema().get(1).getName()),
+                IndexDef.IndexType.INVERTED,
+                Maps.newHashMap(), "balabala");
+        ArrayList<AlterClause> alterClauses = new ArrayList<>();
+        CreateIndexClause createIndexClause = new CreateIndexClause(tableName, indexDef, false);
+        createIndexClause.analyze(analyzer);
+        alterClauses.add(createIndexClause);
+        schemaChangeHandler.process(alterClauses, db, olapTable);
+        alterClauses.clear();
+        BuildIndexClause buildIndexClause = new BuildIndexClause(tableName, indexName, null, false);
+        buildIndexClause.analyze(analyzer);
+        alterClauses.add(buildIndexClause);
+        schemaChangeHandler.process(alterClauses, db, olapTable);
+        Map<Long, IndexChangeJob> indexChangeJobMap = schemaChangeHandler.getIndexChangeJobs();
+        Assert.assertEquals(1, indexChangeJobMap.size());
+        IndexChangeJob indexChangeJob = indexChangeJobMap.values().stream().findAny().get();
+        Assert.assertEquals(IndexChangeJob.JobState.WAITING_TXN, indexChangeJob.getJobState());
+        return indexChangeJob;
+    }
+
+    // Replays the logged job on the follower catalog, as EditLog does with OP_INVERTED_INDEX_JOB.
+    private static void replayOnSlave(String loggedJob) throws Exception {
+        FakeEnv.setEnv(slaveEnv);
+        slaveEnv.getSchemaChangeHandler().replayIndexChangeJob(
+                GsonUtils.GSON.fromJson(loggedJob, IndexChangeJob.class));
+        FakeEnv.setEnv(masterEnv);
+    }
+
+    @Test
+    // the tasks wrote the index files of the partition at its version: the state token no longer names them
+    public void testFinishedIndexChangeInvalidatesStateToken() throws Exception {
+        fakeEnv = new FakeEnv();
+        fakeEditLog = new FakeEditLog();
+        FakeEnv.setEnv(masterEnv);
+        SchemaChangeHandler schemaChangeHandler = Env.getCurrentEnv().getSchemaChangeHandler();
+        Partition partition = givePartitionStateToken(masterEnv);
+        Partition slavePartition = givePartitionStateToken(slaveEnv);
+        long version = partition.getVisibleVersion();
+        IndexChangeJob indexChangeJob = createBuildIndexJob(schemaChangeHandler);
+        String createLog = indexChangeJob.toJson();
+
+        schemaChangeHandler.runAfterCatalogReady();
+        Assert.assertEquals(IndexChangeJob.JobState.RUNNING, indexChangeJob.getJobState());
+        Assert.assertEquals("aaaa", PartitionStateToken.effective(partition));
+        for (AgentTask agentTask : AgentTaskQueue.getTask(TTaskType.ALTER_INVERTED_INDEX)) {
+            agentTask.setFinished(true);
+        }
+        schemaChangeHandler.runAfterCatalogReady();
+        Assert.assertEquals(IndexChangeJob.JobState.FINISHED, indexChangeJob.getJobState());
+        Assert.assertEquals(version, partition.getVisibleVersion());
+        Assert.assertNull(PartitionStateToken.effective(partition));
+        Assert.assertFalse(PartitionStateToken.isTainted(partition));
+
+        replayOnSlave(createLog);
+        Assert.assertEquals("aaaa", PartitionStateToken.effective(slavePartition));
+        replayOnSlave(indexChangeJob.toJson());
+        Assert.assertNull(PartitionStateToken.effective(slavePartition));
+        Assert.assertFalse(PartitionStateToken.isTainted(slavePartition));
+    }
+
+    @Test
+    // the tasks may have changed the index files of some replicas and the cancel does not undo them
+    public void testCancelAfterTasksSentTaintsPartition() throws Exception {
+        fakeEnv = new FakeEnv();
+        fakeEditLog = new FakeEditLog();
+        FakeEnv.setEnv(masterEnv);
+        SchemaChangeHandler schemaChangeHandler = Env.getCurrentEnv().getSchemaChangeHandler();
+        Partition partition = givePartitionStateToken(masterEnv);
+        Partition slavePartition = givePartitionStateToken(slaveEnv);
+        IndexChangeJob indexChangeJob = createBuildIndexJob(schemaChangeHandler);
+        String createLog = indexChangeJob.toJson();
+
+        schemaChangeHandler.runAfterCatalogReady();
+        Assert.assertEquals(IndexChangeJob.JobState.RUNNING, indexChangeJob.getJobState());
+        Assert.assertTrue(indexChangeJob.cancel("user cancelled"));
+        Assert.assertEquals(IndexChangeJob.JobState.CANCELLED, indexChangeJob.getJobState());
+        Assert.assertTrue(PartitionStateToken.isTainted(partition));
+        Assert.assertNull(PartitionStateToken.effective(partition));
+
+        replayOnSlave(createLog);
+        Assert.assertFalse(PartitionStateToken.isTainted(slavePartition));
+        replayOnSlave(indexChangeJob.toJson());
+        Assert.assertTrue(PartitionStateToken.isTainted(slavePartition));
+        Assert.assertNull(PartitionStateToken.effective(slavePartition));
+    }
+
+    @Test
+    // whether the tasks were sent is not logged (and a new master sends them again): a cancel while WAITING_TXN
+    // taints too, on the master and in the replay
+    public void testCancelWhileWaitingTxnTaintsPartition() throws Exception {
+        fakeEnv = new FakeEnv();
+        fakeEditLog = new FakeEditLog();
+        FakeEnv.setEnv(masterEnv);
+        SchemaChangeHandler schemaChangeHandler = Env.getCurrentEnv().getSchemaChangeHandler();
+        Partition partition = givePartitionStateToken(masterEnv);
+        Partition slavePartition = givePartitionStateToken(slaveEnv);
+        IndexChangeJob indexChangeJob = createBuildIndexJob(schemaChangeHandler);
+        String createLog = indexChangeJob.toJson();
+
+        Assert.assertTrue(indexChangeJob.cancel("user cancelled"));
+        Assert.assertEquals(IndexChangeJob.JobState.CANCELLED, indexChangeJob.getJobState());
+        Assert.assertEquals(0, AgentTaskQueue.getTask(TTaskType.ALTER_INVERTED_INDEX).size());
+        Assert.assertTrue(PartitionStateToken.isTainted(partition));
+        Assert.assertNull(PartitionStateToken.effective(partition));
+
+        replayOnSlave(createLog);
+        Assert.assertEquals("aaaa", PartitionStateToken.effective(slavePartition));
+        replayOnSlave(indexChangeJob.toJson());
+        Assert.assertTrue(PartitionStateToken.isTainted(slavePartition));
+        Assert.assertNull(PartitionStateToken.effective(slavePartition));
     }
 }

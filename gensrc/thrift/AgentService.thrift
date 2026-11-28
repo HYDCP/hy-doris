@@ -393,6 +393,15 @@ struct TUploadReq {
     6: optional string location // root path
 }
 
+// The versions (base_version, end_version] of a remote tablet snapshot to append to a local tablet whose
+// version is base_version (the incremental restore): only the rowsets of these versions are downloaded
+// (into an empty snapshot dir), and moved onto the local tablet instead of replacing it.
+// The keep by the state token never sets it; the follow-up logical verification uses it.
+struct TRestoreIncrementalRange {
+    1: required Types.TVersion base_version
+    2: required Types.TVersion end_version
+}
+
 struct TRemoteTabletSnapshot {
     1: optional i64 local_tablet_id
     2: optional string local_snapshot_path
@@ -431,6 +440,23 @@ struct TSnapshotRequest {
     12: optional Types.TVersion end_version
     13: optional bool is_copy_binlog
     14: optional Types.TTabletId ref_tablet_id
+    // restore only: make an empty snapshot dir. The frontend does not set it, the backend sets it on the request of
+    // the empty snapshot dir it makes after the snapshot task loaded the local source into the tablet itself
+    // (restore_kept_load)
+    7603: optional bool restore_incremental
+    // restore only (atomic restore, partition level reuse): the data source of the snapshot is the local tablet
+    // ref_tablet_id (the tablet of the table being replaced) at `version`, instead of the tablet itself. Its files are
+    // hard linked into the snapshot dir of the tablet, or copied if the two tablets are not on the same disk.
+    7604: optional bool restore_local_source
+    // restore only: the id of the restore job. With restore_local_source, the evidence that the local source is
+    // loaded into the tablet by this job is saved with the tablet meta, to tell a resent task from a tablet
+    // which was changed.
+    7605: optional i64 job_id
+    // restore only, with restore_local_source (atomic restore, a partition that keeps its local data): load the local
+    // source into the tablet at once as the move of the restore does (the evidence is saved with the tablet meta,
+    // see job_id) and make an empty snapshot dir, so that the move of the restore has nothing to move. Without it
+    // the snapshot holds the files of the local source and the move of the restore loads them into the tablet.
+    7607: optional bool restore_kept_load
 }
 
 struct TReleaseSnapshotRequest {

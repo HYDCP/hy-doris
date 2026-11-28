@@ -48,6 +48,14 @@ public class UpsertRecord {
 
             @SerializedName(value = "stid")
             public long subTxnId;
+
+            // the state token of the partition before and after this version, see PartitionStateToken; ccr-syncer
+            // passes them to the target so that it can adopt the token. Null if none was assigned.
+            @SerializedName(value = "ptk")
+            public String prevStateToken;
+
+            @SerializedName(value = "tk")
+            public String stateToken;
         }
 
         @SerializedName(value = "partitionRecords")
@@ -76,6 +84,8 @@ public class UpsertRecord {
             partitionRecord.range = partitionCommitInfo.getPartitionRange();
             partitionRecord.version = partitionCommitInfo.getVersion();
             partitionRecord.isTemp = partitionCommitInfo.isTempPartition();
+            partitionRecord.prevStateToken = partitionCommitInfo.getPrevStateToken();
+            partitionRecord.stateToken = partitionCommitInfo.getStateToken();
             partitionRecords.add(partitionRecord);
         }
 
