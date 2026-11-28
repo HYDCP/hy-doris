@@ -78,7 +78,7 @@ public class MasterOpExecutor extends FEOpExecutor {
         limitToTemporaryTableResetDeadline(Integer.MAX_VALUE, deadline);
     }
 
-    private static int limitToTemporaryTableResetDeadline(int timeoutMs, long deadline) throws DdlException {
+    static int limitToTemporaryTableResetDeadline(int timeoutMs, long deadline) throws DdlException {
         if (deadline == 0 || timeoutMs == 0) {
             return timeoutMs;
         }

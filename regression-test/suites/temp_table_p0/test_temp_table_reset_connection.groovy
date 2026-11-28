@@ -184,3 +184,54 @@ suite("test_temporary_table_reset_after_aborted_transaction", "p0") {
         assertEquals([[17]], sql("SELECT id FROM `${database}`.temp_reset_aborted_txn_permanent ORDER BY id"))
     }
 }
+
+suite("test_temporary_table_reset_after_aborted_values_transaction", "p0") {
+    if (isCloudMode()) {
+        return
+    }
+    def database = getCurDbName()
+    sql "DROP TABLE IF EXISTS temp_reset_aborted_values_permanent"
+    sql """
+        CREATE TABLE temp_reset_aborted_values_permanent (id INT)
+        DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ("replication_num" = "1")
+    """
+    sql "INSERT INTO temp_reset_aborted_values_permanent VALUES (17)"
+    sql """
+        CREATE TEMPORARY TABLE temp_reset_aborted_values_table (id INT)
+        DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ("replication_num" = "1")
+    """
+    def connectionId = sql("SELECT CONNECTION_ID()")[0][0]
+    def label = "values_reset_${UUID.randomUUID().toString().replace('-', '')}"
+    sql "SET insert_timeout = 5"
+    sql "SET query_timeout = 5"
+    sql "BEGIN WITH LABEL ${label}"
+    sql "INSERT INTO temp_reset_aborted_values_permanent VALUES (41)"
+
+    def status
+    def deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90)
+    DriverManager.getConnection(getCurDbConnectUrl(), context.config.jdbcUser, context.config.jdbcPassword)
+            .withCloseable { observer ->
+                observer.createStatement().withCloseable { stmt ->
+                    while (System.nanoTime() < deadline) {
+                        stmt.executeQuery("SHOW TRANSACTION FROM `${database}` WHERE LABEL = '${label}'")
+                                .withCloseable { rows ->
+                                    status = rows.next() ? rows.getString("TransactionStatus") : null
+                                }
+                        if (status == "ABORTED") {
+                            break
+                        }
+                        sleep(500)
+                    }
+                }
+            }
+    assertEquals("ABORTED", status)
+    2.times {
+        resetConnection(context.getConnection())
+        assertEquals(connectionId, sql("SELECT CONNECTION_ID()")[0][0])
+        test {
+            sql "SELECT id FROM `${database}`.temp_reset_aborted_values_table"
+            exception "does not exist"
+        }
+        assertEquals([[17]], sql("SELECT id FROM `${database}`.temp_reset_aborted_values_permanent ORDER BY id"))
+    }
+}

@@ -20,6 +20,7 @@ package org.apache.doris.qe;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
+import org.apache.doris.common.DdlException;
 import org.apache.doris.common.UserException;
 import org.apache.doris.planner.StreamLoadPlanner;
 import org.apache.doris.proto.InternalService;
@@ -62,6 +63,7 @@ public class InsertStreamTxnExecutor {
 
     public void beginTransaction(TStreamLoadPutRequest request) throws UserException, TException, TimeoutException,
             InterruptedException, ExecutionException {
+        txnEntry.recordInsertValuesTransactionTimeout(request.getTimeout());
         TTxnParams txnConf = txnEntry.getTxnConf();
         OlapTable table = (OlapTable) txnEntry.getTable();
         // StreamLoadTask's id == request's load_id
@@ -152,6 +154,16 @@ public class InsertStreamTxnExecutor {
 
     public void abortTransaction() throws TException, TimeoutException,
             InterruptedException, ExecutionException {
+        abortTransaction(5000);
+    }
+
+    public void abortTransactionForTemporaryTableReset(long deadline) throws TException, TimeoutException,
+            InterruptedException, ExecutionException, DdlException {
+        abortTransaction(MasterOpExecutor.limitToTemporaryTableResetDeadline(5000, deadline));
+    }
+
+    private void abortTransaction(int timeoutMs) throws TException, TimeoutException,
+            InterruptedException, ExecutionException {
         TTxnParams txnConf = txnEntry.getTxnConf();
         Types.PUniqueId fragmentInstanceId = Types.PUniqueId.newBuilder()
                 .setHi(txnConf.getFragmentInstanceId().getHi())
@@ -162,7 +174,7 @@ public class InsertStreamTxnExecutor {
         try {
             Future<InternalService.PRollbackResult> future = BackendServiceProxy.getInstance().rollback(address,
                     fragmentInstanceId, this.txnEntry.getpLoadId());
-            InternalService.PRollbackResult result = future.get(5, TimeUnit.SECONDS);
+            InternalService.PRollbackResult result = future.get(timeoutMs, TimeUnit.MILLISECONDS);
             TStatusCode code = TStatusCode.findByValue(result.getStatus().getStatusCode());
             if (code != TStatusCode.OK) {
                 throw new TException("failed to rollback txn: " + result.getStatus().getErrorMsgsList());
