@@ -80,6 +80,8 @@ namespace ErrorCode {
     TStatusError(OBTAIN_LOCK_FAILED, false);              \
     TStatusError(SNAPSHOT_EXPIRED, false);                \
     TStatusError(DELETE_BITMAP_LOCK_ERROR, false);
+// RESTORE_MANIFEST_MISMATCH (-7600) is reported to the FE as INTERNAL_ERROR, Status::code_as_string() prints its name
+// instead of the number, so that the message has the prefix [RESTORE_MANIFEST_MISMATCH] which the FE recognizes.
 // E error_name, error_code, print_stacktrace
 #define APPLY_FOR_OLAP_ERROR_CODES(E)                        \
     E(OK, 0, false);                                         \
@@ -296,7 +298,8 @@ namespace ErrorCode {
     E(NEW_ROWS_IN_PARTIAL_UPDATE, -7003, false);             \
     E(INVALID_TABLET_STATE, -7211, false);                   \
     E(ROWSETS_EXPIRED, -7311, false);                        \
-    E(CGROUP_ERROR, -7411, false);
+    E(CGROUP_ERROR, -7411, false);                           \
+    E(RESTORE_MANIFEST_MISMATCH, -7600, false);
 
 // Define constexpr int error_code_name = error_code_value
 #define M(NAME, ERRORCODE, ENABLESTACKTRACE) constexpr int NAME = ERRORCODE;
@@ -564,6 +567,11 @@ private:
     std::unique_ptr<ErrMsg> _err_msg;
 
     std::string code_as_string() const {
+        if (_code == ErrorCode::RESTORE_MANIFEST_MISMATCH) {
+            // An internal error code (not in TStatusCode, so that an old FE can understand the status:
+            // to_thrift reports it as INTERNAL_ERROR). The FE recognizes it by this name in the error message.
+            return "RESTORE_MANIFEST_MISMATCH";
+        }
         return (int)_code >= 0 ? doris::to_string(static_cast<TStatusCode::type>(_code))
                                : fmt::format("E{}", (int16_t)_code);
     }

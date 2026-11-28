@@ -19,6 +19,7 @@ package org.apache.doris.backup;
 
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.FeMetaVersion;
+import org.apache.doris.common.Pair;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.persist.gson.GsonUtils;
@@ -31,7 +32,9 @@ import com.google.gson.annotations.SerializedName;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.Iterator;
 import java.util.Map;
+import java.util.Set;
 
 public class RestoreFileMapping implements Writable {
 
@@ -169,6 +172,25 @@ public class RestoreFileMapping implements Writable {
             return mapping;
         } else {
             return GsonUtils.GSON.fromJson(Text.readString(in), RestoreFileMapping.class);
+        }
+    }
+
+    /**
+     * Remove the mapping of all tablets of the given partitions, e.g. the partitions that keep their local data.
+     *
+     * @param partitions the (table id, partition id) of the partitions
+     */
+    public void removePartitions(Set<Pair<Long, Long>> partitions) {
+        if (partitions.isEmpty()) {
+            return;
+        }
+        Iterator<Map.Entry<IdChain, IdChain>> iter = mapping.entrySet().iterator();
+        while (iter.hasNext()) {
+            IdChain dest = iter.next().getKey();
+            if (partitions.contains(Pair.of(dest.getTblId(), dest.getPartId()))) {
+                iter.remove();
+                overwriteMap.remove(dest.getTabletId());
+            }
         }
     }
 

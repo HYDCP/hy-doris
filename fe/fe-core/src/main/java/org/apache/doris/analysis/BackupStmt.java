@@ -30,6 +30,10 @@ import java.util.Map;
 public class BackupStmt extends AbstractBackupStmt implements NotFallbackInParser {
     private static final String PROP_TYPE = "type";
     public static final String PROP_CONTENT = "content";
+    // "true": compute the SHA-256 of the snapshot files for the manifest when the backup is kept on local
+    // (downloaded by http, e.g. CCR). The files uploaded to a remote repository always have it.
+    public static final String PROP_MANIFEST_DIGEST = "manifest_digest";
+    public static final String PROP_LOGICAL_DIGEST = "logical_digest";
 
     public enum BackupType {
         INCREMENTAL, FULL
@@ -41,7 +45,8 @@ public class BackupStmt extends AbstractBackupStmt implements NotFallbackInParse
 
     private BackupType type = BackupType.FULL;
     private BackupContent content = BackupContent.ALL;
-
+    private boolean manifestDigest = false;
+    private boolean logicalDigest = false;
 
     public BackupStmt(LabelName labelName, String repoName, AbstractBackupTableRefClause abstractBackupTableRefClause,
                       Map<String, String> properties) {
@@ -58,6 +63,14 @@ public class BackupStmt extends AbstractBackupStmt implements NotFallbackInParse
 
     public BackupContent getContent() {
         return content;
+    }
+
+    public boolean isManifestDigest() {
+        return manifestDigest;
+    }
+
+    public boolean isLogicalDigest() {
+        return logicalDigest;
     }
 
     @Override
@@ -101,6 +114,34 @@ public class BackupStmt extends AbstractBackupStmt implements NotFallbackInParse
                         "Invalid backup job content:" + contentProp);
             }
             copiedProperties.remove(PROP_CONTENT);
+        }
+        // manifest digest
+        String manifestDigestProp = copiedProperties.get(PROP_MANIFEST_DIGEST);
+        if (manifestDigestProp != null) {
+            if (manifestDigestProp.equalsIgnoreCase("true")) {
+                manifestDigest = true;
+            } else if (manifestDigestProp.equalsIgnoreCase("false")) {
+                manifestDigest = false;
+            } else {
+                ErrorReport.reportAnalysisException(ErrorCode.ERR_COMMON_ERROR,
+                        "Invalid backup job property " + PROP_MANIFEST_DIGEST + ": " + manifestDigestProp
+                                + ", expect true or false");
+            }
+            copiedProperties.remove(PROP_MANIFEST_DIGEST);
+        }
+        // logical digest
+        String logicalDigestProp = copiedProperties.get(PROP_LOGICAL_DIGEST);
+        if (logicalDigestProp != null) {
+            if (logicalDigestProp.equalsIgnoreCase("true")) {
+                logicalDigest = true;
+            } else if (logicalDigestProp.equalsIgnoreCase("false")) {
+                logicalDigest = false;
+            } else {
+                ErrorReport.reportAnalysisException(ErrorCode.ERR_COMMON_ERROR,
+                        "Invalid backup job property " + PROP_LOGICAL_DIGEST + ": " + logicalDigestProp
+                                + ", expect true or false");
+            }
+            copiedProperties.remove(PROP_LOGICAL_DIGEST);
         }
 
         if (!copiedProperties.isEmpty()) {

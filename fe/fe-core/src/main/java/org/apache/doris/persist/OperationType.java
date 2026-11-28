@@ -428,6 +428,9 @@ public class OperationType {
     public static final short OP_MODIFY_TTL_SECONDS = 1001;
     public static final short OP_MODIFY_CLOUD_WARM_UP_JOB = 1002;
 
+    // restore reuse: the state tokens given to partitions outside of a transaction, see PartitionStateToken
+    public static final short OP_SET_PARTITION_STATE_TOKEN = 7601;
+
     /**
      * Get opcode name by op code.
      **/

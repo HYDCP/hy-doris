@@ -1052,6 +1052,8 @@ public class ReportHandler extends Daemon {
                                     LOG.warn("tablet {} has only one replica {} on backend {}"
                                                     + " and it is lost. create an empty replica to recover it",
                                             tabletId, replica.getId(), backendId);
+                                    Env.getCurrentEnv().taintPartitionOfLostReplica(partition, tabletId, backendId,
+                                            replica);
                                     MaterializedIndexMeta indexMeta = olapTable.getIndexMetaByIndexId(indexId);
                                     Set<String> bfColumns = olapTable.getCopiedBfColumns();
                                     double bfFpp = olapTable.getBfFpp();

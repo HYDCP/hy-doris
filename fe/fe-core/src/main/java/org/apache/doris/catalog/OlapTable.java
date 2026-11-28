@@ -221,6 +221,11 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
     @SerializedName(value = "aIncg")
     private AutoIncrementGenerator autoIncrementGenerator;
 
+    // The source table of the last RESTORE job that wrote this table, null if the table was never restored.
+    // See RestoreSource.
+    @SerializedName(value = "rsrc")
+    private RestoreSource restoreSource;
+
     private volatile Statistics statistics = new Statistics();
 
     public OlapTable() {
@@ -1331,6 +1336,17 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
         List<Partition> partitions = Lists.newArrayList(idToPartition.values());
         partitions.addAll(tempPartitions.getAllPartitions());
         return partitions;
+    }
+
+    /**
+     * No partition of the table has a state token until its next write, restore or backup, see PartitionStateToken.
+     * For a change of the table that, at the same versions, changes the data of the partitions or the data an index
+     * name stands for. Called with the write lock of the table, on the master and on replay.
+     */
+    public void invalidatePartitionStateTokens() {
+        for (Partition partition : idToPartition.values()) {
+            PartitionStateToken.invalidate(partition);
+        }
     }
 
     // get all partitions' name except the temp partitions
@@ -3624,5 +3640,13 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
                                         : invertedIndexesWithFieldPattern.stream()
                                         .filter(Index::isAnalyzedInvertedIndex).findFirst().orElse(null);
         }
+    }
+
+    public RestoreSource getRestoreSource() {
+        return restoreSource;
+    }
+
+    public void setRestoreSource(RestoreSource restoreSource) {
+        this.restoreSource = restoreSource;
     }
 }

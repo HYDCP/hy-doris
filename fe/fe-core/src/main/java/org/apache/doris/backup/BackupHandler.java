@@ -56,11 +56,13 @@ import org.apache.doris.fs.remote.RemoteFileSystem;
 import org.apache.doris.persist.BarrierLog;
 import org.apache.doris.task.DirMoveTask;
 import org.apache.doris.task.DownloadTask;
+import org.apache.doris.task.RestoreDigestTask;
 import org.apache.doris.task.SnapshotTask;
 import org.apache.doris.task.UploadTask;
 import org.apache.doris.thrift.TFinishTaskRequest;
 import org.apache.doris.thrift.TTaskType;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
@@ -77,6 +79,7 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedList;
@@ -84,6 +87,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -149,12 +155,33 @@ public class BackupHandler extends MasterDaemon implements Writable {
     // replays in flight.
     private static final Map<Path, Integer> UNPUBLISHED_STAGING_DIRS = new ConcurrentHashMap<>();
 
+    // The ids of the restore jobs, not done, that load staging partitions from a local source (see
+    // RestoreJob.localSourceStagingPartitions). The tablet scheduler asks isEmpty() first, to skip everything for the
+    // common case, so it has to be cheap and lock free. Kept up to date when a job builds or clears its set, when a
+    // job is added (also on replay and image load, where the job object is replaced by a new one) and when a job is
+    // evicted.
+    private final Set<Long> jobsWithLocalSource = ConcurrentHashMap.newKeySet();
+
     // this lock is used for handling one backup or restore request at a time.
     private ReentrantLock seqlock = new ReentrantLock();
 
     private boolean isInit = false;
 
     private Env env;
+
+    // Config.backup_restore_run_on_task_finish: the jobs nudged by the report of their last task are run by this
+    // one thread, once per nudge (nudgePending dedupes the nudges of a job until it is run). The thread is started
+    // on the first nudge only.
+    private final ExecutorService nudgeExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "backup-restore-nudge");
+        t.setDaemon(true);
+        return t;
+    });
+    private final Set<Long> nudgePending = ConcurrentHashMap.newKeySet();
+    // Taken around each run of a job, by the daemon and by the nudge thread: the jobs are still run one at a time,
+    // as when only the daemon ran them (a nudge may come in between two jobs of a round, not run beside one).
+    // Always taken before the lock of the job (run() is synchronized), never while holding it.
+    private final ReentrantLock jobRunLock = new ReentrantLock();
 
     // map to store backup info, key is label name, value is the BackupJob
     // this map not present in persist && only in fe memory
@@ -223,6 +250,68 @@ public class BackupHandler extends MasterDaemon implements Writable {
         return getCurrentJob(dbId);
     }
 
+    /** Whether some running restore job loads staging partitions from a local source. Lock free. */
+    public boolean hasJobsWithLocalSource() {
+        return !jobsWithLocalSource.isEmpty();
+    }
+
+    @VisibleForTesting
+    Set<Long> getJobsWithLocalSource() {
+        return Collections.unmodifiableSet(jobsWithLocalSource);
+    }
+
+    /**
+     * A job says that the last task its state waits for is reported: run it now (on the nudge thread), if
+     * Config.backup_restore_run_on_task_finish. Only the id of the job is kept: when the nudge is run the job is
+     * looked up again, and it is run only if this frontend is still the master and the job is still the current one
+     * of its database, not done (the object may have been replaced by a replay, or evicted, meanwhile).
+     */
+    public void nudge(long dbId, long jobId) {
+        if (!Config.backup_restore_run_on_task_finish || !nudgePending.add(jobId)) {
+            return;
+        }
+        try {
+            nudgeExecutor.execute(() -> runNudgedJob(dbId, jobId));
+        } catch (RejectedExecutionException e) {
+            nudgePending.remove(jobId);
+            LOG.warn("failed to submit the nudge of job {}, it runs at the next round", jobId, e);
+        }
+    }
+
+    private void runNudgedJob(long dbId, long jobId) {
+        nudgePending.remove(jobId);
+        // as the daemon: only a ready master runs the jobs
+        if (!isInit || env == null || !env.isReady() || !env.isMaster()) {
+            return;
+        }
+        AbstractJob job = getCurrentJob(dbId);
+        if (job == null || job.getJobId() != jobId || job.isDone()) {
+            return;
+        }
+        job.setEnv(env);
+        jobRunLock.lock();
+        try {
+            // looked at again under the lock: the daemon may have run the job to its end meanwhile
+            if (!job.isDone()) {
+                job.run();
+            }
+        } catch (Throwable t) {
+            LOG.warn("failed to run the nudged backup or restore job {}", job, t);
+        } finally {
+            jobRunLock.unlock();
+        }
+    }
+
+    /** Brings the entry of the job in jobsWithLocalSource in line with the state of the job object. */
+    void syncLocalSourceJob(AbstractJob job) {
+        if (job instanceof RestoreJob && !job.isDone()
+                && !((RestoreJob) job).getLocalSourceStagingPartitions().isEmpty()) {
+            jobsWithLocalSource.add(job.getJobId());
+        } else {
+            jobsWithLocalSource.remove(job.getJobId());
+        }
+    }
+
     public List<AbstractJob> getJobs(long dbId, Predicate<String> predicate) {
         jobLock.lock();
         try {
@@ -245,7 +334,15 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
         for (AbstractJob job : getAllCurrentJobs()) {
             job.setEnv(env);
-            job.run();
+            jobRunLock.lock();
+            try {
+                job.run();
+            } catch (Throwable t) {
+                // the other jobs still run this round
+                LOG.warn("failed to run the backup or restore job {}", job, t);
+            } finally {
+                jobRunLock.unlock();
+            }
         }
     }
 
@@ -622,6 +719,12 @@ public class BackupHandler extends MasterDaemon implements Writable {
         BackupJob backupJob = new BackupJob(stmt.getLabel(), db.getId(),
                 ClusterNamespace.getNameFromFullName(db.getFullName()),
                 tblRefs, stmt.getTimeoutMs(), stmt.getContent(), env, repoId, commitSeq);
+        if (stmt.isManifestDigest()) {
+            backupJob.setManifestDigest(true);
+        }
+        if (stmt.isLogicalDigest()) {
+            backupJob.setLogicalDigest(true);
+        }
         // write log
         env.getEditLog().logBackupJob(backupJob);
 
@@ -702,6 +805,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
             }
         }
 
+        restoreJob.setReuseCheckLevel(stmt.getReuseCheckLevel());
         env.getEditLog().logRestoreJob(restoreJob);
 
         // must put to dbIdToBackupOrRestoreJob after edit log, otherwise the state of job may be changed.
@@ -723,6 +827,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
             Deque<AbstractJob> jobs = dbIdToBackupOrRestoreJobs.computeIfAbsent(dbId, k -> Lists.newLinkedList());
             while (jobs.size() >= Config.max_backup_restore_job_num_per_db) {
                 AbstractJob removedJob = jobs.removeFirst();
+                jobsWithLocalSource.remove(removedJob.getJobId());
                 if (removedJob instanceof BackupJob) {
                     removedBackupJobs.add((BackupJob) removedJob);
                 }
@@ -733,6 +838,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
             // Otherwise, the tasks that have been successfully executed will be repeated when replaying edit log.
             if (lastJob != null && (lastJob.isPending() || lastJob.getJobId() == job.getJobId())) {
                 jobs.removeLast();
+                jobsWithLocalSource.remove(lastJob.getJobId());
             }
             jobs.addLast(job);
 
@@ -743,6 +849,8 @@ public class BackupHandler extends MasterDaemon implements Writable {
                     }
                 }
             }
+            // the state of the new object decides, whatever the replaced one was
+            syncLocalSourceJob(job);
         } finally {
             jobLock.unlock();
         }
@@ -1266,6 +1374,24 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
 
         return ((RestoreJob) job).finishTabletDownloadTask(task, request);
+    }
+
+    public boolean handleFinishedRestoreDigestTask(RestoreDigestTask task, TFinishTaskRequest request) {
+        AbstractJob job = getCurrentJob(task.getDbId());
+        if (!(job instanceof RestoreJob)) {
+            LOG.warn("failed to find restore job for task: {}", task);
+            // return true to remove this task from AgentTaskQueue
+            return true;
+        }
+
+        if (job.getJobId() != task.getJobId()) {
+            LOG.warn("invalid restore digest task: {}, job id: {}, task job id: {}", task, job.getJobId(),
+                    task.getJobId());
+            // return true to remove this task from AgentTaskQueue
+            return true;
+        }
+
+        return ((RestoreJob) job).finishRestoreDigestTask(task, request);
     }
 
     public boolean handleDirMoveTask(DirMoveTask task, TFinishTaskRequest request) {

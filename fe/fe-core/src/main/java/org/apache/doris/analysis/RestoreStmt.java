@@ -55,6 +55,7 @@ public class RestoreStmt extends AbstractBackupStmt implements NotFallbackInPars
     public static final String PROP_ATOMIC_RESTORE = "atomic_restore";
     public static final String PROP_FORCE_REPLACE = "force_replace";
     public static final String PROP_STORAGE_VAULT_NAME = "storage_vault_name";
+    public static final String PROP_REUSE_CHECK_LEVEL = "reuse_check_level";
 
     private boolean allowLoad = false;
     private ReplicaAllocation replicaAlloc = ReplicaAllocation.DEFAULT_ALLOCATION;
@@ -71,6 +72,8 @@ public class RestoreStmt extends AbstractBackupStmt implements NotFallbackInPars
     private BackupMeta meta = null;
     private BackupJobInfo jobInfo = null;
     private String storageVaultName = null;
+    // off|sample|full|disable, null means the default of the FE config restore_reuse_default_check_level
+    private String reuseCheckLevel = null;
 
     public RestoreStmt(LabelName labelName, String repoName, AbstractBackupTableRefClause restoreTableRefClause,
             Map<String, String> properties) {
@@ -142,6 +145,10 @@ public class RestoreStmt extends AbstractBackupStmt implements NotFallbackInPars
 
     public boolean isForceReplace() {
         return isForceReplace;
+    }
+
+    public String getReuseCheckLevel() {
+        return reuseCheckLevel;
     }
 
     public String getStorageVaultName() {
@@ -251,6 +258,20 @@ public class RestoreStmt extends AbstractBackupStmt implements NotFallbackInPars
 
         // is force replace
         isForceReplace = eatBooleanProperty(copiedProperties, PROP_FORCE_REPLACE, isForceReplace);
+
+        // check level of partition level reuse
+        if (copiedProperties.containsKey(PROP_REUSE_CHECK_LEVEL)) {
+            String level = copiedProperties.get(PROP_REUSE_CHECK_LEVEL).trim().toLowerCase();
+            if (!level.equals("off") && !level.equals("sample") && !level.equals("full")
+                    && !level.equals("disable")) {
+                ErrorReport.reportAnalysisException(ErrorCode.ERR_COMMON_ERROR,
+                        "Invalid property " + PROP_REUSE_CHECK_LEVEL + " value: "
+                                + copiedProperties.get(PROP_REUSE_CHECK_LEVEL)
+                                + ", expected one of off, sample, full, disable");
+            }
+            reuseCheckLevel = level;
+            copiedProperties.remove(PROP_REUSE_CHECK_LEVEL);
+        }
 
         if (!copiedProperties.isEmpty()) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_COMMON_ERROR,

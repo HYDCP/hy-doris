@@ -37,6 +37,7 @@ import org.apache.doris.thrift.TDisk;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TStorageMedium;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableMap;
@@ -158,6 +159,10 @@ public class Backend implements Writable {
     // And once it back to alive, reset this counter.
     // No need to persist, because only master FE handle heartbeat.
     private int heartbeatFailureCounter = 0;
+
+    // The version of the restore reuse protocol the backend reports in the heartbeat, 0 for an old backend and before
+    // the first heartbeat. Only the master handles it, it is not persisted.
+    private volatile int restoreReuseCapability = 0;
 
     private long nextForceEditlogHeartbeatTime = System.currentTimeMillis() + (new SecureRandom()).nextInt(60 * 1000);
 
@@ -507,6 +512,15 @@ public class Backend implements Writable {
 
     public long getBeMemory() {
         return beMemory;
+    }
+
+    public int getRestoreReuseCapability() {
+        return restoreReuseCapability;
+    }
+
+    @VisibleForTesting
+    public void setRestoreReuseCapability(int restoreReuseCapability) {
+        this.restoreReuseCapability = restoreReuseCapability;
     }
 
     public int getPipelineExecutorSize() {
@@ -908,6 +922,10 @@ public class Backend implements Writable {
             if (this.beMemory != hbResponse.getBeMemory()) {
                 isChanged = true;
                 this.beMemory = hbResponse.getBeMemory();
+            }
+
+            if (!isReplay) {
+                this.restoreReuseCapability = hbResponse.getRestoreReuseCapability();
             }
 
             this.lastUpdateMs = hbResponse.getHbTime();

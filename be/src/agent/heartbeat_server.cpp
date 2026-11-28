@@ -52,6 +52,13 @@ class TProcessor;
 
 namespace doris {
 
+namespace {
+// The version of the restore reuse protocol this BE understands: the RESTORE_DIGEST task, the local source snapshot
+// and the incremental download (1), the version 2 digest of the unique merge on write tables (2), the load of a
+// kept partition by the snapshot task (3, TSnapshotRequest.restore_kept_load). An old BE reports none.
+constexpr int32_t kRestoreReuseCapability = 3;
+} // namespace
+
 HeartbeatServer::HeartbeatServer(ClusterInfo* cluster_info)
         : _engine(ExecEnv::GetInstance()->storage_engine()),
           _cluster_info(cluster_info),
@@ -95,6 +102,9 @@ void HeartbeatServer::heartbeat(THeartbeatResult& heartbeat_result,
         heartbeat_result.backend_info.__set_fragment_last_active_time(
                 get_fragment_last_active_time());
         heartbeat_result.backend_info.__set_be_mem(MemInfo::physical_mem());
+        // The version of the restore reuse protocol of this BE, the FE reuses the local data of a restore only if all
+        // the nodes report it (see RestoreJob.RESTORE_REUSE_CAPABILITY).
+        heartbeat_result.backend_info.__set_restore_reuse_capability(kRestoreReuseCapability);
     }
     watch.stop();
     if (watch.elapsed_time() > 1000L * 1000L * 1000L) {

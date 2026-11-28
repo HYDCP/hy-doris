@@ -1724,6 +1724,21 @@ public class Config extends ConfigBase {
     @ConfField(mutable = true, masterOnly = true)
     public static boolean restore_reset_index_id = false;
 
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "备份时是否为每个 tablet 快照写 manifest（它的完整文件清单，每个 tablet 一个小文件），并把它的根记录在 "
+                    + "job info 里（每个 tablet 约 83 字节）。恢复时用 manifest 校验下载的文件。设为 false 时不写 manifest，"
+                    + "job info 里也没有 manifest 根，恢复这个备份时不做 manifest 校验，与旧版本的备份相同。"
+                    + "默认关闭；恢复时的增量补齐（enable_restore_incremental_append）依赖 manifest，"
+                    + "要用数据复用恢复的备份，请先在源端集群打开。",
+            "Whether a backup writes the manifest of each tablet snapshot (the complete list of its files, one small "
+                    + "file per tablet) and records its root in the job info (about 83 bytes per tablet). The manifest "
+                    + "lets a restore check the downloaded files. If false, no manifest is written and the job info "
+                    + "has no manifest roots, a restore of the backup downloads without the manifest check, as a "
+                    + "backup of an old version does. Disabled by default; the incremental append of a restore "
+                    + "(enable_restore_incremental_append) needs the manifest, so turn it on at the source "
+                    + "cluster before the backups which are to be restored with data reuse."})
+    public static boolean enable_backup_manifest = false;
+
     /**
      * Control the max num of tablets per backup job involved.
      */
@@ -1753,6 +1768,35 @@ public class Config extends ConfigBase {
      */
     @ConfField(mutable = false)
     public static long backup_handler_update_interval_millis = 3000;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "备份或恢复作业到达的状态不需要等待任何任务时（例如保留在本地的备份做完快照后的 UPLOAD_SNAPSHOT、"
+                    + "UPLOADING、SAVE_META、UPLOAD_INFO，恢复做完快照或下载后的 DOWNLOAD、"
+                    + "COMMIT），是否在备份处理器的同一轮里接着推进到下一个状态，而不是每隔 "
+                    + "backup_handler_update_interval_millis 一轮只推进一个状态。"
+                    + "编辑日志的内容和顺序不变。默认关闭（它会改变所有备份恢复作业的推进节奏）；为 false 时与原来一样，"
+                    + "每轮推进一个状态。",
+            "Whether a backup or restore job goes on with the next state in the same round of the backup handler when "
+                    + "the state it reached waits for nothing (for example the backup kept on local after its "
+                    + "snapshots: UPLOAD_SNAPSHOT, UPLOADING, SAVE_META, UPLOAD_INFO; the restore after its snapshots "
+                    + "or its download: DOWNLOAD, COMMIT), instead of one state per round of "
+                    + "backup_handler_update_interval_millis. The edit logs are the same, in the same order. Disabled "
+                    + "by default (it changes the pace of every backup and restore job); if false one state per round, "
+                    + "as before."})
+    public static boolean backup_restore_merge_idle_ticks = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "备份或恢复作业当前状态等待的最后一个任务由 BE 汇报完成后，是否立即再推进一次作业，而不是等备份处理器的下一轮（平均要"
+                    + "等 backup_handler_update_interval_millis 的一半）"
+                    + "。由备份处理器的一个线程在 master 上推进，只推进该数据库当前的作业。默认关闭（它会改变所有备份恢复作业的推进节奏"
+                    + "，并在第一次触发时多启动一个线程）；为 false 时与原来一样，只按轮推进。",
+            "Whether a backup or restore job is run once more as soon as the last task the state waits for is reported "
+                    + "by a backend, instead of at the next round of the backup handler "
+                    + "(backup_handler_update_interval_millis later on average half of it). The run is done by one "
+                    + "thread of the backup handler, on the master, for the current job of the database only. Disabled "
+                    + "by default (it changes the pace of every backup and restore job, and starts one more thread on "
+                    + "the first nudge); if false the job is run by the rounds only, as before."})
+    public static boolean backup_restore_run_on_task_finish = false;
 
 
     /**
@@ -2953,6 +2997,214 @@ public class Config extends ConfigBase {
             "一个 BE 同时执行的恢复任务的并发数",
             "The number of concurrent restore tasks per be"})
     public static int restore_task_concurrency_per_be = 5000;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "是否开启恢复的分区级复用：非原子恢复时，被证明与备份中的分区逻辑相同的本地分区保留本地数据，"
+                    + "跳过它的快照、下载和移动。默认关闭，关闭时恢复的行为与原来相同。",
+            "Whether to enable partition level reuse of restore: for a non-atomic restore, a local partition that is "
+                    + "proved logically equal to the partition in the backup keeps its local data, and its snapshot, "
+                    + "download and move are skipped. Disabled by default, the restore behaves as before if disabled."})
+    public static boolean enable_restore_partition_reuse = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "分区级复用的默认校验档位，可以被恢复属性 reuse_check_level 覆盖："
+                    + "off|sample|full|disable。默认 full：每个复用的分区都由每个副本的摘要证明。"
+                    + "除非 restore_reuse_allow_unverified_keep 为 true，"
+                    + "off 和 sample 都按 full 处理。",
+            "The default check level of partition level reuse, overridden by the restore property reuse_check_level: "
+                    + "off|sample|full|disable. The default is full: every reused partition is proved by the digest of "
+                    + "each replica. Unless restore_reuse_allow_unverified_keep is true, off and sample are taken as "
+                    + "full."})
+    public static String restore_reuse_default_check_level = "full";
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "校验档位 off 和 sample 是否按原意生效。为 false（默认）时按 full 处理，"
+                    + "只有每个副本的摘要都证明了的分区才会保留或增量追加。为 true 时，分区可以不经摘要就保留（off："
+                    + "只凭谱系戳；sample：没有抽中的分区），不保证一致性。只用于实验和观察。",
+            "Whether the check levels off and sample take effect as they are. If false (the default), they are taken "
+                    + "as full, so a partition is kept or appended only if the digest of every replica proves it. If "
+                    + "true, a partition may be kept without a digest (off: by the lineage stamp only, sample: the "
+                    + "partitions not sampled), which gives no consistency guarantee. For experiments and observation "
+                    + "only."})
+    public static boolean restore_reuse_allow_unverified_keep = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "分区级复用是否考虑 Unique 读时合并表。这类表有摘要覆盖不到的隐藏状态（同一个 key 被覆盖的旧版本）"
+                    + "。默认 false：整体下载。为 true 时恢复收窄之前的行为，只用于实验，之后的写入结果不保证与备份一致。"
+                    + "对 Unique 写时合并表无效，见 restore_reuse_mow。",
+            "Whether the unique merge-on-read tables, which have a hidden state that the digest does not cover (the "
+                    + "overwritten versions of a key), are considered by partition level reuse. False by default: they "
+                    + "are downloaded. If true, the behavior before the narrowing is restored, for experiments only, "
+                    + "the data after the following writes is not guaranteed to be consistent with the backup. It has "
+                    + "no effect on the unique merge-on-write tables, see restore_reuse_mow."})
+    public static boolean restore_reuse_allow_hidden_state_models = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "分区级复用是否考虑没有 sequence 列的 Unique 写时合并表。它们的摘要（算法版本 2）"
+                    + "覆盖 delete bitmap 留下的所有行，包括带删除标记的行，也就是之后的写入会读到的全部已有数据。"
+                    + "默认 false：整体下载；备份照样计算并记录摘要。有 sequence 列的表，以及带删除条件（light "
+                    + "delete）的 tablet，永远不复用。要求所有 FE 和 BE 都汇报能力位 2。"
+                    + "写时合并表的算法版本 1 摘要永远不被信任，与 "
+                    + "restore_reuse_allow_hidden_state_models 的取值无关。",
+            "Whether the unique merge-on-write tables without a sequence column are considered by partition level "
+                    + "reuse. Their digest (algorithm version 2) covers the rows that the delete bitmap leaves, the "
+                    + "rows with a delete sign included, which is all that a later write reads of the existing data. "
+                    + "False by default: they are downloaded; the backup computes and records the digest anyway. A "
+                    + "table with a sequence column, or a tablet with a DELETE condition (light delete), is never "
+                    + "reused. All the frontends and backends must report the capability 2. The digest of algorithm "
+                    + "version 1 of a merge-on-write table is never trusted, whatever the value of "
+                    + "restore_reuse_allow_hidden_state_models."})
+    public static boolean restore_reuse_mow = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "原子恢复的增量追加任务或本地来源快照任务失败多少次后取消恢复作业。BE 标明不可重试的错误（前缀 "
+                    + "[RESTORE_NOT_RETRYABLE]）会立即取消作业，拿不到 tablet 锁不计入失败次数。"
+                    + "恢复的其他任务仍与原来一样不限次数地重发。",
+            "The number of failures of an incremental append task or a local source snapshot task of an atomic restore "
+                    + "after which the restore job is cancelled. An error which the backend says can not be retried "
+                    + "(with the prefix [RESTORE_NOT_RETRYABLE]) cancels the job at once, a failure to obtain the "
+                    + "tablet locks is not counted. The other tasks of the restore are resent without a limit as "
+                    + "before."})
+    public static int restore_local_source_task_max_retry = 10;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "sample 档位下要计算摘要的候选分区的比例，至少一个分区。",
+            "The ratio of the candidate partitions to compute the digest for in the sample check level, at least one "
+                    + "partition."})
+    public static double restore_reuse_sample_ratio = 0.1;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "经反向关系或表级关系（而不是本地分区的谱系戳）进入候选的分区，是否无论校验档位如何都用摘要校验。"
+                    + "它们不参与抽样，也不会因为抽样通过就被保留。为 false 时，在 sample 档位下与其他分区一样参与抽样。",
+            "Whether the candidate partitions that come in by the reverse or the table level relation (not by the "
+                    + "lineage stamp of the local partition) are always verified by the digest, whatever the check "
+                    + "level is. They are neither sampled nor kept because the sample passed. If false, they are "
+                    + "sampled as the others in the check level sample."})
+    public static boolean restore_reuse_force_full_for_relation = true;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "参与分区级复用的分区的最小大小（单副本的本地数据量，字节），更小的分区直接下载。默认 0，"
+                    + "所有分区都参与：小分区的摘要校验开销很小，而且按天分区的表的分区经常小于 1 GB。",
+            "The minimum size (local data size of a single replica, in bytes) of a partition to be considered for "
+                    + "partition level reuse, smaller partitions are downloaded. 0 by default, every partition is "
+                    + "considered: the digest check of a small partition costs little, and the partitions of a table "
+                    + "partitioned by day are often smaller than 1 GB."})
+    public static long restore_reuse_min_partition_bytes = 0;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "等待分区级复用的摘要任务的超时时间（秒），超时的分区改为下载。",
+            "The timeout (in seconds) of waiting for the digest tasks of partition level reuse, the partitions timed "
+                    + "out are downloaded."})
+    public static int restore_digest_timeout_s = 3600;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "是否开启恢复的增量追加（还需要打开 enable_restore_partition_reuse）"
+                    + "：本地分区落后于备份中的分区，且它到本地版本为止的数据被证明与备份在该版本逻辑相同时，只下载之后各版本的 rowset "
+                    + "并追加到本地 tablet，而不是整体下载。默认关闭，关闭时恢复的行为与原来相同。",
+            "Whether to enable the incremental append of restore (needs enable_restore_partition_reuse too): a local "
+                    + "partition that is behind the partition in the backup, and whose data up to its version is "
+                    + "proved logically equal to the backup at that version, downloads only the rowsets of the "
+                    + "versions after it and appends them to the local tablets, instead of being downloaded as a "
+                    + "whole. Disabled by default, the restore behaves as before if disabled."})
+    public static boolean enable_restore_incremental_append = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "分区级复用（以及打开时的增量追加）是否也用于原子恢复（还需要打开 "
+                    + "enable_restore_partition_reuse）：被替换的表中被证明与备份逻辑相同的分区，"
+                    + "用被替换表 tablet 的本地快照（硬链接，跨盘时拷贝）放进暂存表，而不是下载。只用于 schema 没有变化、"
+                    + "且暂存副本与被替换表的副本一一绑定的表。这样的分区如果在替换表之前版本变了，恢复失败（被替换的表不受影响）"
+                    + "。默认关闭，关闭时原子恢复的行为与原来相同。",
+            "Whether partition level reuse (and the incremental append, if enabled) also works for an atomic restore "
+                    + "(needs enable_restore_partition_reuse too): the partitions of the table being replaced that are "
+                    + "proved logically equal to the backup are made into the staging table by a local snapshot (hard "
+                    + "links, or a copy on another disk) of the tablets of the table being replaced instead of a "
+                    + "download. Only for a table whose schema is not changed and whose staging replicas are bound to "
+                    + "the replicas of the table being replaced. If the version of such a partition changed before the "
+                    + "tables are replaced, the restore fails (the table being replaced is not touched). Disabled by "
+                    + "default, the atomic restore behaves as before if disabled."})
+    public static boolean enable_restore_atomic_reuse = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "带分区级复用的原子恢复（enable_restore_atomic_reuse）：快照任务是否直接把保留分区的本地数据装"
+                    + "载进暂存 tablet（在 BE 的快照线程池上），让提交阶段的移动任务只做核对。为 false 时由移动任务装载，"
+                    + "它的线程池每个 BE 只有一个线程；两种方式下，保留分区的移动失败都最多重试 "
+                    + "restore_local_source_task_max_retry 次。旧版本的 BE 会忽略它，"
+                    + "仍由移动任务装载。在发送快照任务时读取，修改不影响正在运行的作业。",
+            "Atomic restore with partition level reuse (enable_restore_atomic_reuse): whether the snapshot task loads "
+                    + "the local data of a kept partition into the staging tablet at once (on the snapshot worker pool "
+                    + "of the backend), so that the move task of the commit only checks it. If false the move task "
+                    + "loads it, on the pool of one thread per backend; a failed move of a kept partition is retried "
+                    + "up to restore_local_source_task_max_retry times either way. A backend of an old version ignores "
+                    + "it and loads by the move. Read when the snapshot tasks are sent, a running job is not affected "
+                    + "by a change."})
+    public static boolean restore_reuse_kept_load_at_snapshot = true;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "恢复作业是否只在每个 follower FE（包括 master，不包括 observer）"
+                    + "和每个存活的 BE 都在心跳里汇报了相应能力时，才使用分区级复用（摘要任务、本地来源快照和增量追加）"
+                    + "。旧版本的节点不会汇报，这时作业与原来一样下载全部数据，并记录原因 MIXED_VERSIONS。"
+                    + "只在作业开始决定复用时检查一次。为 false 时跳过检查：作业可能发出旧版本 BE 不认识的任务，"
+                    + "也可能被旧版本 FE 接手，导致作业失败或卡住。只用于实验。",
+            "Whether a restore job uses partition level reuse (the digest tasks, the local source snapshot and the "
+                    + "incremental append) only if every follower frontend (the master included, the observers "
+                    + "excluded) and every alive backend reports the capability of it in the heartbeat. A node of an "
+                    + "old version does not report it, then the job downloads all the data as before and the reason "
+                    + "MIXED_VERSIONS is recorded. It is checked once, when the job starts to decide the reuse. If "
+                    + "false, the check is skipped: a restore job may then send tasks that an old backend does not "
+                    + "know, and be taken over by an old frontend, which fails the job or makes it wait. For "
+                    + "experiments only."})
+    public static boolean restore_reuse_require_capability = true;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "master 是否跟踪分区的状态令牌（见 PartitionStateToken）：可见的事务给它写的每个分区一个令牌，"
+                    + "CCR 增量在延续本地状态时沿用源版本的令牌，恢复沿用备份的令牌。只改变元数据。"
+                    + "只在 master 记录事务日志时读取，回放时不读。为 false（默认）时不写任何新的元数据"
+                    + "（没有新的日志类型，备份里没有令牌），可以回滚到没有这个功能的 FE。为 true 时，只有所有 FE"
+                    + "（包括 observer）都在线且能回放 OP_SET_PARTITION_STATE_TOKEN，备份前才给分区起名并写这种日志；"
+                    + "写过之后要回滚，先关掉它，等每个 FE 的镜像都越过最后一条这种日志，再换回旧版本。",
+            "Whether the master tracks the state token of the partitions (see PartitionStateToken): a transaction "
+                    + "made visible gives each partition it writes a token, a CCR increment adopts the token of the "
+                    + "source version when it continues the local state, and a restore adopts the token of the "
+                    + "backup. It only changes the metadata. Read only when the master logs a transaction, never on "
+                    + "replay. If false (the default) nothing new is persisted (no new kind of log, no token in a "
+                    + "backup), so the frontends can be rolled back to a version without it. If true, a backup names "
+                    + "the partitions and logs OP_SET_PARTITION_STATE_TOKEN only when every frontend, the observers "
+                    + "included, is alive and replays it. To roll back after such a log was written, switch it off "
+                    + "first and wait until the image of every frontend is past the last such log."})
+    public static boolean restore_state_token_track = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "分区级复用在分区的状态令牌与备份分区的相同、版本相同、结构相同时，是否不做摘要直接保留它"
+                    + "（KEPT_STATE_TOKEN）。证据是分区的历史而不是它的内容：依赖一个 tablet 的副本一致，"
+                    + "以及 CCR 按源的原样应用版本。默认关闭。",
+            "Whether partition level reuse keeps a partition without a digest when its state token equals the one "
+                    + "of the backup partition, the versions are equal and the schemas are the same "
+                    + "(KEPT_STATE_TOKEN). The proof is the history of the partition, not its content: it relies on "
+                    + "the replicas of a tablet agreeing and on CCR applying the versions of the source as they are. "
+                    + "Off by default."})
+    public static boolean restore_reuse_trust_state_token = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "备份作业记录逻辑摘要的最大 tablet 数。备份涉及的 tablet 更多时，不让 BE 计算逻辑摘要，"
+                    + "也不把它（以及分解摘要）写进 job info，原因（TOO_MANY_TABLETS）"
+                    + "显示在 SHOW BACKUP 的 LogicalDigest 列，备份照常成功。恢复这样的备份不复用分区。"
+                    + "0（默认）表示不限制。",
+            "The maximum number of tablets of a backup job for which the logical digest is recorded. If a backup "
+                    + "involves more tablets, the backup does not ask the backends to compute the logical digest and "
+                    + "does not write it (nor the decomposed digest) into the job info, the reason (TOO_MANY_TABLETS) "
+                    + "is shown in the column LogicalDigest of SHOW BACKUP, and the backup still succeeds. A restore "
+                    + "of such a backup does not reuse partitions. 0 (the default) means no limit."})
+    public static long backup_logical_digest_max_tablets = 0;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "恢复作业考虑分区级复用时，备份的最大 tablet 数。备份涉及的 tablet 更多时，"
+                    + "作业不复用任何分区（校验档位强制为 disable），与原来一样下载全部数据，并在 SHOW RESTORE 的 "
+                    + "ReuseEstimate 里计入原因 TOO_MANY_TABLETS。0（默认）表示不限制。",
+            "The maximum number of tablets of the backup that a restore job may consider for partition level reuse. If "
+                    + "the backup involves more tablets, the job does not reuse any partition (the check level is "
+                    + "forced to disable), all the data is downloaded as before and the reason TOO_MANY_TABLETS is "
+                    + "counted in the ReuseEstimate of SHOW RESTORE. 0 (the default) means no limit."})
+    public static long restore_reuse_max_tablets = 0;
 
     @ConfField(mutable = true, description = {"执行 agent task 时，BE心跳超过多长时间，认为BE不可用",
             "The time after which BE is considered unavailable if the heartbeat is not received"})

@@ -862,6 +862,14 @@ struct TLoadTxnCommitResult {
     1: required Status.TStatus status
 }
 
+struct TCcrPartitionSource {
+    1: optional i64 target_partition_id
+    2: optional i64 src_partition_id
+    3: optional i64 src_version
+    4: optional string prev_token
+    5: optional string token
+}
+
 struct TCommitTxnRequest {
     1: optional string cluster
     2: optional string user
@@ -879,11 +887,17 @@ struct TCommitTxnRequest {
     13: optional bool txn_insert
     14: optional list<TSubTxnInfo> sub_txn_infos
     15: optional bool only_commit   // only commit txn, without waiting txn publish
+    // restore reuse: the source of each target partition a CCR increment writes, see PartitionStateToken
+    7601: optional list<TCcrPartitionSource> ccr_partition_sources
 }
 
 struct TCommitTxnResult {
     1: optional Status.TStatus status
     2: optional Types.TNetworkAddress master_address
+    // restore reuse: the target partitions of ccr_partition_sources whose state token before the write was not the
+    // one of the source, so they did not continue it. If the transaction is not visible when the commit returns, only
+    // the partitions that no transaction before it is still to change are told, see PartitionStateToken
+    7601: optional list<i64> ccr_not_continuous_partition_ids
 }
 
 struct TLoadTxn2PCRequest {
@@ -1000,6 +1014,10 @@ struct TFrontendPingFrontendResult {
     8: optional list<TDiskInfo> diskInfos
     9: optional i64 processUUID
     10: optional i32 arrowFlightSqlPort
+    // The version of the restore reuse protocol the FE understands, 0 or not set for a FE without it.
+    7601: optional i32 restoreReuseCapability
+    // 1 if the FE replays OP_SET_PARTITION_STATE_TOKEN, 0 or not set for a FE without it.
+    7602: optional i32 partitionStateTokenCapability
 }
 
 struct TPropertyVal {

@@ -522,6 +522,9 @@ void doris_tablet_meta_to_cloud(TabletMetaCloudPB* out, const TabletMetaPB& in) 
     if (in.has_binlog_config()) {
         out->mutable_binlog_config()->CopyFrom(in.binlog_config());
     }
+    if (in.has_restore_stage()) {
+        out->mutable_restore_stage()->CopyFrom(in.restore_stage());
+    }
     out->set_compaction_policy(in.compaction_policy());
     out->set_time_series_compaction_goal_size_mbytes(in.time_series_compaction_goal_size_mbytes());
     out->set_time_series_compaction_file_count_threshold(
@@ -590,6 +593,9 @@ void doris_tablet_meta_to_cloud(TabletMetaCloudPB* out, TabletMetaPB&& in) {
     out->mutable_cooldown_meta_id()->CopyFrom(in.cooldown_meta_id());
     if (in.has_binlog_config()) {
         out->mutable_binlog_config()->Swap(in.mutable_binlog_config());
+    }
+    if (in.has_restore_stage()) {
+        out->mutable_restore_stage()->CopyFrom(in.restore_stage());
     }
     out->set_compaction_policy(in.compaction_policy());
     out->set_time_series_compaction_goal_size_mbytes(in.time_series_compaction_goal_size_mbytes());
@@ -669,6 +675,9 @@ void cloud_tablet_meta_to_doris(TabletMetaPB* out, const TabletMetaCloudPB& in) 
     if (in.has_binlog_config()) {
         out->mutable_binlog_config()->CopyFrom(in.binlog_config());
     }
+    if (in.has_restore_stage()) {
+        out->mutable_restore_stage()->CopyFrom(in.restore_stage());
+    }
     out->set_compaction_policy(in.compaction_policy());
     out->set_time_series_compaction_goal_size_mbytes(in.time_series_compaction_goal_size_mbytes());
     out->set_time_series_compaction_file_count_threshold(
@@ -737,6 +746,9 @@ void cloud_tablet_meta_to_doris(TabletMetaPB* out, TabletMetaCloudPB&& in) {
     out->mutable_cooldown_meta_id()->CopyFrom(in.cooldown_meta_id());
     if (in.has_binlog_config()) {
         out->mutable_binlog_config()->Swap(in.mutable_binlog_config());
+    }
+    if (in.has_restore_stage()) {
+        out->mutable_restore_stage()->CopyFrom(in.restore_stage());
     }
     out->set_compaction_policy(in.compaction_policy());
     out->set_time_series_compaction_goal_size_mbytes(in.time_series_compaction_goal_size_mbytes());

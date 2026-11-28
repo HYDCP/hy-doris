@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <gen_cpp/MasterService_types.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -25,6 +27,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "common/status.h"
 #include "gutil/ref_counted.h"
@@ -37,8 +40,11 @@ class CloudStorageEngine;
 class Thread;
 class ThreadPool;
 class TReportRequest;
+class TSnapshotRequest;
 class TTabletInfo;
 class TAgentTaskRequest;
+class TLogicalDigest;
+struct RestoreDigestDecomposed;
 class ClusterInfo;
 
 class TaskWorkerPoolIf {
@@ -137,11 +143,47 @@ void alter_inverted_index_callback(StorageEngine& engine, const TAgentTaskReques
 
 void check_consistency_callback(StorageEngine& engine, const TAgentTaskRequest& req);
 
+// Computes the logical digest of the tablet at (0, version] (through the digest cache) and converts
+// the outcome to thrift: failures and NOT_SUPPORTED are in status_code / status_msg, root is empty.
+// threads <= 0 means config::restore_digest_threads.
+//
+// If `prefix` is not null, the decomposed digest of the tablet (see RestoreDigestDecomposed) is produced from
+// the same pass over the tablet; prefix->produced tells whether it is valid, reason says why not.
+struct PrefixDigestOutput {
+    bool produced = false;
+    // shared with the digest cache, immutable
+    std::shared_ptr<const RestoreDigestDecomposed> digest;
+    bool from_cache = false;
+    std::string reason;
+};
+TLogicalDigest compute_logical_digest_for_task(StorageEngine& engine, int64_t tablet_id,
+                                               int64_t version, int threads,
+                                               PrefixDigestOutput* prefix = nullptr);
+
+// Lists the files of a snapshot and, if write_manifest, writes its manifest and returns the root; without
+// write_manifest (an older frontend) only lists them. logical_digest (may be nullptr) puts the decomposed digest
+// file into the manifest.
+Status list_snapshot_files_and_write_manifest(const TSnapshotRequest& snapshot_request,
+                                              const std::string& snapshot_path, bool write_manifest,
+                                              const TLogicalDigest* logical_digest,
+                                              std::vector<std::string>* snapshot_files,
+                                              std::string* manifest_root);
+
+void restore_digest_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
+
 void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
 
 void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
 
 void download_callback(CloudStorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
+
+// Lists the files of the snapshot (the tablet_id/schema_hash dir of snapshot_path) into snapshot_files, and if
+// write_manifest, writes the manifest of the snapshot next to it and returns its root in manifest_root. Without
+// write_manifest (an older frontend) the files are only listed: no manifest, no SHA-256, an empty manifest_root.
+Status list_snapshot_files_and_write_manifest(const TSnapshotRequest& snapshot_request,
+                                              const std::string& snapshot_path, bool write_manifest,
+                                              std::vector<std::string>* snapshot_files,
+                                              std::string* manifest_root);
 
 void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req);
 

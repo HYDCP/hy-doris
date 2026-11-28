@@ -19,6 +19,9 @@ package org.apache.doris.clone;
 
 import org.apache.doris.analysis.AdminCancelRebalanceDiskStmt;
 import org.apache.doris.analysis.AdminRebalanceDiskStmt;
+import org.apache.doris.backup.AbstractJob;
+import org.apache.doris.backup.BackupHandler;
+import org.apache.doris.backup.RestoreJob;
 import org.apache.doris.catalog.ColocateGroupSchema;
 import org.apache.doris.catalog.ColocateTableIndex;
 import org.apache.doris.catalog.ColocateTableIndex.GroupId;
@@ -65,6 +68,7 @@ import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TStorageMedium;
 import org.apache.doris.transaction.TransactionState;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.EvictingQueue;
@@ -612,6 +616,17 @@ public class TabletScheduler extends MasterDaemon {
                 }
             }
 
+            // The replicas of a staging partition which an atomic restore loads from a local source are not to be
+            // repaired by clone while the job runs: the clone would replace the data the job loaded. Nothing is
+            // looked up unless a running restore job has such partitions (a lock free check). The state of the table
+            // is not looked at: the atomic replace sets the table NORMAL before the job settles the versions of these
+            // replicas, and the job clears the partitions only after that.
+            if (isLocalSourceStagingPartition(
+                    Env.getCurrentEnv().getBackupHandler(), db.getId(), partition.getId())) {
+                throw new SchedException(Status.UNRECOVERABLE, SubCode.DIAGNOSE_IGNORE,
+                        "partition is loaded from a local source by the restore job");
+            }
+
             if (tabletHealth.status != TabletStatus.VERSION_INCOMPLETE
                     && (partition.getState() != PartitionState.NORMAL || tableState != OlapTableState.NORMAL)
                     && tableState != OlapTableState.WAITING_STABLE) {
@@ -653,6 +668,20 @@ public class TabletScheduler extends MasterDaemon {
         } finally {
             tbl.writeUnlock();
         }
+    }
+
+    /**
+     * Whether the partition is a staging partition which the running restore job of the database loads from a local
+     * source. Takes no lock of the job: it reads the immutable set of the job.
+     */
+    @VisibleForTesting
+    static boolean isLocalSourceStagingPartition(BackupHandler handler, long dbId, long partitionId) {
+        if (handler == null || !handler.hasJobsWithLocalSource()) {
+            return false;
+        }
+        AbstractJob job = handler.getJob(dbId);
+        return job instanceof RestoreJob && !job.isDone()
+                && ((RestoreJob) job).isLocalSourceStagingPartition(partitionId);
     }
 
     private void checkDiskBalanceLastSuccTime(long beId, long pathHash) throws SchedException {
