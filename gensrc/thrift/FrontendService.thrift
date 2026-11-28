@@ -609,6 +609,8 @@ struct TMasterOpRequest {
 
     // temporary table
     1002: optional string sessionId
+    // Downstream extension. Leave upstream forwarding field IDs available for backports.
+    5001: optional i32 tempTableOriginConnectionId
 }
 
 struct TColumnDefinition {
@@ -640,6 +642,9 @@ struct TMasterOpResult {
     9: optional TTxnLoadInfo txnLoadInfo;
     10: optional i64 groupCommitLoadBeId;
     11: optional i64 affectedRows;
+    // Temporary tables registered by this forwarded statement: table ID -> database ID.
+    // Downstream extension. Leave upstream forwarding field IDs available for backports.
+    5001: optional map<i64,i64> createdTemporaryTableDbIds;
 }
 
 struct TUpdateExportTaskStatusRequest {
@@ -967,15 +972,30 @@ struct TFrontendPingFrontendRequest {
    3: optional string deployMode
 }
 
+struct TDropSessionTemporaryTableRequest {
+   1: required i32 clusterId
+   2: required string token
+   3: required string sessionId
+   4: required i64 dbId
+   5: required i64 tableId
+}
+
+struct TDropSessionTemporaryTableResult {
+   1: required Status.TStatus status
+   2: required i64 maxJournalId
+}
+
 struct TFrontendReportAliveSessionRequest {
    1: required i32 clusterId
    2: required string token
+   3: optional i32 connectionId
 }
 
 struct TFrontendReportAliveSessionResult {
    1: required Status.TStatusCode status
    2: required string msg
    3: required list<string> sessionIdList
+   4: optional i32 checkedConnectionId
 }
 
 struct TDiskInfo {
@@ -1013,6 +1033,8 @@ struct TWaitingTxnStatusRequest {
     1: optional i64 db_id
     2: optional i64 txn_id
     3: optional string label
+    // Downstream, read-only check. NOT_FOUND requires confirmation from the ready Master.
+    5001: optional bool checkExpiredTxnForTemporaryTableReset
 }
 
 struct TWaitingTxnStatusResult {
@@ -1884,6 +1906,8 @@ service FrontendService {
     TStreamLoadMultiTablePutResult streamLoadMultiTablePut(1: TStreamLoadPutRequest request)
 
     Status.TStatus snapshotLoaderReport(1: TSnapshotLoaderReportRequest request)
+
+    TDropSessionTemporaryTableResult dropSessionTemporaryTable(1: TDropSessionTemporaryTableRequest request)
 
     TFrontendReportAliveSessionResult getAliveSessions(1: TFrontendReportAliveSessionRequest request)
 

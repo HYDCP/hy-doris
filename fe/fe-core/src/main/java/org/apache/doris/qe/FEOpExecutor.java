@@ -22,7 +22,9 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ClientPool;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
+import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.mysql.MysqlCommand;
 import org.apache.doris.thrift.FrontendService;
 import org.apache.doris.thrift.TExpr;
@@ -64,6 +66,7 @@ public class FEOpExecutor {
 
     protected boolean shouldNotRetry;
     protected boolean moreStmtExists = false;
+    private boolean statementRpcAttempted;
 
     public FEOpExecutor(TNetworkAddress feAddress, OriginStatement originStmt, ConnectContext ctx, boolean isQuery) {
         this.feAddr = feAddress;
@@ -75,8 +78,15 @@ public class FEOpExecutor {
     }
 
     public void execute() throws Exception {
-        result = forward(buildStmtForwardParams());
-        if (ctx.isTxnModel()) {
+        execute(false, true);
+    }
+
+    protected void execute(boolean checkSqlStatus, boolean inheritStatementState) throws Exception {
+        result = forward(inheritStatementState ? buildStmtForwardParams() : buildStmtForwardParams(false));
+        if (checkSqlStatus && getStatusCode() != 0) {
+            throw new DdlException(getErrMsg());
+        }
+        if (inheritStatementState && ctx.isTxnModel()) {
             if (result.isSetTxnLoadInfo()) {
                 ctx.getTxnEntry().setTxnLoadInfoInObserver(result.getTxnLoadInfo());
             } else {
@@ -84,15 +94,27 @@ public class FEOpExecutor {
                 LOG.info("set txn entry to null");
             }
         }
-        if (result.isSetAffectedRows()) {
+        if (inheritStatementState && result.isSetAffectedRows()) {
             ctx.updateReturnRows((int) result.getAffectedRows());
         }
     }
 
+    boolean wasStatementRpcAttempted() {
+        return statementRpcAttempted;
+    }
+
+    protected int getThriftTimeoutMs() throws DdlException {
+        return thriftTimeoutMs;
+    }
+
     public void cancel() throws Exception {
+        sendCancel();
+    }
+
+    protected TMasterOpResult sendCancel() throws Exception {
         TUniqueId queryId = ctx.queryId();
         if (queryId == null) {
-            return;
+            return null;
         }
         Preconditions.checkNotNull(feAddr, "query with id %s is not forwarded to fe", queryId);
         TMasterOpRequest request = new TMasterOpRequest();
@@ -104,7 +126,7 @@ public class FEOpExecutor {
         request.setClientNodePort(Env.getCurrentEnv().getSelfNode().getPort());
         // just make the protocol happy
         request.setSql("");
-        result = forward(request);
+        return forward(request);
     }
 
     // Send request to specific fe
@@ -113,7 +135,7 @@ public class FEOpExecutor {
 
         FrontendService.Client client;
         try {
-            client = ClientPool.frontendPool.borrowObject(feAddr, thriftTimeoutMs);
+            client = ClientPool.frontendPool.borrowObject(feAddr, getThriftTimeoutMs());
         } catch (Exception e) {
             // may throw NullPointerException. add err msg
             throw new Exception("Failed to get master client.", e);
@@ -126,6 +148,9 @@ public class FEOpExecutor {
 
         boolean isReturnToPool = false;
         try {
+            if (!params.isCancelQeury()) {
+                statementRpcAttempted = true;
+            }
             final TMasterOpResult result = client.forward(params);
             isReturnToPool = true;
             return result;
@@ -134,7 +159,7 @@ public class FEOpExecutor {
             forwardMsg.append(" : failed");
             Exception exception = new ForwardToMasterException(forwardMsg.toString(), e);
 
-            boolean ok = ClientPool.frontendPool.reopen(client, thriftTimeoutMs);
+            boolean ok = ClientPool.frontendPool.reopen(client, getThriftTimeoutMs());
             if (!ok) {
                 throw exception;
             }
@@ -160,6 +185,10 @@ public class FEOpExecutor {
     }
 
     protected TMasterOpRequest buildStmtForwardParams() throws AnalysisException {
+        return buildStmtForwardParams(true);
+    }
+
+    protected TMasterOpRequest buildStmtForwardParams(boolean inheritStatementState) throws AnalysisException {
         TMasterOpRequest params = new TMasterOpRequest();
         // node ident
         params.setClientNodeHost(Env.getCurrentEnv().getSelfNode().getHost());
@@ -167,9 +196,12 @@ public class FEOpExecutor {
         params.setSql(originStmt.originStmt);
         params.setStmtIdx(originStmt.idx);
         params.setUser(ctx.getQualifiedUser());
-        params.setDefaultCatalog(ctx.getDefaultCatalog());
-        params.setDefaultDatabase(ctx.getDatabase());
-        params.setDb(ctx.getDatabase());
+        params.setDefaultCatalog(inheritStatementState
+                ? ctx.getDefaultCatalog() : InternalCatalog.INTERNAL_CATALOG_NAME);
+        if (inheritStatementState) {
+            params.setDefaultDatabase(ctx.getDatabase());
+        }
+        params.setDb(inheritStatementState ? ctx.getDatabase() : "");
         params.setUserIp(ctx.getRemoteIP());
         params.setStmtId(ctx.getStmtId());
         params.setCurrentUserIdent(ctx.getCurrentUserIdentity().toThrift());
@@ -192,6 +224,9 @@ public class FEOpExecutor {
         params.setQueryOptions(ctx.getSessionVariable().getQueryOptionVariables());
         // session variables
         params.setSessionVariables(ctx.getSessionVariable().getForwardVariables());
+        if (!inheritStatementState) {
+            return params;
+        }
         params.setUserVariables(getForwardUserVariables(ctx.getUserVars()));
         if (null != ctx.queryId()) {
             params.setQueryId(ctx.queryId());

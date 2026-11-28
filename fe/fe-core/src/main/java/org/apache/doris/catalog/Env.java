@@ -864,17 +864,19 @@ public class Env {
         return sessionReportTimeMap;
     }
 
-    public void registerTempTableAndSession(Table table) {
-        if (ConnectContext.get() != null) {
-            ConnectContext.get().addTempTableToDB(table.getQualifiedDbName(), table.getName());
+    public void registerTempTableAndSession(long dbId, Table table) {
+        String sessionId = Util.getTempTableSessionId(table.getName());
+        ConnectContext context = ConnectContext.get();
+        if (context != null && sessionId.equals(context.getSessionId())) {
+            context.addTemporaryTable(dbId, table.getId());
         }
 
-        refreshSession(Util.getTempTableSessionId(table.getName()));
+        refreshSession(sessionId);
     }
 
     public void unregisterTempTable(Table table) {
         if (ConnectContext.get() != null) {
-            ConnectContext.get().removeTempTableFromDB(table.getQualifiedDbName(), table.getName());
+            ConnectContext.get().removeTemporaryTable(table.getId());
         }
     }
 

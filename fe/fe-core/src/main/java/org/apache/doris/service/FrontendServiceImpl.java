@@ -60,6 +60,7 @@ import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.AuthenticationException;
 import org.apache.doris.common.CaseSensibility;
+import org.apache.doris.common.ClientPool;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.DuplicatedRequestException;
@@ -71,6 +72,7 @@ import org.apache.doris.common.Pair;
 import org.apache.doris.common.PatternMatcher;
 import org.apache.doris.common.PatternMatcherException;
 import org.apache.doris.common.Status;
+import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.common.ThriftServerContext;
 import org.apache.doris.common.ThriftServerEventProcessor;
 import org.apache.doris.common.UserException;
@@ -155,6 +157,8 @@ import org.apache.doris.thrift.TDescribeTablesParams;
 import org.apache.doris.thrift.TDescribeTablesResult;
 import org.apache.doris.thrift.TDropPlsqlPackageRequest;
 import org.apache.doris.thrift.TDropPlsqlStoredProcedureRequest;
+import org.apache.doris.thrift.TDropSessionTemporaryTableRequest;
+import org.apache.doris.thrift.TDropSessionTemporaryTableResult;
 import org.apache.doris.thrift.TEncryptionAlgorithm;
 import org.apache.doris.thrift.TEncryptionKey;
 import org.apache.doris.thrift.TFeResult;
@@ -277,6 +281,8 @@ import org.apache.doris.thrift.TUpdateFollowerPartitionStatsCacheRequest;
 import org.apache.doris.thrift.TUpdateFollowerStatsCacheRequest;
 import org.apache.doris.thrift.TWaitingTxnStatusRequest;
 import org.apache.doris.thrift.TWaitingTxnStatusResult;
+import org.apache.doris.transaction.GlobalTransactionMgr;
+import org.apache.doris.transaction.GlobalTransactionMgrIface;
 import org.apache.doris.transaction.SubTransactionState;
 import org.apache.doris.transaction.TabletCommitInfo;
 import org.apache.doris.transaction.TransactionState;
@@ -315,9 +321,12 @@ import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -331,9 +340,13 @@ public class FrontendServiceImpl implements FrontendService.Iface {
     private static final Logger LOG = LogManager.getLogger(FrontendServiceImpl.class);
 
     private static final String NOT_MASTER_ERR_MSG = "FE is not master";
+    private static final Executor TEMPORARY_TABLE_ORIGIN_CHECK_EXECUTOR = ThreadPoolManager.newDaemonFixedThreadPool(
+            ClientPool.TEMPORARY_TABLE_ORIGIN_CHECK_THREADS, 256, "temporary-table-origin-check", false,
+            new ThreadPoolExecutor.AbortPolicy());
 
     private MasterImpl masterImpl;
     private ExecuteEnv exeEnv;
+    private final Executor temporaryTableOriginCheckExecutor;
     // key is txn id,value is index of plan fragment instance, it's used by multi
     // table request plan
     private ConcurrentHashMap<Long, AtomicInteger> multiTableFragmentInstanceIdIndexMap =
@@ -371,8 +384,13 @@ public class FrontendServiceImpl implements FrontendService.Iface {
     }
 
     public FrontendServiceImpl(ExecuteEnv exeEnv) {
+        this(exeEnv, TEMPORARY_TABLE_ORIGIN_CHECK_EXECUTOR);
+    }
+
+    FrontendServiceImpl(ExecuteEnv exeEnv, Executor temporaryTableOriginCheckExecutor) {
         masterImpl = new MasterImpl();
         this.exeEnv = exeEnv;
+        this.temporaryTableOriginCheckExecutor = temporaryTableOriginCheckExecutor;
     }
 
     @Override
@@ -1255,15 +1273,107 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             proxyQueryIdToConnCtx.put(params.getQueryId(), context);
             clearCallback = () -> proxyQueryIdToConnCtx.remove(params.getQueryId());
         }
-        TMasterOpResult result = processor.proxyExecute(params);
-        if (QueryState.MysqlStateType.ERR.name().equalsIgnoreCase(result.getStatus())) {
-            context.getState().setError(result.getStatus());
-        } else {
-            context.getState().setOk();
+        boolean checkTemporaryTableOrigin = params.isSetTempTableOriginConnectionId();
+        Map<Long, Long> createdTemporaryTables = Collections.emptyMap();
+        TMasterOpResult result;
+        try {
+            result = processor.proxyExecute(params);
+            if (QueryState.MysqlStateType.ERR.name().equalsIgnoreCase(result.getStatus())) {
+                context.getState().setError(result.getStatus());
+            } else {
+                context.getState().setOk();
+            }
+            if (checkTemporaryTableOrigin) {
+                result.setMaxJournalId(Env.getCurrentEnv().getMaxJournalId());
+            }
+        } finally {
+            ConnectContext.remove();
+            clearCallback.run();
+            if (checkTemporaryTableOrigin) {
+                createdTemporaryTables = context.snapshotTemporaryTables();
+                if (!createdTemporaryTables.isEmpty()) {
+                    scheduleLateTemporaryTableCleanup(fe, params.getTempTableOriginConnectionId(),
+                            context.getSessionId(), createdTemporaryTables);
+                }
+            }
         }
-        ConnectContext.remove();
-        clearCallback.run();
+        if (checkTemporaryTableOrigin) {
+            result.setCreatedTemporaryTableDbIds(createdTemporaryTables);
+        }
         return result;
+    }
+
+    private void scheduleLateTemporaryTableCleanup(Frontend origin, int connectionId, String sessionId,
+            Map<Long, Long> tables) {
+        try {
+            temporaryTableOriginCheckExecutor.execute(() -> {
+                try {
+                    cleanupLateTemporaryTables(origin, connectionId, sessionId, tables);
+                } catch (RuntimeException e) {
+                    LOG.warn("Could not finish temporary table cleanup for {}", sessionId, e);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            LOG.warn("Temporary table origin check queue is full, skipping cleanup for session {}", sessionId);
+        }
+    }
+
+    void cleanupLateTemporaryTables(Frontend origin, int connectionId, String sessionId, Map<Long, Long> tables) {
+        if (!isTemporaryTableOriginClosed(origin, connectionId, sessionId)) {
+            return;
+        }
+
+        Env env = Env.getCurrentEnv();
+        if (!env.isMaster()) {
+            return;
+        }
+        InternalCatalog catalog = env.getInternalCatalog();
+        for (Map.Entry<Long, Long> entry : tables.entrySet()) {
+            long tableId = entry.getKey();
+            Database db = catalog.getDbNullable(entry.getValue().longValue());
+            if (db != null) {
+                try {
+                    catalog.dropTemporaryTable(db, tableId, sessionId);
+                } catch (DdlException e) {
+                    LOG.warn("Could not clean late temporary table {} for disconnected session {}", tableId, sessionId,
+                            e);
+                }
+            }
+        }
+    }
+
+    boolean isTemporaryTableOriginClosed(Frontend origin, int connectionId, String sessionId) {
+        TNetworkAddress address = new TNetworkAddress(origin.getHost(), origin.getRpcPort());
+        FrontendService.Client client = null;
+        boolean transportOk = false;
+        try {
+            client = ClientPool.frontendSessionCheckPool.borrowObject(address);
+            Env env = Env.getCurrentEnv();
+            TFrontendReportAliveSessionRequest request = new TFrontendReportAliveSessionRequest(
+                    env.getClusterId(), env.getToken()).setConnectionId(connectionId);
+            TFrontendReportAliveSessionResult result = client.getAliveSessions(request);
+            transportOk = true;
+            return confirmsTemporaryTableOriginClosed(result, connectionId, sessionId);
+        } catch (Exception e) {
+            LOG.warn("Could not verify the origin connection {} on FE {} for temporary tables",
+                    connectionId, address, e);
+            return false;
+        } finally {
+            if (client != null) {
+                if (transportOk) {
+                    ClientPool.frontendSessionCheckPool.returnObject(address, client);
+                } else {
+                    ClientPool.frontendSessionCheckPool.invalidateObject(address, client);
+                }
+            }
+        }
+    }
+
+    static boolean confirmsTemporaryTableOriginClosed(TFrontendReportAliveSessionResult result,
+            int connectionId, String sessionId) {
+        return result.getStatus() == TStatusCode.OK && result.isSetSessionIdList()
+                && result.isSetCheckedConnectionId() && result.getCheckedConnectionId() == connectionId
+                && !result.getSessionIdList().contains(sessionId);
     }
 
     private List<String> getTableNames(String dbName, List<Long> tableIds) throws UserException {
@@ -2402,6 +2512,40 @@ public class FrontendServiceImpl implements FrontendService.Iface {
     }
 
     @Override
+    public TDropSessionTemporaryTableResult dropSessionTemporaryTable(TDropSessionTemporaryTableRequest request) {
+        Env env = Env.getCurrentEnv();
+        TStatus status = checkMaster();
+        TDropSessionTemporaryTableResult result = new TDropSessionTemporaryTableResult(status, 0L);
+        if (status.getStatusCode() != TStatusCode.OK) {
+            return result;
+        }
+        if (!env.isReady()) {
+            status.setStatusCode(TStatusCode.ILLEGAL_STATE);
+            status.addToErrorMsgs("Master catalog is not ready");
+        } else if (request.getClusterId() != env.getClusterId() || Strings.isNullOrEmpty(request.getToken())
+                || !request.getToken().equals(env.getToken())) {
+            status.setStatusCode(TStatusCode.NOT_AUTHORIZED);
+            status.addToErrorMsgs("Invalid FE cluster credentials");
+        } else if (Strings.isNullOrEmpty(request.getSessionId())) {
+            status.setStatusCode(TStatusCode.INVALID_ARGUMENT);
+            status.addToErrorMsgs("Temporary table cleanup requires a session ID");
+        } else {
+            try {
+                InternalCatalog catalog = env.getInternalCatalog();
+                Database db = catalog.getDbNullable(request.getDbId());
+                if (db != null) {
+                    catalog.dropTemporaryTable(db, request.getTableId(), request.getSessionId());
+                }
+                result.setMaxJournalId(env.getMaxJournalId());
+            } catch (DdlException e) {
+                status.setStatusCode(TStatusCode.INTERNAL_ERROR);
+                status.addToErrorMsgs(e.getMessage());
+            }
+        }
+        return result;
+    }
+
+    @Override
     public TFrontendReportAliveSessionResult getAliveSessions(TFrontendReportAliveSessionRequest request)
             throws TException {
         TFrontendReportAliveSessionResult result = new TFrontendReportAliveSessionResult();
@@ -2420,7 +2564,15 @@ public class FrontendServiceImpl implements FrontendService.Iface {
                 result.setMsg("invalid token: " + Env.getCurrentEnv().getToken());
             } else {
                 result.setMsg("success");
-                result.setSessionIdList(env.getAllAliveSessionIds());
+                if (request.isSetConnectionId()) {
+                    ConnectContext context = ExecuteEnv.getInstance().getScheduler()
+                            .getConnectionForTemporaryTableCheck(request.getConnectionId());
+                    result.setCheckedConnectionId(request.getConnectionId());
+                    result.setSessionIdList(context == null || !context.isOpenForTemporaryTableCleanup()
+                            ? Collections.emptyList() : Collections.singletonList(context.getSessionId()));
+                } else {
+                    result.setSessionIdList(env.getAllAliveSessionIds());
+                }
             }
         } else {
             result.setStatus(TStatusCode.ILLEGAL_STATE);
@@ -2524,6 +2676,9 @@ public class FrontendServiceImpl implements FrontendService.Iface {
 
     @Override
     public TWaitingTxnStatusResult waitingTxnStatus(TWaitingTxnStatusRequest request) throws TException {
+        if (request.isCheckExpiredTxnForTemporaryTableReset()) {
+            return checkExpiredTxnForTemporaryTableReset(request);
+        }
         TWaitingTxnStatusResult result = new TWaitingTxnStatusResult();
         result.setStatus(new TStatus());
         try {
@@ -2537,6 +2692,26 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             result.status.addToErrorMsgs(e.getMessage());
         }
         return result;
+    }
+
+    private TWaitingTxnStatusResult checkExpiredTxnForTemporaryTableReset(TWaitingTxnStatusRequest request) {
+        TWaitingTxnStatusResult result = new TWaitingTxnStatusResult();
+        GlobalTransactionMgrIface txnManager = Env.getCurrentGlobalTransactionMgr();
+        if (!(txnManager instanceof GlobalTransactionMgr) || request.getDbId() <= 0 || request.getTxnId() <= 0) {
+            return result.setStatus(new TStatus(TStatusCode.INVALID_ARGUMENT));
+        }
+        try {
+            TransactionStatus status = ((GlobalTransactionMgr) txnManager)
+                    .getTransactionStatusForTemporaryTableReset(request.getDbId(), request.getTxnId());
+            if (status == null) {
+                return result.setStatus(new TStatus(TStatusCode.NOT_FOUND));
+            }
+            return result.setStatus(new TStatus(TStatusCode.OK)).setTxnStatusId(status.value());
+        } catch (AnalysisException e) {
+            TStatus status = new TStatus(TStatusCode.INTERNAL_ERROR);
+            status.addToErrorMsgs(e.getMessage());
+            return result.setStatus(status);
+        }
     }
 
     @Override

@@ -125,6 +125,7 @@ import org.apache.doris.common.util.SqlParserUtils;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.common.util.Util;
 import org.apache.doris.datasource.FileScanNode;
+import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.datasource.jdbc.client.JdbcClientException;
 import org.apache.doris.datasource.tvf.source.TVFScanNode;
 import org.apache.doris.load.EtlJobType;
@@ -159,6 +160,7 @@ import org.apache.doris.nereids.trees.plans.algebra.InlineTable;
 import org.apache.doris.nereids.trees.plans.commands.Command;
 import org.apache.doris.nereids.trees.plans.commands.CreatePolicyCommand;
 import org.apache.doris.nereids.trees.plans.commands.CreateTableCommand;
+import org.apache.doris.nereids.trees.plans.commands.CreateTableLikeCommand;
 import org.apache.doris.nereids.trees.plans.commands.DeleteFromCommand;
 import org.apache.doris.nereids.trees.plans.commands.DeleteFromUsingCommand;
 import org.apache.doris.nereids.trees.plans.commands.Forward;
@@ -636,6 +638,19 @@ public class StmtExecutor {
     }
 
     public void execute(TUniqueId queryId) throws Exception {
+        if (context.isProxy() || context.getConnectType() != ConnectType.MYSQL) {
+            executeStatement(queryId);
+            return;
+        }
+        context.beginStatementExecution();
+        try {
+            executeStatement(queryId);
+        } finally {
+            context.endStatementExecution();
+        }
+    }
+
+    private void executeStatement(TUniqueId queryId) throws Exception {
         SessionVariable sessionVariable = context.getSessionVariable();
         if (context.getConnectType() == ConnectType.ARROW_FLIGHT_SQL) {
             context.setReturnResultFromLocal(true);
@@ -1320,8 +1335,51 @@ public class StmtExecutor {
             LOG.debug("need to transfer to Master. stmt: {}", context.getStmtId());
         }
         masterOpExecutor.setMoreStmtExists(moreStmtExists);
-        masterOpExecutor.execute();
-        recordTempTableOfForwardedDdl();
+        TableName tempTableTarget = getForwardedTemporaryTableTarget();
+        Database originalDb = null;
+        if (tempTableTarget != null) {
+            tempTableTarget.analyze(new Analyzer(context.getEnv(), context));
+            originalDb = getForwardedInternalDatabase(tempTableTarget.getCtl(), tempTableTarget.getDb());
+            masterOpExecutor.trackTemporaryTableCreation();
+        }
+        try {
+            masterOpExecutor.execute();
+        } catch (Exception e) {
+            if (tempTableTarget != null && masterOpExecutor.wasStatementRpcAttempted()
+                    && !masterOpExecutor.recordCreatedTemporaryTables(tempTableTarget)) {
+                long journalId = masterOpExecutor.getAcknowledgedCreateJournalId();
+                // Keep the acknowledgement even when a name resolves: a renamed database may have
+                // left a different table of this session under the original database ID.
+                context.trackUnresolvedTemporaryTable(tempTableTarget, originalDb, journalId);
+                try {
+                    if (journalId >= 0) {
+                        masterOpExecutor.waitOnReplaying();
+                    } else {
+                        new MasterOpExecutor(context).syncJournal();
+                    }
+                    recordForwardedTemporaryTable(tempTableTarget, originalDb);
+                } catch (Exception syncException) {
+                    e.addSuppressed(syncException);
+                }
+            }
+            throw e;
+        }
+        if (tempTableTarget != null) {
+            if (!masterOpExecutor.recordCreatedTemporaryTables(null)) {
+                recordForwardedTemporaryTable(tempTableTarget, originalDb);
+                if (masterOpExecutor.getStatusCode() == 0) {
+                    // A name match in the original database cannot identify which database the Master used.
+                    context.trackUnresolvedTemporaryTable(tempTableTarget, originalDb,
+                            masterOpExecutor.getAcknowledgedCreateJournalId());
+                }
+            }
+        } else if (masterOpExecutor.getStatusCode() == 0 && parsedStmt instanceof DropTableStmt) {
+            DropTableStmt drop = (DropTableStmt) parsedStmt;
+            Database db = getForwardedInternalDatabase(drop.getCatalogName(), drop.getDbName());
+            if (db != null) {
+                context.removeDroppedTemporaryTables(db);
+            }
+        }
         if (parsedStmt instanceof SetStmt) {
             SetStmt setStmt = (SetStmt) parsedStmt;
             setStmt.modifySetVarsForExecute();
@@ -1349,43 +1407,52 @@ public class StmtExecutor {
         }
     }
 
-    // Temporary table ddl is executed on master FE with a proxy ConnectContext, so master FE only
-    // records the temporary table in the proxy session. Record it in the original session on this
-    // follower FE too, otherwise ConnectContext.deleteTempTable() can not find the temporary table
-    // when this session exits and the temporary table would be leaked.
-    private void recordTempTableOfForwardedDdl() {
-        // status code 0 means the forwarded ddl is executed successfully on master FE
-        if (masterOpExecutor.getStatusCode() != 0) {
-            return;
-        }
+    // The owner is the originating FE connection even though the Master executes the DDL.
+    private TableName getForwardedTemporaryTableTarget() {
         if (parsedStmt instanceof LogicalPlanAdapter) {
-            LogicalPlan logicalPlan = ((LogicalPlanAdapter) parsedStmt).getLogicalPlan();
-            if (logicalPlan instanceof CreateTableCommand) {
-                CreateTableInfo createTableInfo = ((CreateTableCommand) logicalPlan).getCreateTableInfo();
-                if (createTableInfo.isTemp()) {
-                    context.addTempTableToDB(createTableInfo.getDbName(),
-                            Util.generateTempTableInnerName(createTableInfo.getTableName()));
+            LogicalPlan plan = ((LogicalPlanAdapter) parsedStmt).getLogicalPlan();
+            if (plan instanceof CreateTableCommand) {
+                CreateTableInfo info = ((CreateTableCommand) plan).getCreateTableInfo();
+                if (info.isTemp()) {
+                    return new TableName(info.getCtlName(), info.getDbName(), info.getTableName());
                 }
+            } else if (plan instanceof CreateTableLikeCommand) {
+                return ((CreateTableLikeCommand) plan).getTemporaryTableTarget();
             }
-        } else if (parsedStmt instanceof CreateTableStmt) {
-            CreateTableStmt createTableStmt = (CreateTableStmt) parsedStmt;
-            if (createTableStmt.isTemp()) {
-                context.addTempTableToDB(getForwardedDdlDbName(createTableStmt.getDbName()),
-                        Util.generateTempTableInnerName(createTableStmt.getTableName()));
+        } else if (parsedStmt instanceof CreateTableLikeStmt) {
+            return getTemporaryLikeTarget((CreateTableLikeStmt) parsedStmt);
+        } else if (parsedStmt instanceof CreateTableAsSelectStmt || parsedStmt instanceof CreateTableStmt) {
+            CreateTableStmt create = parsedStmt instanceof CreateTableStmt ? (CreateTableStmt) parsedStmt
+                    : ((CreateTableAsSelectStmt) parsedStmt).getCreateTableStmt();
+            if (create.isTemp()) {
+                return create.getDbTbl();
             }
-        } else if (parsedStmt instanceof DropTableStmt) {
-            DropTableStmt dropTableStmt = (DropTableStmt) parsedStmt;
-            // the dropped table may be a temporary table created by this session, remove it from the
-            // session's map so that it will not be dropped again when this session exits.
-            context.removeTempTableFromDB(getForwardedDdlDbName(dropTableStmt.getDbName()),
-                    Util.generateTempTableInnerName(dropTableStmt.getTableName()));
+        }
+        return null;
+    }
+
+    private TableName getTemporaryLikeTarget(CreateTableLikeStmt like) {
+        return like.isTemp() ? new TableName(like.getCatalogName(), like.getDbName(), like.getTableName()) : null;
+    }
+
+    private void recordForwardedTemporaryTable(TableName target, Database originalDb) {
+        Database db = originalDb == null ? getForwardedInternalDatabase(target.getCtl(), target.getDb())
+                : context.getEnv().getInternalCatalog().getDbNullable(originalDb.getId());
+        if (db != null) {
+            Table table = db.getTemporaryTableNullable(target.getTbl());
+            if (table != null && context.getSessionId().equals(Util.getTempTableSessionId(table.getName()))) {
+                context.addTemporaryTable(db.getId(), table.getId());
+            }
         }
     }
 
-    // The forwarded ddl stmt is not analyzed on this follower FE, so its db name may be unset,
-    // in which case master FE resolves the table in the session's current database.
-    private String getForwardedDdlDbName(String dbName) {
-        return Strings.isNullOrEmpty(dbName) ? context.getDatabase() : dbName;
+    private Database getForwardedInternalDatabase(String catalogName, String dbName) {
+        String resolvedCatalog = Strings.isNullOrEmpty(catalogName) ? context.getDefaultCatalog() : catalogName;
+        String resolvedDb = Strings.isNullOrEmpty(dbName) ? context.getDatabase() : dbName;
+        if (!InternalCatalog.INTERNAL_CATALOG_NAME.equals(resolvedCatalog) || Strings.isNullOrEmpty(resolvedDb)) {
+            return null;
+        }
+        return context.getEnv().getInternalCatalog().getDbNullable(resolvedDb);
     }
 
     public void updateProfile(boolean isFinished) {

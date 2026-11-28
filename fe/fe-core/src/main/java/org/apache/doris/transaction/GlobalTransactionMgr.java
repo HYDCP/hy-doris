@@ -723,6 +723,20 @@ public class GlobalTransactionMgr implements GlobalTransactionMgrIface {
         }
     }
 
+    // Only a ready Master with the database's transaction manager can confirm an expired ID is absent.
+    public TransactionStatus getTransactionStatusForTemporaryTableReset(long dbId, long transactionId)
+            throws AnalysisException {
+        if (!env.isMaster() || !env.isReady() || env.getInternalCatalog().getDbNullable(dbId) == null) {
+            throw new AnalysisException("Cannot verify expired transaction " + transactionId + " in database " + dbId);
+        }
+        TransactionStatus status = getDatabaseTransactionMgr(dbId)
+                .getTransactionStatusForTemporaryTableReset(transactionId);
+        if (!env.isMaster() || !env.isReady()) {
+            throw new AnalysisException("Master changed while verifying expired transaction " + transactionId);
+        }
+        return status;
+    }
+
     @Override
     public List<TransactionState> getPreCommittedTxnList(Long dbId) throws AnalysisException {
         return getDatabaseTransactionMgr(dbId).getPreCommittedTxnList();

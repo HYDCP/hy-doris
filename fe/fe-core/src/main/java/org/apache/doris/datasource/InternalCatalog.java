@@ -1010,6 +1010,24 @@ public class InternalCatalog implements CatalogIf<Database> {
         }
     }
 
+    public void dropTemporaryTable(Database db, long tableId, String sessionId) throws DdlException {
+        if (!db.writeLockIfExist()) {
+            return;
+        }
+        try {
+            Table table = db.getTableNullable(tableId);
+            if (table == null) {
+                return;
+            }
+            if (!table.isTemporary() || !sessionId.equals(Util.getTempTableSessionId(table.getName()))) {
+                throw new DdlException("Table " + tableId + " is not a temporary table of the closing session");
+            }
+            dropTableInternal(db, table, false, true, null, null);
+        } finally {
+            db.writeUnlock();
+        }
+    }
+
     // drop table without any check.
     public void dropTableWithoutCheck(Database db, Table table, boolean isView, boolean forceDrop) throws DdlException {
         if (!db.writeLockIfExist()) {
@@ -1058,8 +1076,9 @@ public class InternalCatalog implements CatalogIf<Database> {
             table.writeUnlock();
         }
 
-        Env.getCurrentEnv().getQueryStats().clear(Env.getCurrentEnv().getCurrentCatalog().getId(),
-                db.getId(), table.getId());
+        Env env = Env.getCurrentEnv();
+        long catalogId = table.isTemporary() ? getId() : env.getCurrentCatalog().getId();
+        env.getQueryStats().clear(catalogId, db.getId(), table.getId());
         Env.getCurrentEnv().getMtmvService().dropTable(table);
         if (Config.isCloudMode()) {
             ((CloudGlobalTransactionMgr) Env.getCurrentGlobalTransactionMgr())

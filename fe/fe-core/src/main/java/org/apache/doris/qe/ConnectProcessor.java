@@ -34,6 +34,7 @@ import org.apache.doris.cloud.system.CloudSystemInfoService;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.ConnectionException;
+import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.NotImplementedException;
 import org.apache.doris.common.Pair;
@@ -147,9 +148,14 @@ public abstract class ConnectProcessor {
     }
 
     protected void handleResetConnection() {
-        ctx.changeDefaultCatalog(InternalCatalog.INTERNAL_CATALOG_NAME);
-        ctx.clearLastDBOfCatalog();
-        ctx.getState().setOk();
+        try {
+            ctx.resetTemporaryTables();
+            ctx.changeDefaultCatalog(InternalCatalog.INTERNAL_CATALOG_NAME);
+            ctx.clearLastDBOfCatalog();
+            ctx.getState().setOk();
+        } catch (DdlException e) {
+            ctx.getState().setError(e.getMysqlErrorCode(), e.getMessage());
+        }
     }
 
     protected void handleStmtReset() {

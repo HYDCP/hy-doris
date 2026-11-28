@@ -84,6 +84,10 @@ public class CreateTableLikeStmt extends DdlStmt implements NotFallbackInParser 
         return tableName.getTbl();
     }
 
+    public String getCatalogName() {
+        return tableName.getCtl();
+    }
+
     public String getExistedDbName() {
         return existedTableName.getDb();
     }

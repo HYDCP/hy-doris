@@ -78,6 +78,7 @@ public class ConnectPoolMgr {
     }
 
     public void unregisterConnection(ConnectContext ctx) {
+        ctx.onConnectionUnregistering();
         ctx.closeTxn();
         if (connectionMap.remove(ctx.getConnectionId()) != null) {
             AtomicInteger conns = connByUser.get(ctx.getQualifiedUser());

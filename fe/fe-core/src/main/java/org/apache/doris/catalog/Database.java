@@ -478,7 +478,7 @@ public class Database extends MetaObject implements Writable, DatabaseIf<Table>,
                 Env.getCurrentEnv().getMtmvService().registerMTMV((MTMV) olapTable, id);
             }
             if (olapTable.isTemporary()) {
-                Env.getCurrentEnv().registerTempTableAndSession(olapTable);
+                Env.getCurrentEnv().registerTempTableAndSession(id, olapTable);
             }
         }
         olapTable.unmarkDropped();

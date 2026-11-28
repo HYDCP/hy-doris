@@ -17,153 +17,988 @@
 
 package org.apache.doris.qe;
 
+import org.apache.doris.analysis.RedirectStatus;
+import org.apache.doris.analysis.TableName;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.Table;
+import org.apache.doris.common.ClientPool;
+import org.apache.doris.common.DdlException;
+import org.apache.doris.common.ErrorCode;
+import org.apache.doris.common.FeNameFormat;
+import org.apache.doris.common.GenericPool;
+import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.nereids.glue.LogicalPlanAdapter;
+import org.apache.doris.nereids.parser.NereidsParser;
+import org.apache.doris.qe.QueryState.MysqlStateType;
+import org.apache.doris.thrift.FrontendService;
+import org.apache.doris.thrift.TDropSessionTemporaryTableRequest;
+import org.apache.doris.thrift.TDropSessionTemporaryTableResult;
+import org.apache.doris.thrift.TMasterOpRequest;
+import org.apache.doris.thrift.TMasterOpResult;
+import org.apache.doris.thrift.TNetworkAddress;
+import org.apache.doris.thrift.TStatus;
+import org.apache.doris.thrift.TStatusCode;
+import org.apache.doris.thrift.TTxnParams;
+import org.apache.doris.thrift.TWaitingTxnStatusRequest;
+import org.apache.doris.thrift.TWaitingTxnStatusResult;
+import org.apache.doris.transaction.GlobalTransactionMgr;
+import org.apache.doris.transaction.TransactionEntry;
+import org.apache.doris.transaction.TransactionNotFoundException;
+import org.apache.doris.transaction.TransactionState;
+import org.apache.doris.transaction.TransactionStatus;
 
-import mockit.Delegate;
+import com.google.common.collect.ImmutableList;
 import mockit.Expectations;
+import mockit.Injectable;
 import mockit.Invocation;
 import mockit.Mock;
 import mockit.MockUp;
 import mockit.Mocked;
 import mockit.Verifications;
-import org.junit.Assert;
-import org.junit.Test;
+import org.apache.thrift.TApplicationException;
+import org.apache.thrift.TException;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
-import java.util.Optional;
 
-public class ConnectContextTempTableTest {
+class ConnectContextTempTableTest {
+    private static final GenericPool<FrontendService.Client> FRONTEND_POOL = ClientPool.frontendPool;
+
     @Mocked
     private Env env;
+    @Mocked
+    private InternalCatalog catalog;
+    @Mocked
+    private Database db;
 
-    @Test
-    public void testMasterContinuesAfterMissingDatabaseAndTable(@Mocked InternalCatalog catalog,
-            @Mocked Database db, @Mocked Table table) throws Exception {
-        ConnectContext ctx = new ConnectContext();
-        ctx.addTempTableToDB("empty_db", "removed");
-        ctx.removeTempTableFromDB("empty_db", "removed");
-        ctx.addTempTableToDB("dropped_db", "stale");
-        ctx.addTempTableToDB("live_db", "missing");
-        ctx.addTempTableToDB("live_db", "remaining");
-
+    private void mockLocalCatalog(boolean leader) {
         new Expectations() {
             {
                 Env.getCurrentEnv();
                 result = env;
+                minTimes = 0;
                 env.isMaster();
-                result = true;
+                result = leader;
+                minTimes = 0;
                 env.getInternalCatalog();
                 result = catalog;
-                catalog.getDb("dropped_db");
-                result = Optional.empty();
-                catalog.getDb("live_db");
-                result = Optional.of(db);
-                db.getTable("missing");
-                result = Optional.empty();
-                db.getTable("remaining");
-                result = Optional.of(table);
-            }
-        };
-
-        ctx.cleanup();
-
-        new Verifications() {
-            {
-                catalog.getDb("empty_db");
-                times = 0;
-                catalog.dropTableWithoutCheck(db, table, false, true);
-                times = 1;
-                env.unregisterSessionInfo(ctx.getSessionId());
-                times = 1;
+                minTimes = 0;
+                catalog.getDbNullable(10L);
+                result = db;
+                minTimes = 0;
             }
         };
     }
 
     @Test
-    public void testDropCanUnregisterTablesDuringCleanup(@Mocked InternalCatalog catalog,
-            @Mocked Database db, @Mocked Table table) throws Exception {
+    void retriesFailedResetWithoutRepeatingSuccessfulDrops() throws Exception {
+        mockLocalCatalog(true);
         ConnectContext ctx = new ConnectContext();
-        ctx.addTempTableToDB("db", "first");
-        ctx.addTempTableToDB("db", "second");
-        List<String> dropped = new ArrayList<>();
+        String owner = ctx.getSessionId();
+        ctx.addTemporaryTable(10L, 11L);
+        ctx.addTemporaryTable(10L, 12L);
         new Expectations() {
             {
-                Env.getCurrentEnv();
-                result = env;
-                env.isMaster();
-                result = true;
-                env.getInternalCatalog();
-                result = catalog;
-                catalog.getDb("db");
-                result = Optional.of(db);
-                db.getTable(anyString);
-                result = new Delegate<Object>() {
-                    Optional<Table> lookup(String name) {
-                        dropped.add(name);
-                        return Optional.of(table);
-                    }
-                };
-                catalog.dropTableWithoutCheck(db, table, false, true);
-                result = new Delegate<Object>() {
-                    void drop() {
-                        ctx.removeTempTableFromDB("db", dropped.get(dropped.size() - 1));
-                    }
-                };
+                catalog.dropTemporaryTable(db, 11L, owner);
+                result = new DdlException("injected DROP failure");
+                result = null;
                 times = 2;
             }
         };
 
-        ctx.killConnection();
+        ConnectProcessor processor = new MysqlConnectProcessor(ctx);
+        processor.handleResetConnection();
+        Assertions.assertEquals(MysqlStateType.ERR, ctx.getState().getStateType());
+        Assertions.assertEquals(owner, ctx.getSessionId());
+        processor.handleResetConnection();
+        Assertions.assertNotEquals(owner, ctx.getSessionId());
+        Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
 
-        Assert.assertTrue(dropped.contains("first"));
-        Assert.assertTrue(dropped.contains("second"));
+        new Verifications() {
+            {
+                catalog.dropTemporaryTable(db, 12L, owner);
+                times = 1;
+            }
+        };
     }
 
     @Test
-    public void testFollowerForwardsQualifiedNames() {
+    void retainsTemporaryTablesWhenRollbackFails(@Mocked TransactionEntry transaction) throws Exception {
+        mockLocalCatalog(true);
         ConnectContext ctx = new ConnectContext();
-        ctx.setEnv(env);
-        ctx.addTempTableToDB("db_a", "tmp");
-        ctx.addTempTableToDB("db_b", "tmp");
+        ctx.setTxnEntry(transaction);
+        ctx.addTemporaryTable(10L, 11L);
         new Expectations() {
             {
-                Env.getCurrentEnv();
-                result = env;
-                env.isMaster();
-                result = false;
+                transaction.isTxnModel();
+                result = true;
+                transaction.abortTransactionForTemporaryTableReset(anyLong);
+                result = new DdlException("injected rollback failure");
             }
         };
 
-        List<String> sql = new ArrayList<>();
+        new MysqlConnectProcessor(ctx).handleResetConnection();
+        Assertions.assertEquals(MysqlStateType.ERR, ctx.getState().getStateType());
+        Assertions.assertSame(transaction, ctx.getTxnEntry());
+        new Verifications() {
+            {
+                catalog.dropTemporaryTable(db, anyLong, anyString);
+                times = 0;
+            }
+        };
+    }
+
+    @Test
+    void drainsInFlightStatementBeforeCleaningOnce() throws Exception {
+        mockLocalCatalog(true);
+        ConnectContext ctx = new ConnectContext();
+        ctx.addTemporaryTable(10L, 11L);
+        ctx.beginStatementExecution();
+        ctx.onConnectionUnregistering();
+        Assertions.assertTrue(ctx.isOpenForTemporaryTableCleanup());
+        ctx.cleanup();
+        new Verifications() {
+            {
+                catalog.dropTemporaryTable(db, anyLong, anyString);
+                times = 0;
+            }
+        };
+
+        ctx.addTemporaryTable(10L, 12L);
+        ctx.endStatementExecution();
+        Assertions.assertFalse(ctx.isOpenForTemporaryTableCleanup());
+        ctx.cleanup();
+        Assertions.assertThrows(DdlException.class, ctx::beginStatementExecution);
+
+        new Verifications() {
+            {
+                catalog.dropTemporaryTable(db, 11L, ctx.getSessionId());
+                times = 1;
+                catalog.dropTemporaryTable(db, 12L, ctx.getSessionId());
+                times = 1;
+            }
+        };
+    }
+
+    @Test
+    void legacyMasterFallsBackToQualifiedDropAndChecksStatus(@Mocked Table table,
+            @Mocked GenericPool<FrontendService.Client> pool, @Mocked FrontendService.Client client) throws Exception {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.changeDefaultCatalog("external_catalog");
+        ctx.addTemporaryTable(10L, 11L);
+        String internalName = ctx.getSessionId() + FeNameFormat.TEMPORARY_TABLE_SIGN + "tmp";
+        new Expectations() {
+            {
+                FRONTEND_POOL.borrowObject((TNetworkAddress) any, anyInt);
+                result = client;
+                client.dropSessionTemporaryTable((TDropSessionTemporaryTableRequest) any);
+                result = new TApplicationException(TApplicationException.UNKNOWN_METHOD, "old FE");
+                Env.isStoredTableNamesLowerCase();
+                result = true;
+                db.getFullName();
+                result = "other_db";
+                db.getTableNullable(11L);
+                result = table;
+                result = table;
+                result = null;
+                table.isTemporary();
+                result = true;
+                table.getName();
+                result = internalName;
+            }
+        };
+        List<String> sentSql = new ArrayList<>();
+        new MockUp<MasterOpExecutor>() {
+            @Mock
+            public void syncJournal(Invocation invocation) throws DdlException {
+                if (invocation.getInvocationCount() == 2) {
+                    throw new DdlException("legacy follower replay is behind");
+                }
+            }
+
+            @Mock
+            public void executeTemporaryTableDrop(Invocation invocation) throws DdlException {
+                MasterOpExecutor operation = invocation.getInvokedInstance();
+                sentSql.add(operation.originStmt.originStmt);
+                if (sentSql.size() == 1) {
+                    throw new DdlException("injected forwarded error");
+                }
+            }
+        };
+
+        DdlException failure = Assertions.assertThrows(DdlException.class, ctx::resetTemporaryTables);
+        Assertions.assertTrue(failure.getCause().getMessage().contains("injected forwarded error"));
+        Assertions.assertEquals(1, sentSql.size());
+        Assertions.assertEquals("DROP TEMPORARY TABLE IF EXISTS `internal`.`other_db`.`tmp` FORCE",
+                sentSql.get(0));
+
+        ctx.cleanup();
+        Assertions.assertEquals(2, sentSql.size());
+        Assertions.assertEquals(sentSql.get(0), sentSql.get(1));
+        Assertions.assertTrue(ctx.snapshotTemporaryTables().isEmpty());
+    }
+
+    @Test
+    void rejectsResetAfterUncertainCreate() {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.trackUnresolvedTemporaryTable(new TableName("internal", "stage", "tmp"), null, -1L);
+        ctx.trackUnresolvedTemporaryTable(new TableName("internal", "stage", "tmp"), null, 42L);
+        DdlException error = Assertions.assertThrows(DdlException.class, ctx::resetTemporaryTables);
+        Assertions.assertTrue(error.getMessage().contains("unknown"));
+    }
+
+    @Test
+    void followerRetainsRunningTransactionAfterMasterRejectsRollback(
+            @Mocked GenericPool<FrontendService.Client> pool, @Mocked FrontendService.Client client) throws Exception {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.setThreadLocalInfo();
+        TransactionEntry txn = new TransactionEntry();
+        txn.setTxnConf(new TTxnParams().setNeedTxn(true).setTxnId(-1));
+        Deencapsulation.setField(txn, "isTransactionBegan", true);
+        Deencapsulation.setField(txn, "dbId", 10L);
+        Deencapsulation.setField(txn, "transactionId", 19L);
+        Deencapsulation.setField(txn, "timeoutTimestamp", 1L);
+        ctx.setTxnEntry(txn);
+        ctx.addTemporaryTable(10L, 11L);
+        new MockUp<FEOpExecutor>() {
+            @Mock
+            protected TMasterOpRequest buildStmtForwardParams() {
+                return new TMasterOpRequest();
+            }
+
+            @Mock
+            protected TMasterOpResult forward(TMasterOpRequest request) {
+                return new TMasterOpResult().setStatusCode(1105).setErrMessage("injected remote rollback failure");
+            }
+        };
+        new Expectations() {
+            {
+                FRONTEND_POOL.borrowObject((TNetworkAddress) any, anyInt);
+                result = client;
+                client.waitingTxnStatus(new TWaitingTxnStatusRequest().setDbId(10L).setTxnId(19L)
+                        .setCheckExpiredTxnForTemporaryTableReset(true));
+                result = new TWaitingTxnStatusResult().setStatus(new TStatus(TStatusCode.OK))
+                        .setTxnStatusId(TransactionStatus.PREPARE.value());
+                times = 1;
+            }
+        };
+        try {
+            new MysqlConnectProcessor(ctx).handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.ERR, ctx.getState().getStateType());
+            Assertions.assertSame(txn, ctx.getTxnEntry());
+            new Verifications() {
+                {
+                    catalog.getDbNullable(anyLong);
+                    times = 0;
+                }
+            };
+        } finally {
+            ConnectContext.remove();
+        }
+    }
+
+    @Test
+    void masterResetsTwiceAfterExpiredTransactionWasPurged(@Mocked GlobalTransactionMgr txnManager) throws Exception {
+        mockLocalCatalog(true);
+        ConnectContext ctx = new ConnectContext();
+        TransactionEntry txn = new TransactionEntry(new TTxnParams().setNeedTxn(true).setTxnId(-1), db, null);
+        Deencapsulation.setField(txn, "isTransactionBegan", true);
+        Deencapsulation.setField(txn, "dbId", 10L);
+        Deencapsulation.setField(txn, "transactionId", 19L);
+        Deencapsulation.setField(txn, "timeoutTimestamp", 1L);
+        Deencapsulation.setField(txn, "transactionState", new TransactionState());
+        ctx.setTxnEntry(txn);
+        ctx.addTemporaryTable(10L, 11L);
+        String owner = ctx.getSessionId();
+        new Expectations() {
+            {
+                Env.getCurrentGlobalTransactionMgr();
+                result = txnManager;
+                db.getId();
+                result = 10L;
+                txnManager.abortTransaction(10L, 19L, "user rollback");
+                result = new TransactionNotFoundException("transaction not found", 19L);
+                times = 1;
+                txnManager.getTransactionStatusForTemporaryTableReset(10L, 19L);
+                result = null;
+                times = 1;
+                catalog.dropTemporaryTable(db, 11L, owner);
+                times = 1;
+            }
+        };
+
+        assertTwoSuccessfulResets(ctx);
+    }
+
+    @Test
+    void followerResetsTwiceAfterMasterConfirmsTransactionAborted(
+            @Mocked GenericPool<FrontendService.Client> pool, @Mocked FrontendService.Client client) throws Exception {
+        assertFollowerResetsAfterRollbackError(client, false, new TWaitingTxnStatusResult()
+                .setStatus(new TStatus(TStatusCode.OK)).setTxnStatusId(TransactionStatus.ABORTED.value()));
+    }
+
+    @Test
+    void followerResetsTwiceAfterMasterConfirmsExpiredTransactionWasPurged(
+            @Mocked GenericPool<FrontendService.Client> pool, @Mocked FrontendService.Client client) throws Exception {
+        assertFollowerResetsAfterRollbackError(client, true, new TWaitingTxnStatusResult()
+                .setStatus(new TStatus(TStatusCode.NOT_FOUND)));
+    }
+
+    private void assertFollowerResetsAfterRollbackError(FrontendService.Client client, boolean expired,
+            TWaitingTxnStatusResult txnStatus) throws Exception {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.setThreadLocalInfo();
+        TransactionEntry txn = new TransactionEntry();
+        txn.setTxnConf(new TTxnParams().setNeedTxn(true).setTxnId(-1));
+        Deencapsulation.setField(txn, "isTransactionBegan", true);
+        Deencapsulation.setField(txn, "dbId", 10L);
+        Deencapsulation.setField(txn, "transactionId", 19L);
+        ctx.setTxnEntry(txn);
+        TWaitingTxnStatusRequest request = new TWaitingTxnStatusRequest().setDbId(10L).setTxnId(19L);
+        if (expired) {
+            Deencapsulation.setField(txn, "timeoutTimestamp", 1L);
+            request.setCheckExpiredTxnForTemporaryTableReset(true);
+        }
+        ctx.addTemporaryTable(10L, 11L);
+        new MockUp<FEOpExecutor>() {
+            @Mock
+            protected TMasterOpRequest buildStmtForwardParams() {
+                return new TMasterOpRequest();
+            }
+        };
+        new Expectations() {
+            {
+                FRONTEND_POOL.borrowObject((TNetworkAddress) any, anyInt);
+                result = client;
+                client.forward((TMasterOpRequest) any);
+                result = new TMasterOpResult().setStatusCode(1105).setErrMessage("transaction not found");
+                times = 1;
+                client.waitingTxnStatus(request);
+                result = txnStatus;
+                times = 1;
+                client.dropSessionTemporaryTable((TDropSessionTemporaryTableRequest) any);
+                result = new TDropSessionTemporaryTableResult(new TStatus(TStatusCode.OK), 42L);
+                times = 1;
+                env.getJournalObservable().waitOn(42L, anyInt);
+                times = 1;
+            }
+        };
+        try {
+            assertTwoSuccessfulResets(ctx);
+        } finally {
+            ConnectContext.remove();
+        }
+    }
+
+    private void assertTwoSuccessfulResets(ConnectContext ctx) {
+        MysqlConnectProcessor processor = new MysqlConnectProcessor(ctx);
+        processor.handleResetConnection();
+        Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType(), ctx.getState().getErrorMessage());
+        Assertions.assertNull(ctx.getTxnEntry());
+        Assertions.assertTrue(ctx.snapshotTemporaryTables().isEmpty());
+        processor.handleResetConnection();
+        Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
+    }
+
+    @Test
+    void followerDisconnectChecksMasterForCreateAbsentFromLocalReplay() {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.trackUnresolvedTemporaryTable(new TableName("internal", "stage", "late"), null, -1L);
+        List<String> sentSql = new ArrayList<>();
+        new MockUp<MasterOpExecutor>() {
+            @Mock
+            public void executeTemporaryTableDrop(Invocation invocation) {
+                MasterOpExecutor operation = invocation.getInvokedInstance();
+                sentSql.add(operation.originStmt.originStmt);
+            }
+        };
+        ctx.cleanup();
+        Assertions.assertEquals(1, sentSql.size());
+        Assertions.assertEquals("DROP TEMPORARY TABLE IF EXISTS `internal`.`stage`.`"
+                + ctx.getSessionId() + FeNameFormat.TEMPORARY_TABLE_SIGN + "late` FORCE", sentSql.get(0));
+    }
+
+    @Test
+    void disconnectChecksBothPossibleDatabasesAfterRenameAndLostReply() {
+        mockLocalCatalog(false);
+        new Expectations() {
+            {
+                db.getId();
+                result = 10L;
+                db.getFullName();
+                result = "renamed";
+            }
+        };
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.trackUnresolvedTemporaryTable(new TableName("internal", "original", "tmp"), db, -1L);
+        List<String> drops = new ArrayList<>();
+        new MockUp<MasterOpExecutor>() {
+            @Mock
+            public void executeTemporaryTableDrop(Invocation invocation) {
+                MasterOpExecutor operation = invocation.getInvokedInstance();
+                drops.add(operation.originStmt.originStmt);
+            }
+        };
+        ctx.cleanup();
+        String target = "`.`" + ctx.getSessionId() + FeNameFormat.TEMPORARY_TABLE_SIGN + "tmp` FORCE";
+        Assertions.assertEquals(ImmutableList.of("DROP TEMPORARY TABLE IF EXISTS `internal`.`renamed" + target,
+                "DROP TEMPORARY TABLE IF EXISTS `internal`.`original" + target), drops);
+    }
+
+    private StmtExecutor forwardedCreate(ConnectContext ctx) {
+        String sql = "CREATE TEMPORARY TABLE old_db.tmp (id INT)";
+        StmtExecutor executor = new StmtExecutor(ctx, sql);
+        Deencapsulation.setField(executor, "parsedStmt",
+                new LogicalPlanAdapter(new NereidsParser().parseSingle(sql), ctx.getStatementContext()));
+        Deencapsulation.setField(executor, "redirectStatus", RedirectStatus.FORWARD_WITH_SYNC);
+        return executor;
+    }
+
+    @Test
+    void resetCleansForwardedCreateByIdWithStaleDatabaseName(@Mocked GenericPool<FrontendService.Client> pool,
+            @Mocked FrontendService.Client client) throws Exception {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.setThreadLocalInfo();
+        new Expectations() {
+            {
+                env.getClusterId();
+                result = 77;
+                env.getToken();
+                result = "test-token";
+                FRONTEND_POOL.borrowObject((TNetworkAddress) any, anyInt);
+                result = client;
+                client.dropSessionTemporaryTable(new TDropSessionTemporaryTableRequest(77, "test-token",
+                        ctx.getSessionId(), 10L, 11L));
+                result = new TDropSessionTemporaryTableResult(new TStatus(TStatusCode.OK), 43L);
+                env.getJournalObservable().waitOn(43L, anyInt);
+                times = 1;
+            }
+        };
         new MockUp<MasterOpExecutor>() {
             @Mock
             public void execute(Invocation invocation) {
-                MasterOpExecutor executor = invocation.getInvokedInstance();
-                sql.add(executor.originStmt.originStmt);
+                MasterOpExecutor op = invocation.getInvokedInstance();
+                op.result = new TMasterOpResult().setStatusCode(0)
+                        .setCreatedTemporaryTableDbIds(Collections.singletonMap(11L, 10L));
             }
         };
-
-        ctx.cleanup();
-
-        Assert.assertEquals(2, sql.size());
-        Assert.assertTrue(sql.contains("drop table `db_a`.`tmp`"));
-        Assert.assertTrue(sql.contains("drop table `db_b`.`tmp`"));
+        try {
+            Deencapsulation.invoke(forwardedCreate(ctx), "forwardToMaster");
+            Assertions.assertEquals(Collections.singletonMap(11L, 10L), ctx.snapshotTemporaryTables());
+            new MysqlConnectProcessor(ctx).handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
+            Assertions.assertTrue(ctx.snapshotTemporaryTables().isEmpty());
+            new Verifications() {
+                {
+                    db.getFullName();
+                    times = 0;
+                }
+            };
+        } finally {
+            ConnectContext.remove();
+        }
     }
 
     @Test
-    public void testProxyLeavesTablesToCreatingSession() {
-        ConnectContext proxy = new ConnectContext(null, true);
-        proxy.addTempTableToDB("db", "tmp");
+    void resetSucceedsAfterCreateFailedBeforeSendingRpc() throws Exception {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.setThreadLocalInfo();
+        new MockUp<FEOpExecutor>() {
+            @Mock
+            protected TMasterOpRequest buildStmtForwardParams() {
+                return new TMasterOpRequest();
+            }
+        };
+        new Expectations() {
+            {
+                env.checkReadyOrThrow();
+                result = new DdlException("not ready before dispatch");
+                times = 1;
+            }
+        };
+        try {
+            StmtExecutor create = forwardedCreate(ctx);
+            Exception error = Assertions.assertThrows(Exception.class,
+                    () -> Deencapsulation.invoke(create, "forwardToMaster"));
+            Assertions.assertTrue(error.getMessage().contains("not ready before dispatch"));
+            MysqlConnectProcessor processor = new MysqlConnectProcessor(ctx);
+            processor.handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
+        } finally {
+            ConnectContext.remove();
+        }
+    }
 
+    @Test
+    void resetRejectsCreateWhenDispatchedRpcLosesReply(@Mocked GenericPool<FrontendService.Client> pool,
+            @Mocked FrontendService.Client client) throws Exception {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.setThreadLocalInfo();
+        new MockUp<FEOpExecutor>() {
+            @Mock
+            protected TMasterOpRequest buildStmtForwardParams() {
+                return new TMasterOpRequest();
+            }
+        };
+        new Expectations() {
+            {
+                FRONTEND_POOL.borrowObject((TNetworkAddress) any, anyInt);
+                result = client;
+                client.forward((TMasterOpRequest) any);
+                result = new TException("lost CREATE reply");
+                result = new TMasterOpResult().setStatusCode(0);
+            }
+        };
+        try {
+            StmtExecutor create = forwardedCreate(ctx);
+            Exception error = Assertions.assertThrows(Exception.class,
+                    () -> Deencapsulation.invoke(create, "forwardToMaster"));
+            Assertions.assertTrue(error.getMessage().contains("lost CREATE reply"));
+            new MysqlConnectProcessor(ctx).handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.ERR, ctx.getState().getStateType());
+            Assertions.assertTrue(ctx.getState().getErrorMessage().contains("unknown"));
+        } finally {
+            ConnectContext.remove();
+        }
+    }
+
+    @Test
+    void resetWaitsOnceForAllConfirmedDropsAndDoesNotResendThem(@Mocked GenericPool<FrontendService.Client> pool,
+            @Mocked FrontendService.Client client) throws Exception {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.setThreadLocalInfo();
+        new MockUp<FEOpExecutor>() {
+            @Mock
+            protected TMasterOpRequest buildStmtForwardParams() {
+                return new TMasterOpRequest();
+            }
+        };
+        new Expectations() {
+            {
+                FRONTEND_POOL.borrowObject((TNetworkAddress) any, anyInt);
+                result = client;
+                client.forward((TMasterOpRequest) any);
+                result = new TMasterOpResult().setStatusCode(0).setMaxJournalId(42L)
+                        .setCreatedTemporaryTableDbIds(Collections.singletonMap(11L, 10L));
+                client.dropSessionTemporaryTable((TDropSessionTemporaryTableRequest) any);
+                result = new TDropSessionTemporaryTableResult(new TStatus(TStatusCode.OK), 43L);
+                result = new TDropSessionTemporaryTableResult(new TStatus(TStatusCode.OK), 44L);
+                times = 2;
+                env.getJournalObservable().waitOn(42L, anyInt);
+                result = new DdlException("replay is behind");
+                times = 1;
+                env.getJournalObservable().waitOn(44L, anyInt);
+                result = new DdlException("DROP replay is behind");
+                result = null;
+                times = 2;
+            }
+        };
+        try {
+            StmtExecutor create = forwardedCreate(ctx);
+            Exception error = Assertions.assertThrows(Exception.class,
+                    () -> Deencapsulation.invoke(create, "forwardToMaster"));
+            Assertions.assertTrue(error.getMessage().contains("replay is behind"));
+            Assertions.assertEquals(Collections.singletonMap(11L, 10L), ctx.snapshotTemporaryTables());
+            ctx.addTemporaryTable(10L, 12L);
+
+            MysqlConnectProcessor processor = new MysqlConnectProcessor(ctx);
+            processor.handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.ERR, ctx.getState().getStateType());
+            Assertions.assertTrue(ctx.snapshotTemporaryTables().isEmpty());
+            processor.handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
+            Assertions.assertTrue(ctx.snapshotTemporaryTables().isEmpty());
+            new Verifications() {
+                {
+                    env.getJournalObservable().waitOn(43L, anyInt);
+                    times = 0;
+                }
+            };
+        } finally {
+            ConnectContext.remove();
+        }
+    }
+
+    @Test
+    void legacyCreateReplayTimeoutAllowsReuseAfterTableIsFound(@Mocked Table table,
+            @Mocked GenericPool<FrontendService.Client> pool, @Mocked FrontendService.Client client) throws Exception {
+        assertLegacyCreateReplayTimeoutAllowsReuse(new TMasterOpResult().setStatusCode(0), table, client);
+    }
+
+    @Test
+    void legacyDuplicateCreateReplayTimeoutAllowsTwoResets(@Mocked Table table,
+            @Mocked GenericPool<FrontendService.Client> pool, @Mocked FrontendService.Client client) throws Exception {
+        TMasterOpResult duplicate = new TMasterOpResult().setStatusCode(ErrorCode.ERR_TABLE_EXISTS_ERROR.getCode())
+                .setErrMessage("Table 'tmp' already exists");
+        assertLegacyCreateReplayTimeoutAllowsReuse(duplicate, table, client);
+    }
+
+    private void assertLegacyCreateReplayTimeoutAllowsReuse(TMasterOpResult createReply, Table table,
+            FrontendService.Client client) throws Exception {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.setThreadLocalInfo();
+        String owner = ctx.getSessionId();
+        new MockUp<FEOpExecutor>() {
+            @Mock
+            protected TMasterOpRequest buildStmtForwardParams() {
+                return new TMasterOpRequest();
+            }
+
+            @Mock
+            protected TMasterOpRequest buildStmtForwardParams(boolean inheritStatementState) {
+                return new TMasterOpRequest();
+            }
+        };
+        new Expectations() {
+            {
+                FRONTEND_POOL.borrowObject((TNetworkAddress) any, anyInt);
+                result = client;
+                client.forward((TMasterOpRequest) any);
+                result = createReply.setMaxJournalId(42L);
+                result = new TMasterOpResult().setStatusCode(0).setMaxJournalId(43L);
+                env.isReady();
+                result = true;
+                env.getReplayedJournalId();
+                result = 42L;
+                catalog.getDbs();
+                result = Collections.singletonList(db);
+                times = 1;
+                db.getTemporaryTableNullable(owner + FeNameFormat.TEMPORARY_TABLE_SIGN + "tmp");
+                result = table;
+                env.getJournalObservable().waitOn(42L, anyInt);
+                result = new DdlException("CREATE replay timeout");
+                result = null;
+                times = 2;
+                catalog.getDbNullable("old_db");
+                result = db;
+                db.getId();
+                result = 10L;
+                db.getFullName();
+                result = "old_db";
+                db.getTemporaryTableNullable("tmp");
+                result = table;
+                table.getName();
+                result = owner + FeNameFormat.TEMPORARY_TABLE_SIGN + "tmp";
+                table.getId();
+                result = 11L;
+                table.isTemporary();
+                result = true;
+                client.dropSessionTemporaryTable((TDropSessionTemporaryTableRequest) any);
+                result = new TApplicationException(TApplicationException.UNKNOWN_METHOD, "legacy Master");
+                times = 1;
+                db.getTableNullable(11L);
+                result = table;
+                result = null;
+            }
+        };
+        try {
+            StmtExecutor create = forwardedCreate(ctx);
+            Exception error = Assertions.assertThrows(Exception.class,
+                    () -> Deencapsulation.invoke(create, "forwardToMaster"));
+            Assertions.assertTrue(error.getMessage().contains("CREATE replay timeout"));
+            Assertions.assertEquals(createReply.getStatusCode(), create.getProxyStatusCode());
+            Assertions.assertEquals(Collections.singletonMap(11L, 10L), ctx.snapshotTemporaryTables());
+            MysqlConnectProcessor processor = new MysqlConnectProcessor(ctx);
+            processor.handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType(), ctx.getState().getErrorMessage());
+            Assertions.assertNotEquals(owner, ctx.getSessionId());
+            Assertions.assertTrue(ctx.snapshotTemporaryTables().isEmpty());
+            processor.handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
+            new Verifications() {
+                {
+                    client.forward((TMasterOpRequest) any);
+                    times = 3; // CREATE, legacy cleanup sync, and one DROP across both resets
+                }
+            };
+        } finally {
+            ConnectContext.remove();
+        }
+    }
+
+    @Test
+    void successfulLegacyCreateAlsoChecksTheDatabaseThatReusedTheName(@Injectable Database replacementDb,
+            @Injectable Table oldTable, @Injectable Table createdTable) throws Exception {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.setThreadLocalInfo();
+        String owner = ctx.getSessionId();
+        String innerName = owner + FeNameFormat.TEMPORARY_TABLE_SIGN + "tmp";
+        List<Long> dropped = new ArrayList<>();
+        new MockUp<MasterOpExecutor>() {
+            @Mock
+            public void execute(Invocation invocation) {
+                MasterOpExecutor operation = invocation.getInvokedInstance();
+                operation.result = new TMasterOpResult().setStatusCode(0).setMaxJournalId(42L);
+            }
+
+            @Mock
+            boolean tryDropTemporaryTableById(long dbId, long tableId, boolean waitForReplay) {
+                Assertions.assertTrue(waitForReplay);
+                dropped.add(tableId);
+                return true;
+            }
+        };
+        new Expectations() {
+            {
+                catalog.getDbNullable("old_db");
+                result = db;
+                db.getId();
+                result = 10L;
+                db.getTemporaryTableNullable("tmp");
+                result = oldTable;
+                oldTable.getName();
+                result = innerName;
+                oldTable.getId();
+                result = 11L;
+                env.isReady();
+                result = true;
+                env.getReplayedJournalId();
+                result = 42L;
+                catalog.getDbs();
+                result = ImmutableList.of(db, replacementDb);
+                db.getTemporaryTableNullable(innerName);
+                result = oldTable;
+                replacementDb.getTemporaryTableNullable(innerName);
+                result = createdTable;
+                replacementDb.getId();
+                result = 20L;
+                createdTable.getName();
+                result = innerName;
+                createdTable.getId();
+                result = 21L;
+            }
+        };
+        try {
+            Deencapsulation.invoke(forwardedCreate(ctx), "forwardToMaster");
+            Assertions.assertEquals(Collections.singletonMap(11L, 10L), ctx.snapshotTemporaryTables());
+            new MysqlConnectProcessor(ctx).handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
+            Collections.sort(dropped);
+            Assertions.assertEquals(ImmutableList.of(11L, 21L), dropped);
+            Assertions.assertNotEquals(owner, ctx.getSessionId());
+        } finally {
+            ConnectContext.remove();
+        }
+    }
+
+    @Test
+    void retriesLegacyCreateAtItsJournalPositionAfterDatabaseRename(@Injectable Table owned,
+            @Injectable Database reusedDatabaseName, @Injectable Table replacement,
+            @Mocked GenericPool<FrontendService.Client> pool,
+            @Mocked FrontendService.Client client) throws Exception {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.setThreadLocalInfo();
+        String owner = ctx.getSessionId();
+        new MockUp<FEOpExecutor>() {
+            @Mock
+            protected TMasterOpRequest buildStmtForwardParams() {
+                return new TMasterOpRequest();
+            }
+        };
+        new Expectations() {
+            {
+                FRONTEND_POOL.borrowObject((TNetworkAddress) any, anyInt);
+                result = client;
+                client.forward((TMasterOpRequest) any);
+                result = new TMasterOpResult().setStatusCode(0).setMaxJournalId(42L);
+                times = 1;
+                env.getJournalObservable().waitOn(42L, anyInt);
+                result = new DdlException("CREATE replay timeout");
+                result = new DdlException("retry still behind");
+                times = 2;
+                env.isReady();
+                result = true;
+                env.getReplayedJournalId();
+                returns(41L, 42L);
+                catalog.getDbNullable("old_db");
+                result = null;
+                catalog.getDbs();
+                result = ImmutableList.of(db, reusedDatabaseName);
+                times = 1;
+                db.getTemporaryTableNullable(owner + FeNameFormat.TEMPORARY_TABLE_SIGN + "tmp");
+                result = owned;
+                db.getId();
+                result = 10L;
+                owned.getId();
+                result = 11L;
+                owned.getName();
+                result = owner + FeNameFormat.TEMPORARY_TABLE_SIGN + "tmp";
+                reusedDatabaseName.getTemporaryTableNullable(owner + FeNameFormat.TEMPORARY_TABLE_SIGN + "tmp");
+                result = replacement;
+                reusedDatabaseName.getId();
+                result = 20L;
+                replacement.getId();
+                result = 21L;
+                replacement.getName();
+                result = owner + FeNameFormat.TEMPORARY_TABLE_SIGN + "tmp";
+                env.getClusterId();
+                result = 77;
+                env.getToken();
+                result = "test-token";
+                client.dropSessionTemporaryTable(new TDropSessionTemporaryTableRequest(77, "test-token", owner,
+                        10L, 11L));
+                result = new TDropSessionTemporaryTableResult(new TStatus(TStatusCode.OK), 43L);
+                times = 1;
+                client.dropSessionTemporaryTable(new TDropSessionTemporaryTableRequest(77, "test-token", owner,
+                        20L, 21L));
+                result = new TDropSessionTemporaryTableResult(new TStatus(TStatusCode.NOT_MASTER), 0L);
+                result = new TDropSessionTemporaryTableResult(new TStatus(TStatusCode.OK), 44L);
+                times = 2;
+            }
+        };
+        try {
+            Exception error = Assertions.assertThrows(Exception.class,
+                    () -> Deencapsulation.invoke(forwardedCreate(ctx), "forwardToMaster"));
+            Assertions.assertTrue(error.getMessage().contains("CREATE replay timeout"));
+            MysqlConnectProcessor processor = new MysqlConnectProcessor(ctx);
+            processor.handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.ERR, ctx.getState().getStateType());
+            Assertions.assertTrue(ctx.getState().getErrorMessage().contains("42"));
+            Assertions.assertEquals(owner, ctx.getSessionId());
+            processor.handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.ERR, ctx.getState().getStateType());
+            Assertions.assertEquals(owner, ctx.getSessionId());
+            Assertions.assertEquals(Collections.singletonMap(21L, 20L), ctx.snapshotTemporaryTables());
+            processor.handleResetConnection();
+            Assertions.assertEquals(MysqlStateType.OK, ctx.getState().getStateType());
+            Assertions.assertNotEquals(owner, ctx.getSessionId());
+            Assertions.assertTrue(ctx.snapshotTemporaryTables().isEmpty());
+        } finally {
+            ConnectContext.remove();
+        }
+    }
+
+    @Test
+    void disconnectDropsReconciledLegacyTableOnlyOnce(@Injectable Table table) throws Exception {
+        mockLocalCatalog(true);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        String owner = ctx.getSessionId();
+        String innerName = owner + FeNameFormat.TEMPORARY_TABLE_SIGN + "tmp";
+        ctx.addTemporaryTable(10L, 11L);
+        ctx.trackUnresolvedTemporaryTable(new TableName("internal", "old_db", "tmp"), null, 42L);
+        new Expectations() {
+            {
+                env.isReady();
+                result = true;
+                env.getMaxJournalId();
+                result = 42L;
+                catalog.getDbs();
+                result = Collections.singletonList(db);
+                db.getTemporaryTableNullable(innerName);
+                result = table;
+                db.getId();
+                result = 10L;
+                table.getId();
+                result = 11L;
+                table.getName();
+                result = innerName;
+                catalog.dropTemporaryTable(db, 11L, owner);
+                times = 1;
+            }
+        };
+        ctx.cleanup();
+        ctx.cleanup();
+        new Verifications() {
+            {
+                catalog.getDbNullable("old_db");
+                times = 0;
+            }
+        };
+    }
+
+    @Test
+    void disconnectDropsConfirmedIdWithoutWaitingForLocalReplay(@Mocked GenericPool<FrontendService.Client> pool,
+            @Mocked FrontendService.Client client) throws Exception {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.addForwardedTemporaryTables(Collections.singletonMap(11L, 10L), 42L,
+                new TableName("internal", "stale_name", "tmp"));
+        new Expectations() {
+            {
+                FRONTEND_POOL.borrowObject((TNetworkAddress) any, anyInt);
+                result = client;
+                client.dropSessionTemporaryTable((TDropSessionTemporaryTableRequest) any);
+                result = new TDropSessionTemporaryTableResult(new TStatus(TStatusCode.OK), 43L);
+                times = 1;
+            }
+        };
+        ctx.cleanup();
+        Assertions.assertTrue(ctx.snapshotTemporaryTables().isEmpty());
+        new Verifications() {
+            {
+                env.getJournalObservable();
+                times = 0;
+                catalog.getDbNullable(10L);
+                times = 0;
+            }
+        };
+    }
+
+    @Test
+    void masterRejectionKeepsIdWithoutTryingLegacySql(@Mocked GenericPool<FrontendService.Client> pool,
+            @Mocked FrontendService.Client client) throws Exception {
+        mockLocalCatalog(false);
+        ConnectContext ctx = new ConnectContext();
+        ctx.setEnv(env);
+        ctx.addTemporaryTable(10L, 11L);
+        new Expectations() {
+            {
+                FRONTEND_POOL.borrowObject((TNetworkAddress) any, anyInt);
+                result = client;
+                client.dropSessionTemporaryTable((TDropSessionTemporaryTableRequest) any);
+                result = new TDropSessionTemporaryTableResult(new TStatus(TStatusCode.NOT_MASTER), 0L);
+            }
+        };
+        Assertions.assertThrows(DdlException.class, ctx::resetTemporaryTables);
+        Assertions.assertEquals(Collections.singletonMap(11L, 10L), ctx.snapshotTemporaryTables());
+        new Verifications() {
+            {
+                client.forward((TMasterOpRequest) any);
+                times = 0;
+            }
+        };
+    }
+
+    @Test
+    void proxyDoesNotCleanOriginatingSession() throws Exception {
+        ConnectContext proxy = new ConnectContext(null, true, "test-session");
+        proxy.addTemporaryTable(10L, 11L);
         proxy.deleteTempTable();
 
         new Verifications() {
             {
-                env.isMaster();
+                env.getInternalCatalog();
                 times = 0;
             }
         };

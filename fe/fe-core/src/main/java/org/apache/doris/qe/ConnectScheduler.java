@@ -47,6 +47,8 @@ public class ConnectScheduler {
     private final AtomicInteger nextConnectionId;
     private final ConnectPoolMgr connectPoolMgr;
     private final FlightSqlConnectPoolMgr flightSqlConnectPoolMgr;
+    // Connections removed from their pool can still have statements using session objects.
+    private final Map<Integer, ConnectContext> closingConnections = Maps.newConcurrentMap();
 
     // Use a thread to check whether connection is timeout. Because
     // 1. If use a scheduler, the task maybe a huge number when query is messy.
@@ -84,6 +86,19 @@ public class ConnectScheduler {
         context.setConnectionId(nextConnectionId.getAndAdd(1));
         context.resetLoginTime();
         return true;
+    }
+
+    void retainClosingConnection(ConnectContext context) {
+        closingConnections.put(context.getConnectionId(), context);
+    }
+
+    void releaseClosingConnection(ConnectContext context) {
+        closingConnections.remove(context.getConnectionId(), context);
+    }
+
+    public ConnectContext getConnectionForTemporaryTableCheck(int connectionId) {
+        ConnectContext context = getContext(connectionId);
+        return context == null ? closingConnections.get(connectionId) : context;
     }
 
     public ConnectContext getContext(int connectionId) {

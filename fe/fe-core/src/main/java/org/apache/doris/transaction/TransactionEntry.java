@@ -153,6 +153,10 @@ public class TransactionEntry {
         return isTxnModel() && txnConf.getTxnId() == -1;
     }
 
+    public void recordInsertValuesTransactionTimeout(long timeoutSecond) {
+        timeoutTimestamp = System.currentTimeMillis() + timeoutSecond * 1000;
+    }
+
     private boolean isInsertValuesTxnBegan() {
         return isTxnModel() && txnConf.getTxnId() != -1;
     }
@@ -335,6 +339,83 @@ public class TransactionEntry {
 
     public long abortTransaction() throws Exception {
         return abortTransaction("user rollback");
+    }
+
+    public void abortTransactionForTemporaryTableReset(long deadline) throws Exception {
+        if (!isTransactionBegan && isInsertValuesTxnBegan()) {
+            try {
+                new InsertStreamTxnExecutor(this).abortTransactionForTemporaryTableReset(deadline);
+            } catch (Exception e) {
+                confirmTransactionFinishedForTemporaryTableReset(txnConf.getDbId(), txnConf.getTxnId(), deadline, e);
+            }
+            return;
+        }
+        if (!isTransactionBegan || Env.getCurrentEnv().isMaster() || Config.isCloudMode()) {
+            try {
+                if (isTransactionBegan && transactionState == null && !Config.isCloudMode()) {
+                    // A connection retained on a promoted Follower has transaction IDs but no local state.
+                    GlobalTransactionMgr txnManager = (GlobalTransactionMgr) Env.getCurrentGlobalTransactionMgr();
+                    TransactionStatus status = txnManager.getTransactionStatusForTemporaryTableReset(dbId,
+                            transactionId);
+                    if (status == TransactionStatus.ABORTED) {
+                        return;
+                    }
+                    if (status == null) {
+                        throw new TransactionNotFoundException("transaction not found", transactionId);
+                    }
+                    if (status != TransactionStatus.PREPARE && status != TransactionStatus.PRECOMMITTED) {
+                        throw new DdlException("Cannot roll back transaction " + transactionId + " in state " + status);
+                    }
+                    transactionState = txnManager.getTransactionState(dbId, transactionId);
+                    if (transactionState == null) {
+                        throw new TransactionNotFoundException("transaction not found", transactionId);
+                    }
+                }
+                abortTransaction();
+            } catch (TransactionNotFoundException e) {
+                if (!isTransactionBegan) {
+                    throw e;
+                }
+                confirmTransactionFinishedForTemporaryTableReset(dbId, transactionId, deadline, e);
+            }
+            return;
+        }
+        MasterOpExecutor executor = new MasterOpExecutor(new OriginStatement("rollback", 0), ConnectContext.get(),
+                RedirectStatus.NO_FORWARD, false).withTemporaryTableResetDeadline(deadline);
+        try {
+            executor.executeCheckingSqlStatus();
+        } catch (DdlException e) {
+            confirmTransactionFinishedForTemporaryTableReset(dbId, transactionId, deadline, e);
+        }
+    }
+
+    private void confirmTransactionFinishedForTemporaryTableReset(long resetDbId, long resetTxnId,
+            long deadline, Exception rollbackFailure) throws Exception {
+        try {
+            // A missing record is safe only after the original transaction deadline and a ready Master check.
+            boolean checkExpired = resetDbId > 0 && resetTxnId > 0
+                    && timeoutTimestamp > 0 && timeoutTimestamp <= System.currentTimeMillis();
+            if (Env.getCurrentEnv().isMaster() || Config.isCloudMode()) {
+                GlobalTransactionMgrIface txnManager = Env.getCurrentGlobalTransactionMgr();
+                TransactionState state = txnManager.getTransactionState(resetDbId, resetTxnId);
+                if (state != null && state.getTransactionStatus() == TransactionStatus.ABORTED) {
+                    return;
+                }
+                if (checkExpired && txnManager instanceof GlobalTransactionMgr) {
+                    TransactionStatus status = ((GlobalTransactionMgr) txnManager)
+                            .getTransactionStatusForTemporaryTableReset(resetDbId, resetTxnId);
+                    if (status == null || status == TransactionStatus.ABORTED) {
+                        return;
+                    }
+                }
+            } else if (new MasterOpExecutor(ConnectContext.get()).withTemporaryTableResetDeadline(deadline)
+                    .canResetTemporaryTableTransaction(resetDbId, resetTxnId, checkExpired)) {
+                return;
+            }
+        } catch (Exception statusFailure) {
+            rollbackFailure.addSuppressed(statusFailure);
+        }
+        throw rollbackFailure;
     }
 
     private long abortTransaction(String reason) throws Exception {
