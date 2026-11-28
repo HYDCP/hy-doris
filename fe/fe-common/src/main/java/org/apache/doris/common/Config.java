@@ -1754,6 +1754,35 @@ public class Config extends ConfigBase {
     @ConfField(mutable = false)
     public static long backup_handler_update_interval_millis = 3000;
 
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "备份或恢复作业到达的状态不需要等待任何任务时（例如保留在本地的备份做完快照后的 UPLOAD_SNAPSHOT、"
+                    + "UPLOADING、SAVE_META、UPLOAD_INFO，恢复做完快照或下载后的 DOWNLOAD、"
+                    + "COMMIT），是否在备份处理器的同一轮里接着推进到下一个状态，而不是每隔 "
+                    + "backup_handler_update_interval_millis 一轮只推进一个状态。"
+                    + "编辑日志的内容和顺序不变。默认关闭（它会改变所有备份恢复作业的推进节奏）；为 false 时与原来一样，"
+                    + "每轮推进一个状态。",
+            "Whether a backup or restore job goes on with the next state in the same round of the backup handler when "
+                    + "the state it reached waits for nothing (for example the backup kept on local after its "
+                    + "snapshots: UPLOAD_SNAPSHOT, UPLOADING, SAVE_META, UPLOAD_INFO; the restore after its snapshots "
+                    + "or its download: DOWNLOAD, COMMIT), instead of one state per round of "
+                    + "backup_handler_update_interval_millis. The edit logs are the same, in the same order. Disabled "
+                    + "by default (it changes the pace of every backup and restore job); if false one state per round, "
+                    + "as before."})
+    public static boolean backup_restore_merge_idle_ticks = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "备份或恢复作业当前状态等待的最后一个任务由 BE 汇报完成后，是否立即再推进一次作业，而不是等备份处理器的下一轮（平均要"
+                    + "等 backup_handler_update_interval_millis 的一半）"
+                    + "。由备份处理器的一个线程在 master 上推进，只推进该数据库当前的作业。默认关闭（它会改变所有备份恢复作业的推进节奏"
+                    + "，并在第一次触发时多启动一个线程）；为 false 时与原来一样，只按轮推进。",
+            "Whether a backup or restore job is run once more as soon as the last task the state waits for is reported "
+                    + "by a backend, instead of at the next round of the backup handler "
+                    + "(backup_handler_update_interval_millis later on average half of it). The run is done by one "
+                    + "thread of the backup handler, on the master, for the current job of the database only. Disabled "
+                    + "by default (it changes the pace of every backup and restore job, and starts one more thread on "
+                    + "the first nudge); if false the job is run by the rounds only, as before."})
+    public static boolean backup_restore_run_on_task_finish = false;
+
 
     /**
      * Whether to enable cloud restore job.

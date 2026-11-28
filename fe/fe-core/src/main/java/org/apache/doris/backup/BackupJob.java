@@ -309,6 +309,8 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                     taskProgress.remove(task.getSignature());
                     taskErrMsg.remove(task.getSignature());
                     Long oldValue = unfinishedTaskIds.remove(task.getSignature());
+                    // it may be the last task the state waits for, like a finished one
+                    nudgeIfIdle(oldValue != null && unfinishedTaskIds.isEmpty());
                     return oldValue != null;
                 } else {
                     // Not caused by drop, follow original logic
@@ -350,6 +352,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                     info, unfinishedTaskIds.size(), (oldValue != null), this);
         }
 
+        nudgeIfIdle(oldValue != null && unfinishedTaskIds.isEmpty());
         return oldValue != null;
     }
 
@@ -408,6 +411,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             LOG.debug("get finished upload snapshot task, unfinished tasks num: {}, remove result: {}. {}",
                     unfinishedTaskIds.size(), (oldValue != null), this);
         }
+        nudgeIfIdle(oldValue != null && unfinishedTaskIds.isEmpty());
         return oldValue != null;
     }
 
@@ -498,35 +502,59 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             }
         }
 
-        // run job base on current state
-        switch (state) {
-            case PENDING:
-                prepareAndSendSnapshotTask();
+        // run job base on current state. With backup_restore_merge_idle_ticks the next state is run in this round
+        // as well when the state reached waits for nothing (status is not reset: a failure ends the round as before).
+        int steps = 0;
+        do {
+            BackupJobState before = state;
+            switch (state) {
+                case PENDING:
+                    prepareAndSendSnapshotTask();
+                    break;
+                case SNAPSHOTING:
+                    waitingAllSnapshotsFinished();
+                    break;
+                case UPLOAD_SNAPSHOT:
+                    uploadSnapshot();
+                    break;
+                case UPLOADING:
+                    waitingAllUploadingFinished();
+                    break;
+                case SAVE_META:
+                    saveMetaInfo(false);
+                    break;
+                case UPLOAD_INFO:
+                    uploadMetaAndJobInfoFile();
+                    break;
+                default:
+                    break;
+            }
+            if (!Config.backup_restore_merge_idle_ticks || !status.ok() || state == before || isWaitingState()
+                    || ++steps >= MAX_MERGED_STEPS_BACKUP) {
                 break;
-            case SNAPSHOTING:
-                waitingAllSnapshotsFinished();
-                break;
-            case UPLOAD_SNAPSHOT:
-                uploadSnapshot();
-                break;
-            case UPLOADING:
-                waitingAllUploadingFinished();
-                break;
-            case SAVE_META:
-                saveMetaInfo(false);
-                break;
-            case UPLOAD_INFO:
-                uploadMetaAndJobInfoFile();
-                break;
-            default:
-                break;
-        }
+            }
+            LOG.info("go on with state {} in the same round. {}", state, this);
+        } while (true);
 
         // we don't want to cancel the job if we already in state UPLOAD_INFO,
         // which is the final step of backup job. just retry it.
         // if it encounters some unrecoverable errors, just retry it until timeout.
         if (!status.ok() && state != BackupJobState.UPLOAD_INFO) {
             cancelInternal();
+        }
+    }
+
+    // Whether the state waits for the backends (or is done): the next round looks again, nothing to run now.
+    private boolean isWaitingState() {
+        switch (state) {
+            case SNAPSHOTING:
+            case UPLOADING:
+                return !unfinishedTaskIds.isEmpty();
+            case FINISHED:
+            case CANCELLED:
+                return true;
+            default:
+                return false;
         }
     }
 

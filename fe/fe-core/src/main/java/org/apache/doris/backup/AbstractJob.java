@@ -53,6 +53,20 @@ public abstract class AbstractJob implements Writable {
     @SerializedName("t")
     protected JobType type;
 
+    // With Config.backup_restore_merge_idle_ticks, the most states run() goes through in one round: the states
+    // after the snapshots of a backup (UPLOAD_SNAPSHOT, UPLOADING, SAVE_META, UPLOAD_INFO, FINISHED), and of a
+    // restore the states from the snapshots to the commit (DOWNLOAD, DOWNLOADING, COMMIT, COMMITTING).
+    protected static final int MAX_MERGED_STEPS_BACKUP = 5;
+    protected static final int MAX_MERGED_STEPS_RESTORE = 4;
+
+    // The last task the state waits for is reported: ask the backup handler to run the job now (see
+    // Config.backup_restore_run_on_task_finish), instead of at its next round.
+    protected void nudgeIfIdle(boolean idle) {
+        if (idle && env != null && env.getBackupHandler() != null) {
+            env.getBackupHandler().nudge(dbId, jobId);
+        }
+    }
+
     // must be set right before job's running
     protected Env env;
     // repo will be set at first run()
