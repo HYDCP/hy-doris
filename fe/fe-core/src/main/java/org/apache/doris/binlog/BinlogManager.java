@@ -616,9 +616,11 @@ public class BinlogManager {
             return null;
         }
 
+        // Read the limit once, so that all dbs in this round use the same valid value.
+        int maxExpiredNum = Config.max_binlog_gc_num_per_round;
         List<BinlogTombstone> tombstones = Lists.newArrayList();
         for (DBBinlog dbBinlog : gcDbBinlogMap.values()) {
-            BinlogTombstone dbTombstones = dbBinlog.gc();
+            BinlogTombstone dbTombstones = dbBinlog.gc(maxExpiredNum);
             if (dbTombstones != null) {
                 tombstones.add(dbTombstones);
             }
@@ -662,14 +664,9 @@ public class BinlogManager {
     }
 
     public void removeTable(long dbId, long tableId) {
-        lock.writeLock().lock();
-        try {
-            DBBinlog dbBinlog = dbBinlogMap.get(dbId);
-            if (dbBinlog != null) {
-                dbBinlog.removeTable(tableId);
-            }
-        } finally {
-            lock.writeLock().unlock();
+        DBBinlog dbBinlog = getDbBinlog(dbId);
+        if (dbBinlog != null) {
+            dbBinlog.removeTable(tableId);
         }
     }
 

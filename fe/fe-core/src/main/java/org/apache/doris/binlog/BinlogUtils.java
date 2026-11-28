@@ -140,7 +140,9 @@ public class BinlogUtils {
             }
             ++expiredNum;
         }
-        list.subList(0, expiredNum).clear();
+        if (expiredNum > 0) {
+            list.subList(0, expiredNum).clear();
+        }
         return expiredNum;
     }
 }

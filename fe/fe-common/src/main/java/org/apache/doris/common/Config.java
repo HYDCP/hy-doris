@@ -2620,14 +2620,14 @@ public class Config extends ConfigBase {
         "Set the maximum byte length of binlog message"})
     public static int max_binlog_messsage_size = 1024 * 1024 * 1024;
 
-    @ConfField(mutable = true, masterOnly = true, description = {
+    @ConfField(mutable = true, masterOnly = true, minValue = 1, description = {
             "单轮 binlog GC 中，一个库或一张表最多回收的 binlog 条数，剩余的过期 binlog 留到后续轮次回收，"
-                    + "避免一次回收大量 binlog 时长时间持有 binlog 锁。必须大于 0。",
+                    + "避免一次回收大量 binlog 时长时间持有 binlog 锁。最小值为 1。",
             "The max number of binlogs recycled for one db or table in a single round of binlog gc. "
                     + "The remaining expired binlogs are recycled in later rounds, so that the binlog lock "
                     + "is not held for a long time when a large number of binlogs expire at once. "
-                    + "Must be greater than 0."})
-    public static long max_binlog_gc_num_per_round = 100000;
+                    + "The minimum value is 1."})
+    public static volatile int max_binlog_gc_num_per_round = 100000;
 
     @ConfField(mutable = true, masterOnly = true, description = {
             "是否禁止使用 WITH RESOURCE 语句创建 Catalog。",

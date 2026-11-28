@@ -38,6 +38,7 @@ public class ConfigBaseTest {
     public TemporaryFolder temporaryFolder = new TemporaryFolder();
 
     private int savedCapacity;
+    private int savedBinlogGcNum;
     private Class<? extends ConfigBase> savedConfClass;
     private Map<String, Field> savedConfFields;
     private Field confFileField;
@@ -48,6 +49,7 @@ public class ConfigBaseTest {
     @Before
     public void setUp() throws Exception {
         savedCapacity = Config.tablet_health_check_host_set_initial_capacity;
+        savedBinlogGcNum = Config.max_binlog_gc_num_per_round;
         savedConfClass = ConfigBase.confClass;
         savedConfFields = ConfigBase.confFields;
         confFileField = ConfigBase.class.getDeclaredField("confFile");
@@ -62,6 +64,7 @@ public class ConfigBaseTest {
     @After
     public void tearDown() throws Exception {
         Config.tablet_health_check_host_set_initial_capacity = savedCapacity;
+        Config.max_binlog_gc_num_per_round = savedBinlogGcNum;
         ConfigBase.confClass = savedConfClass;
         ConfigBase.confFields = savedConfFields;
         confFileField.set(null, savedConfFile);
@@ -137,6 +140,26 @@ public class ConfigBaseTest {
         } finally {
             Config.max_backup_tablets_per_job = previous;
         }
+    }
+
+    @Test
+    public void testBinlogGcNumPerRoundRejectsNonPositive() throws Exception {
+        String key = "max_binlog_gc_num_per_round";
+        Assert.assertEquals(100000, Config.max_binlog_gc_num_per_round);
+        for (String value : new String[] {"0", "-1", "2147483648"}) {
+            Assert.assertThrows(ConfigException.class, () -> ConfigBase.setMutableConfig(key, value));
+            Assert.assertEquals(100000, Config.max_binlog_gc_num_per_round);
+
+            File file = temporaryFolder.newFile("binlog-gc-" + value + ".conf");
+            Files.write(file.toPath(), (key + "=" + value + "\n").getBytes(StandardCharsets.UTF_8));
+            Assert.assertThrows(IllegalArgumentException.class, () -> new Config().init(file.getAbsolutePath()));
+            Assert.assertEquals(100000, Config.max_binlog_gc_num_per_round);
+            Assert.assertThrows(IllegalArgumentException.class,
+                    () -> new Config().initCustom(file.getAbsolutePath()));
+            Assert.assertEquals(100000, Config.max_binlog_gc_num_per_round);
+        }
+        ConfigBase.setMutableConfig(key, "1");
+        Assert.assertEquals(1, Config.max_binlog_gc_num_per_round);
     }
 
     private String writeCapacity(String name, String value) throws Exception {

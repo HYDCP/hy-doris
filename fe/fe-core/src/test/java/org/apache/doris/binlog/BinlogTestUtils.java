@@ -31,6 +31,8 @@ public class BinlogTestUtils {
 
     public static final long MAX_BYTES = 0x7fffffffffffffffL;
     public static final long MAX_HISTORY_NUMS = 0x7fffffffffffffffL;
+    // no limit of the number of binlogs recycled in a gc round
+    public static final long NO_GC_LIMIT = Long.MAX_VALUE;
 
     public static BinlogConfig newTestBinlogConfig(boolean enableBinlog, long expiredTime) {
         return new BinlogConfig(enableBinlog, expiredTime, MAX_BYTES, MAX_HISTORY_NUMS);

@@ -17,7 +17,6 @@
 
 package org.apache.doris.binlog;
 
-import org.apache.doris.common.Config;
 import org.apache.doris.thrift.TBinlog;
 
 import com.google.common.collect.Lists;
@@ -78,7 +77,7 @@ public class TableBinlogTest {
         }
 
         // trigger ttlGc
-        BinlogTombstone tombstone = tableBinlog.gc();
+        BinlogTombstone tombstone = tableBinlog.gc(BinlogTestUtils.NO_GC_LIMIT);
 
         // check binlog status
         for (TBinlog binlog : testBinlogs) {
@@ -182,7 +181,7 @@ public class TableBinlogTest {
         }
 
         // trigger gc
-        BinlogTombstone tombstone = tableBinlog.gc();
+        BinlogTombstone tombstone = tableBinlog.gc(BinlogTestUtils.NO_GC_LIMIT);
 
         // check binlog status - all binlogs should be cleared when table binlog is disabled
         for (TBinlog binlog : testBinlogs) {
@@ -237,7 +236,7 @@ public class TableBinlogTest {
         }
 
         // trigger gc
-        BinlogTombstone tombstone = tableBinlog.gc();
+        BinlogTombstone tombstone = tableBinlog.gc(BinlogTestUtils.NO_GC_LIMIT);
 
         // check binlog status - only expired binlogs should be cleared
         for (TBinlog binlog : testBinlogs) {
@@ -272,38 +271,30 @@ public class TableBinlogTest {
         List<TBinlog> testBinlogs = newTestBinlogs();
         TableBinlog tableBinlog = newTableBinlog(binlogConfigCache, testBinlogs);
 
-        long oldLimit = Config.max_binlog_gc_num_per_round;
-        Config.max_binlog_gc_num_per_round = 4;
-        try {
-            // recycled in 3 rounds: 4 + 4 + 2
-            long[] expectedCommitSeqs = {baseNum + 3, baseNum + 7, baseNum + totalBinlogNum - 1};
-            for (long expectedCommitSeq : expectedCommitSeqs) {
-                BinlogTombstone tombstone = tableBinlog.gc();
-                Assert.assertFalse(tombstone.isDbBinlogTomstone());
-                Assert.assertEquals(expectedCommitSeq, tombstone.getCommitSeq());
-                Assert.assertEquals(expectedCommitSeq, tableBinlog.getDummyBinlog().getCommitSeq());
-                for (TBinlog binlog : testBinlogs) {
-                    Assert.assertEquals(binlog.getCommitSeq() <= expectedCommitSeq ? 0 : 1, binlog.getTableRef());
-                }
+        // recycled in 3 rounds: 4 + 4 + 2
+        long[] expectedCommitSeqs = {baseNum + 3, baseNum + 7, baseNum + totalBinlogNum - 1};
+        for (long expectedCommitSeq : expectedCommitSeqs) {
+            BinlogTombstone tombstone = tableBinlog.gc(4);
+            Assert.assertFalse(tombstone.isDbBinlogTomstone());
+            Assert.assertEquals(expectedCommitSeq, tombstone.getCommitSeq());
+            Assert.assertEquals(expectedCommitSeq, tableBinlog.getDummyBinlog().getCommitSeq());
+            for (TBinlog binlog : testBinlogs) {
+                Assert.assertEquals(binlog.getCommitSeq() <= expectedCommitSeq ? 0 : 1, binlog.getTableRef());
             }
-            Assert.assertNull(tableBinlog.gc());
+        }
+        Assert.assertNull(tableBinlog.gc(4));
 
-            // a non-positive limit fails the gc instead of stopping it silently
-            Config.max_binlog_gc_num_per_round = 0;
-            TableBinlog invalidLimitTableBinlog = newTableBinlog(binlogConfigCache, newTestBinlogs());
-            Assert.assertThrows(IllegalArgumentException.class, invalidLimitTableBinlog::gc);
+        // a non-positive limit is a bug of the caller
+        TableBinlog invalidLimitTableBinlog = newTableBinlog(binlogConfigCache, newTestBinlogs());
+        Assert.assertThrows(IllegalArgumentException.class, () -> invalidLimitTableBinlog.gc(0));
 
-            // the replay is not limited
-            Config.max_binlog_gc_num_per_round = 1;
-            List<TBinlog> replayBinlogs = newTestBinlogs();
-            TableBinlog replayTableBinlog = newTableBinlog(binlogConfigCache, replayBinlogs);
-            replayTableBinlog.replayGc(baseNum + 7);
-            Assert.assertEquals(baseNum + 7, replayTableBinlog.getDummyBinlog().getCommitSeq());
-            for (TBinlog binlog : replayBinlogs) {
-                Assert.assertEquals(binlog.getCommitSeq() <= baseNum + 7 ? 0 : 1, binlog.getTableRef());
-            }
-        } finally {
-            Config.max_binlog_gc_num_per_round = oldLimit;
+        // the replay is not limited
+        List<TBinlog> replayBinlogs = newTestBinlogs();
+        TableBinlog replayTableBinlog = newTableBinlog(binlogConfigCache, replayBinlogs);
+        replayTableBinlog.replayGc(baseNum + 7);
+        Assert.assertEquals(baseNum + 7, replayTableBinlog.getDummyBinlog().getCommitSeq());
+        for (TBinlog binlog : replayBinlogs) {
+            Assert.assertEquals(binlog.getCommitSeq() <= baseNum + 7 ? 0 : 1, binlog.getTableRef());
         }
     }
 

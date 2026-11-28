@@ -20,7 +20,6 @@ package org.apache.doris.binlog;
 import org.apache.doris.catalog.BinlogConfig;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.common.Config;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.proc.BaseProcResult;
 import org.apache.doris.persist.BarrierLog;
@@ -357,16 +356,18 @@ public class DBBinlog {
         return Pair.of(new TStatus(TStatusCode.OK), lockCommitSeq);
     }
 
-    public BinlogTombstone gc() {
+    // Recycle at most maxExpiredNum binlogs of the db (db binlog enabled) or of each table (db binlog
+    // disabled) in this round, the rest are left to the next round.
+    public BinlogTombstone gc(long maxExpiredNum) {
         // check db
         BinlogConfig dbBinlogConfig = binlogConfigCache.getDBBinlogConfig(dbId);
         if (dbBinlogConfig == null) {
             LOG.error("db not found. dbId: {}", dbId);
             return null;
         } else if (!dbBinlogConfig.isEnable()) {
-            return dbBinlogDisableGc();
+            return dbBinlogDisableGc(maxExpiredNum);
         } else {
-            return dbBinlogEnableGc(dbBinlogConfig);
+            return dbBinlogEnableGc(dbBinlogConfig, maxExpiredNum);
         }
     }
 
@@ -376,6 +377,11 @@ public class DBBinlog {
         }
 
         BinlogTombstone dbTombstone = new BinlogTombstone(dbId, isDbGc);
+        mergeTableTombstones(dbTombstone, tableTombstones);
+        return dbTombstone;
+    }
+
+    private void mergeTableTombstones(BinlogTombstone dbTombstone, List<BinlogTombstone> tableTombstones) {
         for (BinlogTombstone tableTombstone : tableTombstones) {
             // collect tableCommitSeq
             dbTombstone.mergeTableTombstone(tableTombstone);
@@ -390,11 +396,9 @@ public class DBBinlog {
 
         LOG.info("After GC, dbId: {}, dbExpiredBinlog: {}, tableExpiredBinlogs: {}",
                 dbId, dbTombstone.getCommitSeq(), dbTombstone.getTableCommitSeqMap());
-
-        return dbTombstone;
     }
 
-    private BinlogTombstone dbBinlogDisableGc() {
+    private BinlogTombstone dbBinlogDisableGc(long maxExpiredNum) {
         List<BinlogTombstone> tombstones = Lists.newArrayList();
         List<TableBinlog> tableBinlogs;
 
@@ -406,7 +410,7 @@ public class DBBinlog {
         }
 
         for (TableBinlog tableBinlog : tableBinlogs) {
-            BinlogTombstone tombstone = tableBinlog.gc();
+            BinlogTombstone tombstone = tableBinlog.gc(maxExpiredNum);
             if (tombstone != null) {
                 tombstones.add(tombstone);
             }
@@ -464,7 +468,7 @@ public class DBBinlog {
     // partitions, used in enable db binlog gc. At most maxExpiredNum binlogs are recycled, the
     // rest are left to the next round so that the write lock is not held for a long time.
     private TBinlog getLastExpiredBinlog(BinlogComparator checker, long maxExpiredNum) {
-        Preconditions.checkArgument(maxExpiredNum > 0, "max_binlog_gc_num_per_round must be greater than 0");
+        Preconditions.checkArgument(maxExpiredNum > 0, "maxExpiredNum must be greater than 0");
         TBinlog lastExpiredBinlog = null;
         long expiredNum = 0;
 
@@ -522,7 +526,7 @@ public class DBBinlog {
         }
     }
 
-    private BinlogTombstone dbBinlogEnableGc(BinlogConfig dbBinlogConfig) {
+    private BinlogTombstone dbBinlogEnableGc(BinlogConfig dbBinlogConfig, long maxExpiredNum) {
         long ttlSeconds = dbBinlogConfig.getTtlSeconds();
         long maxBytes = dbBinlogConfig.getMaxBytes();
         long maxHistoryNums = dbBinlogConfig.getMaxHistoryNums();
@@ -566,7 +570,7 @@ public class DBBinlog {
                         || maxBytes < binlogSize
                         || maxHistoryNums < allBinlogs.size();
             };
-            lastExpiredBinlog = getLastExpiredBinlog(checker, Config.max_binlog_gc_num_per_round);
+            lastExpiredBinlog = getLastExpiredBinlog(checker, maxExpiredNum);
             tableBinlogs.addAll(tableBinlogMap.values());
         } finally {
             lock.writeLock().unlock();
@@ -588,7 +592,12 @@ public class DBBinlog {
             }
         }
 
-        return collectTableTombstone(tableTombstones, true);
+        // The db tombstone records where the db gc reaches even if no table binlog is recycled in this
+        // round (e.g. the round only recycles CREATE_TABLE binlogs), so that the followers replay it exactly.
+        BinlogTombstone dbTombstone = new BinlogTombstone(dbId, true);
+        dbTombstone.setCommitSeq(lastExpiredBinlog.getCommitSeq());
+        mergeTableTombstones(dbTombstone, tableTombstones);
+        return dbTombstone;
     }
 
     public void replayGc(BinlogTombstone tombstone) {

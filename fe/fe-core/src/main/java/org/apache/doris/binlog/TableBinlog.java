@@ -21,7 +21,6 @@ import org.apache.doris.catalog.BinlogConfig;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Table;
-import org.apache.doris.common.Config;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.proc.BaseProcResult;
 import org.apache.doris.thrift.TBinlog;
@@ -203,7 +202,7 @@ public class TableBinlog {
     // At most maxExpiredNum binlogs are recycled, the rest are left to the next round so that the
     // write lock is not held for a long time.
     private Pair<TBinlog, Long> getLastUpsertAndLargestCommitSeq(BinlogComparator checker, long maxExpiredNum) {
-        Preconditions.checkArgument(maxExpiredNum > 0, "max_binlog_gc_num_per_round must be greater than 0");
+        Preconditions.checkArgument(maxExpiredNum > 0, "maxExpiredNum must be greater than 0");
         if (binlogs.size() <= 1) {
             return null;
         }
@@ -280,7 +279,7 @@ public class TableBinlog {
     }
 
     // this method call when db binlog disable
-    public BinlogTombstone gc() {
+    public BinlogTombstone gc(long maxExpiredNum) {
         // step 1: get expire time
         BinlogConfig tableBinlogConfig = binlogConfigCache.getTableBinlogConfig(dbId, tableId);
         Boolean isCleanFullBinlog = false;
@@ -339,7 +338,7 @@ public class TableBinlog {
                         || maxBytes < binlogSize
                         || maxHistoryNums < binlogs.size();
             };
-            tombstoneInfo = getLastUpsertAndLargestCommitSeq(check, Config.max_binlog_gc_num_per_round);
+            tombstoneInfo = getLastUpsertAndLargestCommitSeq(check, maxExpiredNum);
         } finally {
             lock.writeLock().unlock();
         }
