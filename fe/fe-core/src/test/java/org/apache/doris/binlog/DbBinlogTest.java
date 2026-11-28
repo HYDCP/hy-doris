@@ -114,7 +114,7 @@ public class DbBinlogTest {
         }
 
         // trigger gc
-        BinlogTombstone tombstone = dbBinlog.gc();
+        BinlogTombstone tombstone = dbBinlog.gc(BinlogTestUtils.NO_GC_LIMIT);
 
         // check binlog status
         for (TBinlog binlog : testBinlogs) {
@@ -194,7 +194,7 @@ public class DbBinlogTest {
         }
 
         // trigger gc
-        dbBinlog.gc();
+        dbBinlog.gc(BinlogTestUtils.NO_GC_LIMIT);
 
         // check binlog status
         long unGcTableId = baseTableId + tableNum - 1;
@@ -245,7 +245,7 @@ public class DbBinlogTest {
         }
 
         // trigger gc
-        dbBinlog.gc();
+        dbBinlog.gc(BinlogTestUtils.NO_GC_LIMIT);
 
         // check binlog status
         for (TBinlog binlog : testBinlogs) {
@@ -351,7 +351,7 @@ public class DbBinlogTest {
         }
 
         // trigger gc
-        BinlogTombstone tombstone = dbBinlog.gc();
+        BinlogTombstone tombstone = dbBinlog.gc(BinlogTestUtils.NO_GC_LIMIT);
 
         // check binlog status - all binlogs should be cleared for disabled tables
         for (TBinlog binlog : testBinlogs) {
@@ -412,7 +412,7 @@ public class DbBinlogTest {
         }
 
         // trigger gc
-        BinlogTombstone tombstone = dbBinlog.gc();
+        BinlogTombstone tombstone = dbBinlog.gc(BinlogTestUtils.NO_GC_LIMIT);
 
         // check binlog status - only expired binlogs should be cleared
         for (TBinlog binlog : testBinlogs) {
@@ -426,6 +426,130 @@ public class DbBinlogTest {
         // check tombstone
         Assert.assertTrue(tombstone.isDbBinlogTomstone());
         Assert.assertEquals(expiredTime, tombstone.getCommitSeq());
+    }
+
+    private DBBinlog newDbBinlogWithEnable(MockBinlogConfigCache binlogConfigCache, List<TBinlog> binlogs) {
+        DBBinlog dbBinlog = new DBBinlog(binlogConfigCache, binlogs.get(0));
+        for (TBinlog binlog : binlogs) {
+            dbBinlog.addBinlog(binlog, null);
+        }
+        return dbBinlog;
+    }
+
+    private List<TBinlog> newTestBinlogs() {
+        List<TBinlog> binlogs = Lists.newArrayList();
+        for (int i = 0; i < totalBinlogNum; ++i) {
+            long tableId = baseTableId + (i / tableNum);
+            binlogs.add(BinlogTestUtils.newBinlog(dbId, tableId, baseNum + i, baseNum + i));
+        }
+        return binlogs;
+    }
+
+    private long getDbDummyCommitSeq(DBBinlog dbBinlog) {
+        List<TBinlog> allBinlogs = Lists.newArrayList();
+        dbBinlog.getAllBinlogs(allBinlogs);
+        for (TBinlog binlog : allBinlogs) {
+            if (binlog.getType() == TBinlogType.DUMMY && binlog.getBelong() < 0) {
+                return binlog.getCommitSeq();
+            }
+        }
+        Assert.fail("db dummy binlog not found");
+        return -1;
+    }
+
+    // A syncer locks the latest binlog (e.g. before a full sync), so that all the binlogs before it
+    // become expired at once. The gc recycles at most max_binlog_gc_num_per_round binlogs in a round.
+    @Test
+    public void testDbGcLimitPerRoundAfterLockLatestBinlog() {
+        // no binlog is expired by ttl, only by the lock
+        long expiredTime = 0L;
+        Map<String, Long> ttlMap = Maps.newHashMap();
+        for (int i = 0; i < tableNum; ++i) {
+            ttlMap.put(String.format("%d_%d", dbId, baseTableId + i), expiredTime);
+        }
+        MockBinlogConfigCache binlogConfigCache = BinlogTestUtils.newMockBinlogConfigCache(ttlMap);
+        binlogConfigCache.addDbBinlogConfig(dbId, true, expiredTime);
+        for (int i = 0; i < tableNum; i++) {
+            binlogConfigCache.addTableBinlogConfig(dbId, baseTableId + i, true, expiredTime);
+        }
+
+        List<TBinlog> testBinlogs = newTestBinlogs();
+        DBBinlog dbBinlog = newDbBinlogWithEnable(binlogConfigCache, testBinlogs);
+        long lastCommitSeq = baseNum + totalBinlogNum - 1;
+        Assert.assertEquals(lastCommitSeq, (long) dbBinlog.lockBinlog(-1, "job", -1).second);
+
+        // all binlogs before the locked one are expired, they are recycled in 3 rounds: 4 + 4 + 1
+        List<BinlogTombstone> tombstones = Lists.newArrayList();
+        long[] expectedCommitSeqs = {baseNum + 3, baseNum + 7, lastCommitSeq - 1};
+        for (long expectedCommitSeq : expectedCommitSeqs) {
+            BinlogTombstone tombstone = dbBinlog.gc(4);
+            Assert.assertTrue(tombstone.isDbBinlogTomstone());
+            Assert.assertEquals(expectedCommitSeq, tombstone.getCommitSeq());
+            Assert.assertEquals(expectedCommitSeq, getDbDummyCommitSeq(dbBinlog));
+            for (TBinlog binlog : testBinlogs) {
+                Assert.assertEquals(binlog.getCommitSeq() <= expectedCommitSeq ? 0 : 1, binlog.getTableRef());
+            }
+            tombstones.add(tombstone);
+        }
+        // the locked binlog is kept
+        Assert.assertNull(dbBinlog.gc(4));
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.getBinlog(-1, lastCommitSeq - 1, 1).first.getStatusCode());
+
+        // the replay is not limited, it recycles exactly the binlogs in the tombstone
+        List<TBinlog> replayBinlogs = newTestBinlogs();
+        DBBinlog replayDbBinlog = newDbBinlogWithEnable(binlogConfigCache, replayBinlogs);
+        replayDbBinlog.replayGc(tombstones.get(1));
+        Assert.assertEquals(baseNum + 7, getDbDummyCommitSeq(replayDbBinlog));
+        for (TBinlog binlog : replayBinlogs) {
+            Assert.assertEquals(binlog.getCommitSeq() <= baseNum + 7 ? 0 : 1, binlog.getTableRef());
+        }
+    }
+
+    // A round that recycles only db level binlogs (e.g. CREATE_TABLE) still produces a db tombstone, so that
+    // the followers replay the gc to the same position as the master.
+    @Test
+    public void testDbGcOnlyDbLevelBinlogsInRound() {
+        long expiredTime = baseNum + totalBinlogNum;
+        Map<String, Long> ttlMap = Maps.newHashMap();
+        ttlMap.put(String.format("%d_%d", dbId, baseTableId), expiredTime);
+        MockBinlogConfigCache binlogConfigCache = BinlogTestUtils.newMockBinlogConfigCache(ttlMap);
+        binlogConfigCache.addDbBinlogConfig(dbId, true, expiredTime);
+        binlogConfigCache.addTableBinlogConfig(dbId, baseTableId, true, expiredTime);
+
+        // 3 CREATE_TABLE binlogs are only in the db binlog, then 1 table binlog, all expired
+        List<TBinlog> testBinlogs = Lists.newArrayList();
+        for (int i = 0; i < 3; ++i) {
+            TBinlog binlog = BinlogTestUtils.newBinlog(dbId, baseTableId + 1 + i, baseNum + i, baseNum + i);
+            binlog.setType(TBinlogType.CREATE_TABLE);
+            testBinlogs.add(binlog);
+        }
+        testBinlogs.add(BinlogTestUtils.newBinlog(dbId, baseTableId, baseNum + 3, baseNum + 3));
+        DBBinlog dbBinlog = newDbBinlogWithEnable(binlogConfigCache, testBinlogs);
+
+        BinlogTombstone tombstone = dbBinlog.gc(3);
+        Assert.assertTrue(tombstone.isDbBinlogTomstone());
+        Assert.assertEquals(baseNum + 2, tombstone.getCommitSeq());
+        Assert.assertTrue(tombstone.getTableCommitSeqMap().isEmpty());
+        Assert.assertEquals(baseNum + 2, getDbDummyCommitSeq(dbBinlog));
+
+        List<TBinlog> replayBinlogs = Lists.newArrayList();
+        for (TBinlog binlog : testBinlogs) {
+            replayBinlogs.add(binlog.deepCopy());
+        }
+        DBBinlog replayDbBinlog = newDbBinlogWithEnable(binlogConfigCache, replayBinlogs);
+        replayDbBinlog.replayGc(tombstone);
+        Assert.assertEquals(baseNum + 2, getDbDummyCommitSeq(replayDbBinlog));
+        // the master and the follower give the same answer to the same consumer
+        Assert.assertEquals(dbBinlog.getBinlog(-1, baseNum + 1, 1).first.getStatusCode(),
+                replayDbBinlog.getBinlog(-1, baseNum + 1, 1).first.getStatusCode());
+        Assert.assertEquals(TStatusCode.BINLOG_TOO_OLD_COMMIT_SEQ,
+                replayDbBinlog.getBinlog(-1, baseNum + 1, 1).first.getStatusCode());
+
+        // the next round recycles the table binlog
+        tombstone = dbBinlog.gc(3);
+        Assert.assertEquals(baseNum + 3, tombstone.getCommitSeq());
+        Assert.assertEquals(baseNum + 3, (long) tombstone.getTableCommitSeqMap().get(baseTableId));
     }
 
     private DBBinlog newEnabledDbBinlog(long tableId) {
@@ -606,7 +730,7 @@ public class DbBinlogTest {
         dbBinlog.addBinlog(replaceBinlog, replaceLog);
 
         // gc the binlog at commitSeq 1, the drop record at commitSeq 2 is kept
-        dbBinlog.gc();
+        dbBinlog.gc(BinlogTestUtils.NO_GC_LIMIT);
         Assert.assertEquals(1, dbBinlog.getDroppedTables().size());
 
         // a consumer older than the gc point gets TOO_OLD with the dummy binlog, as for a
@@ -650,7 +774,7 @@ public class DbBinlogTest {
                 dbBinlog.getBinlog(baseTableId, 3, 10).first.getStatusCode());
 
         // the drop record (commitSeq 2) is expired by gc, the signal is cleared
-        dbBinlog.gc();
+        dbBinlog.gc(BinlogTestUtils.NO_GC_LIMIT);
         Assert.assertTrue(dbBinlog.getDroppedTables().isEmpty());
         Assert.assertNotEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
                 dbBinlog.getBinlog(baseTableId, -1, 10).first.getStatusCode());

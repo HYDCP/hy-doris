@@ -33,6 +33,7 @@ import org.apache.doris.thrift.TBinlogType;
 import org.apache.doris.thrift.TStatus;
 import org.apache.doris.thrift.TStatusCode;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
@@ -355,16 +356,18 @@ public class DBBinlog {
         return Pair.of(new TStatus(TStatusCode.OK), lockCommitSeq);
     }
 
-    public BinlogTombstone gc() {
+    // Recycle at most maxExpiredNum binlogs of the db (db binlog enabled) or of each table (db binlog
+    // disabled) in this round, the rest are left to the next round.
+    public BinlogTombstone gc(long maxExpiredNum) {
         // check db
         BinlogConfig dbBinlogConfig = binlogConfigCache.getDBBinlogConfig(dbId);
         if (dbBinlogConfig == null) {
             LOG.error("db not found. dbId: {}", dbId);
             return null;
         } else if (!dbBinlogConfig.isEnable()) {
-            return dbBinlogDisableGc();
+            return dbBinlogDisableGc(maxExpiredNum);
         } else {
-            return dbBinlogEnableGc(dbBinlogConfig);
+            return dbBinlogEnableGc(dbBinlogConfig, maxExpiredNum);
         }
     }
 
@@ -374,6 +377,11 @@ public class DBBinlog {
         }
 
         BinlogTombstone dbTombstone = new BinlogTombstone(dbId, isDbGc);
+        mergeTableTombstones(dbTombstone, tableTombstones);
+        return dbTombstone;
+    }
+
+    private void mergeTableTombstones(BinlogTombstone dbTombstone, List<BinlogTombstone> tableTombstones) {
         for (BinlogTombstone tableTombstone : tableTombstones) {
             // collect tableCommitSeq
             dbTombstone.mergeTableTombstone(tableTombstone);
@@ -388,11 +396,9 @@ public class DBBinlog {
 
         LOG.info("After GC, dbId: {}, dbExpiredBinlog: {}, tableExpiredBinlogs: {}",
                 dbId, dbTombstone.getCommitSeq(), dbTombstone.getTableCommitSeqMap());
-
-        return dbTombstone;
     }
 
-    private BinlogTombstone dbBinlogDisableGc() {
+    private BinlogTombstone dbBinlogDisableGc(long maxExpiredNum) {
         List<BinlogTombstone> tombstones = Lists.newArrayList();
         List<TableBinlog> tableBinlogs;
 
@@ -404,7 +410,7 @@ public class DBBinlog {
         }
 
         for (TableBinlog tableBinlog : tableBinlogs) {
-            BinlogTombstone tombstone = tableBinlog.gc();
+            BinlogTombstone tombstone = tableBinlog.gc(maxExpiredNum);
             if (tombstone != null) {
                 tombstones.add(tombstone);
             }
@@ -459,21 +465,29 @@ public class DBBinlog {
     }
 
     // Get last expired binlog, and gc expired binlogs/timestamps/dropped
-    // partitions, used in enable db binlog gc.
-    private TBinlog getLastExpiredBinlog(BinlogComparator checker) {
+    // partitions, used in enable db binlog gc. At most maxExpiredNum binlogs are recycled, the
+    // rest are left to the next round so that the write lock is not held for a long time.
+    private TBinlog getLastExpiredBinlog(BinlogComparator checker, long maxExpiredNum) {
+        Preconditions.checkArgument(maxExpiredNum > 0, "maxExpiredNum must be greater than 0");
         TBinlog lastExpiredBinlog = null;
+        long expiredNum = 0;
 
         Iterator<TBinlog> binlogIter = allBinlogs.iterator();
         TBinlog dummy = binlogIter.next();
         while (binlogIter.hasNext()) {
             TBinlog binlog = binlogIter.next();
-            if (checker.isExpired(binlog)) {
-                binlogIter.remove();
-                binlogSize -= BinlogUtils.getApproximateMemoryUsage(binlog);
-                lastExpiredBinlog = binlog;
-            } else {
+            if (!checker.isExpired(binlog)) {
                 break;
             }
+            if (expiredNum >= maxExpiredNum) {
+                LOG.info("gc db binlog reaches the limit {}, the rest are recycled in the next round. dbId: {}",
+                        maxExpiredNum, dbId);
+                break;
+            }
+            binlogIter.remove();
+            binlogSize -= BinlogUtils.getApproximateMemoryUsage(binlog);
+            lastExpiredBinlog = binlog;
+            ++expiredNum;
         }
 
         if (lastExpiredBinlog != null) {
@@ -482,10 +496,7 @@ public class DBBinlog {
             dummy.setTimestamp(lastExpiredBinlog.getTimestamp());
 
             // release expired timestamps by commit seq.
-            Iterator<Pair<Long, Long>> timeIter = timestamps.iterator();
-            while (timeIter.hasNext() && timeIter.next().first <= expiredCommitSeq) {
-                timeIter.remove();
-            }
+            BinlogUtils.removeExpiredPrefix(timestamps, ts -> ts.first <= expiredCommitSeq);
 
             lockedBinlogs.entrySet().removeIf(ent -> ent.getValue() <= expiredCommitSeq);
             gcDroppedResources(expiredCommitSeq);
@@ -515,7 +526,7 @@ public class DBBinlog {
         }
     }
 
-    private BinlogTombstone dbBinlogEnableGc(BinlogConfig dbBinlogConfig) {
+    private BinlogTombstone dbBinlogEnableGc(BinlogConfig dbBinlogConfig, long maxExpiredNum) {
         long ttlSeconds = dbBinlogConfig.getTtlSeconds();
         long maxBytes = dbBinlogConfig.getMaxBytes();
         long maxHistoryNums = dbBinlogConfig.getMaxHistoryNums();
@@ -559,7 +570,7 @@ public class DBBinlog {
                         || maxBytes < binlogSize
                         || maxHistoryNums < allBinlogs.size();
             };
-            lastExpiredBinlog = getLastExpiredBinlog(checker);
+            lastExpiredBinlog = getLastExpiredBinlog(checker, maxExpiredNum);
             tableBinlogs.addAll(tableBinlogMap.values());
         } finally {
             lock.writeLock().unlock();
@@ -573,14 +584,20 @@ public class DBBinlog {
         // tombstone
         List<BinlogTombstone> tableTombstones = Lists.newArrayList();
         for (TableBinlog tableBinlog : tableBinlogs) {
-            // step 2.1: gc tableBinlog，and get table tombstone
+            // step 2.1: gc tableBinlog，and get table tombstone. The binlogs of a table are a subset of
+            // allBinlogs, so a table recycles at most the binlogs recycled by the db gc above.
             BinlogTombstone tableTombstone = tableBinlog.commitSeqGc(lastExpiredBinlog.getCommitSeq());
             if (tableTombstone != null) {
                 tableTombstones.add(tableTombstone);
             }
         }
 
-        return collectTableTombstone(tableTombstones, true);
+        // The db tombstone records where the db gc reaches even if no table binlog is recycled in this
+        // round (e.g. the round only recycles CREATE_TABLE binlogs), so that the followers replay it exactly.
+        BinlogTombstone dbTombstone = new BinlogTombstone(dbId, true);
+        dbTombstone.setCommitSeq(lastExpiredBinlog.getCommitSeq());
+        mergeTableTombstones(dbTombstone, tableTombstones);
+        return dbTombstone;
     }
 
     public void replayGc(BinlogTombstone tombstone) {
@@ -598,7 +615,8 @@ public class DBBinlog {
         lock.writeLock().lock();
         try {
             BinlogComparator checker = (binlog) -> binlog.getCommitSeq() <= largestExpiredCommitSeq;
-            getLastExpiredBinlog(checker);
+            // The tombstone is bounded by the master, replay it exactly.
+            getLastExpiredBinlog(checker, Long.MAX_VALUE);
         } finally {
             lock.writeLock().unlock();
         }
@@ -630,27 +648,15 @@ public class DBBinlog {
     }
 
     private void gcDroppedResources(long commitSeq) {
-        Iterator<Pair<Long, Long>> iter = droppedPartitions.iterator();
-        while (iter.hasNext() && iter.next().second < commitSeq) {
-            iter.remove();
-        }
-        iter = droppedTables.iterator();
-        boolean droppedTablesChanged = false;
-        while (iter.hasNext() && iter.next().second < commitSeq) {
-            iter.remove();
-            droppedTablesChanged = true;
-        }
-        if (droppedTablesChanged) {
+        BinlogUtils.removeExpiredPrefix(droppedPartitions, entry -> entry.second < commitSeq);
+        if (BinlogUtils.removeExpiredPrefix(droppedTables, entry -> entry.second < commitSeq) > 0) {
             // keep droppedTableIds consistent with droppedTables
             droppedTableIds.clear();
             for (Pair<Long, Long> entry : droppedTables) {
                 droppedTableIds.add(entry.first);
             }
         }
-        iter = droppedIndexes.iterator();
-        while (iter.hasNext() && iter.next().second < commitSeq) {
-            iter.remove();
-        }
+        BinlogUtils.removeExpiredPrefix(droppedIndexes, entry -> entry.second < commitSeq);
     }
 
     // not thread safety, do this without lock

@@ -53,6 +53,9 @@ import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class BinlogManagerTest {
     private Map<Long, List<Long>> frameWork;
@@ -229,6 +232,58 @@ public class BinlogManagerTest {
         pair = manager.getBinlog(dbBaseId, tableBaseId, 999);
         Assert.assertEquals(TStatusCode.BINLOG_TOO_NEW_COMMIT_SEQ, pair.first.getStatusCode());
         Assert.assertNull(pair.second);
+    }
+
+    // A reader waiting for a busy DBBinlog (e.g. a long gc holds its write lock) must not hold the lock
+    // of BinlogManager. Otherwise a writer of BinlogManager (addBinlog of any db) waits for the reader,
+    // and all readers of all dbs queue behind the writer.
+    @Test
+    public void testReaderWaitingDbBinlogNotHoldManagerLock() throws Exception {
+        Method addBinlog = BinlogManager.class.getDeclaredMethod("addBinlog", TBinlog.class, Object.class);
+        addBinlog.setAccessible(true);
+        Field dbBinlogMapField = BinlogManager.class.getDeclaredField("dbBinlogMap");
+        dbBinlogMapField.setAccessible(true);
+        Field managerLockField = BinlogManager.class.getDeclaredField("lock");
+        managerLockField.setAccessible(true);
+        Field dbLockField = DBBinlog.class.getDeclaredField("lock");
+        dbLockField.setAccessible(true);
+
+        BinlogManager manager = new BinlogManager();
+        addBinlog.invoke(manager, BinlogTestUtils.newBinlog(dbBaseId, tableBaseId, 1, 1), null);
+        DBBinlog dbBinlog = ((Map<Long, DBBinlog>) dbBinlogMapField.get(manager)).get(dbBaseId);
+        ReentrantReadWriteLock managerLock = (ReentrantReadWriteLock) managerLockField.get(manager);
+        ReentrantReadWriteLock dbLock = (ReentrantReadWriteLock) dbLockField.get(dbBinlog);
+
+        List<Runnable> readers = Lists.newArrayList(
+                () -> manager.getBinlog(dbBaseId, tableBaseId, 0, 1),
+                () -> manager.getBinlogLag(dbBaseId, tableBaseId, 0),
+                () -> manager.getDroppedPartitions(dbBaseId),
+                () -> manager.getDroppedTables(dbBaseId),
+                () -> manager.getDroppedIndexes(dbBaseId),
+                () -> manager.getBinlogInfo());
+        for (Runnable reader : readers) {
+            AtomicReference<Throwable> readerError = new AtomicReference<>();
+            Thread readerThread = new Thread(reader);
+            readerThread.setUncaughtExceptionHandler((thread, e) -> readerError.set(e));
+            dbLock.writeLock().lock();
+            try {
+                readerThread.start();
+                long deadline = System.currentTimeMillis() + 10000;
+                while (!dbLock.hasQueuedThread(readerThread)) {
+                    Assert.assertNull(readerError.get());
+                    Assert.assertTrue("reader does not wait for the db binlog lock",
+                            System.currentTimeMillis() < deadline);
+                    Thread.sleep(10);
+                }
+                Assert.assertTrue(managerLock.writeLock().tryLock(5, TimeUnit.SECONDS));
+                managerLock.writeLock().unlock();
+            } finally {
+                dbLock.writeLock().unlock();
+            }
+            readerThread.join(10000);
+            Assert.assertFalse(readerThread.isAlive());
+            Assert.assertNull(readerError.get());
+        }
     }
 
     @Test

@@ -26,6 +26,7 @@ import org.apache.doris.thrift.TStatusCode;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.TreeSet;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 public class BinlogUtils {
@@ -126,5 +127,22 @@ public class BinlogUtils {
         final long objSize = 80; // 9 fields and 1 header
         String data = binlog.getData();
         return objSize + binlog.getTableIdsSize() * 8 + (data == null ? 0 : data.length());
+    }
+
+    // Remove the leading elements that are expired, stop at the first one that is not, and return the
+    // number of removed elements. Removing the head of an ArrayList one by one moves all the remaining
+    // elements each time, so the whole prefix is removed at once to keep the cost linear.
+    public static <T> int removeExpiredPrefix(List<T> list, Predicate<T> isExpired) {
+        int expiredNum = 0;
+        for (T element : list) {
+            if (!isExpired.test(element)) {
+                break;
+            }
+            ++expiredNum;
+        }
+        if (expiredNum > 0) {
+            list.subList(0, expiredNum).clear();
+        }
+        return expiredNum;
     }
 }
