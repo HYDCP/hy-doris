@@ -103,6 +103,7 @@ import org.apache.doris.persist.ModifyTableEngineOperationLog;
 import org.apache.doris.persist.ModifyTablePropertyOperationLog;
 import org.apache.doris.persist.OperationType;
 import org.apache.doris.persist.PartitionPersistInfo;
+import org.apache.doris.persist.PartitionStateTokenLog;
 import org.apache.doris.persist.PrivInfo;
 import org.apache.doris.persist.RecoverInfo;
 import org.apache.doris.persist.RefreshExternalTableInfo;
@@ -634,6 +635,11 @@ public class JournalEntity implements Writable {
             }
             case OperationType.OP_SET_PARTITION_VERSION: {
                 data = SetPartitionVersionOperationLog.read(in);
+                isRead = true;
+                break;
+            }
+            case OperationType.OP_SET_PARTITION_STATE_TOKEN: {
+                data = PartitionStateTokenLog.read(in);
                 isRead = true;
                 break;
             }

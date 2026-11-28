@@ -1070,7 +1070,10 @@ public class CatalogRecycleBin extends MasterDaemon implements Writable, GsonPos
                 recoverPartition.setName(newPartitionName);
             }
 
-            // recover partition
+            // recover partition. Its state token is invalidated (a taint is kept): while it was in the recycle bin
+            // its replicas could be changed (its tablets stay in the inverted index) and its indexes renamed, and
+            // nothing invalidated it. See PartitionStateToken.
+            PartitionStateToken.invalidate(recoverPartition);
             table.addPartition(recoverPartition);
 
             // recover partition info
@@ -1125,6 +1128,8 @@ public class CatalogRecycleBin extends MasterDaemon implements Writable, GsonPos
                     }
                 }
                 String recycledPartitionName = recyclePartitionInfo.getPartition().getName();
+                // as recoverPartition does
+                PartitionStateToken.invalidate(recyclePartitionInfo.getPartition());
                 table.addPartition(recyclePartitionInfo.getPartition());
                 if (!Strings.isNullOrEmpty(newPartitionName)) {
                     table.renamePartition(recycledPartitionName, newPartitionName);

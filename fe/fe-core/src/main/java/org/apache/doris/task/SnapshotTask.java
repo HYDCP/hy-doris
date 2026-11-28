@@ -38,6 +38,12 @@ public class SnapshotTask extends AgentTask {
     // Only for copy tablet task.
     // Save the snapshot path.
     private String resultSnapshotPath;
+    // Restore only (atomic restore): the data of the snapshot is the local tablet refTabletId at the version, see
+    // TSnapshotRequest.restore_local_source.
+    private boolean restoreLocalSource = false;
+    // Restore only (atomic restore, with restoreLocalSource): the backend loads the local tablet into the tablet at
+    // once and makes an empty snapshot dir, see TSnapshotRequest.restore_kept_load.
+    private boolean restoreKeptLoad = false;
 
     public SnapshotTask(TResourceInfo resourceInfo, long backendId, long signature, long jobId, long dbId, long tableId,
             long partitionId, long indexId, long tabletId, long version, int schemaHash, long timeoutMs,
@@ -99,6 +105,22 @@ public class SnapshotTask extends AgentTask {
         return resultSnapshotPath;
     }
 
+    public void setRestoreLocalSource(boolean restoreLocalSource) {
+        this.restoreLocalSource = restoreLocalSource;
+    }
+
+    public boolean isRestoreLocalSource() {
+        return restoreLocalSource;
+    }
+
+    public void setRestoreKeptLoad(boolean restoreKeptLoad) {
+        this.restoreKeptLoad = restoreKeptLoad;
+    }
+
+    public boolean isRestoreKeptLoad() {
+        return restoreKeptLoad;
+    }
+
     public void setRefTabletId(long refTabletId) {
         assert refTabletId > 0;
         this.refTabletId = refTabletId;
@@ -115,6 +137,14 @@ public class SnapshotTask extends AgentTask {
         }
         if (version > 0L) {
             request.setVersion(version);
+        }
+        if (restoreLocalSource) {
+            request.setRestoreLocalSource(true);
+            // the backend saves the evidence that this job loaded the local source with the tablet
+            request.setJobId(jobId);
+            if (restoreKeptLoad) {
+                request.setRestoreKeptLoad(true);
+            }
         }
         return request;
     }

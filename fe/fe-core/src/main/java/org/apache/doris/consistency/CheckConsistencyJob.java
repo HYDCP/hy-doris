@@ -22,6 +22,7 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Replica.ReplicaState;
 import org.apache.doris.catalog.Table;
@@ -370,6 +371,10 @@ public class CheckConsistencyJob {
             index.setLastCheckTime(lastCheckTime);
             tablet.setLastCheckTime(lastCheckTime);
             tablet.setIsConsistent(isConsistent);
+            if (!isConsistent) {
+                // the checksums of the replicas differ: they do not agree, see PartitionStateToken
+                PartitionStateToken.taint(partition);
+            }
 
             // set checked version
             tablet.setCheckedVersion(checkedVersion);

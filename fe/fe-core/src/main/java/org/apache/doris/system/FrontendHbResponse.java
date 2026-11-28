@@ -47,6 +47,9 @@ public class FrontendHbResponse extends HeartbeatResponse implements Writable {
     private long feStartTime;
     private long processUUID;
     private List<FeDiskInfo> diskInfos;
+    // Not persisted in the edit log, only the master handles it.
+    private transient int partitionStateTokenCapability = 0;
+    private transient int restoreReuseCapability = 0;
 
     public FrontendHbResponse() {
         super(HeartbeatResponse.Type.FRONTEND);
@@ -121,6 +124,24 @@ public class FrontendHbResponse extends HeartbeatResponse implements Writable {
         queryPort = in.readInt();
         rpcPort = in.readInt();
         replayedJournalId = in.readLong();
+    }
+
+    public int getPartitionStateTokenCapability() {
+        return partitionStateTokenCapability;
+    }
+
+    public FrontendHbResponse setPartitionStateTokenCapability(int partitionStateTokenCapability) {
+        this.partitionStateTokenCapability = partitionStateTokenCapability;
+        return this;
+    }
+
+    public int getRestoreReuseCapability() {
+        return restoreReuseCapability;
+    }
+
+    public FrontendHbResponse setRestoreReuseCapability(int restoreReuseCapability) {
+        this.restoreReuseCapability = restoreReuseCapability;
+        return this;
     }
 
     @Override

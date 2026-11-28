@@ -105,6 +105,9 @@ public class Partition extends MetaObject {
     private long nextVersionHash;
     @SerializedName(value = "di", alternate = {"distributionInfo"})
     private DistributionInfo distributionInfo;
+    // The state token of the partition, null if it never got one. See PartitionStateToken.
+    @SerializedName(value = "stk")
+    private PartitionStateToken stateToken;
 
     protected Partition() {
     }
@@ -485,5 +488,13 @@ public class Partition extends MetaObject {
             dataSize += mIndex.getDataSize(singleReplica, true);
         }
         return dataSize + getRemoteDataSize();
+    }
+
+    public PartitionStateToken getStateToken() {
+        return stateToken;
+    }
+
+    public void setStateToken(PartitionStateToken stateToken) {
+        this.stateToken = stateToken;
     }
 }

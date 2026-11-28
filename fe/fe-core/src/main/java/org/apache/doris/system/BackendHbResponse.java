@@ -54,6 +54,8 @@ public class BackendHbResponse extends HeartbeatResponse implements Writable {
     private boolean isShutDown = false;
     // The physical memory available for use by BE.
     private long beMemory = 0;
+    // Not persisted in the edit log, only the master handles it.
+    private transient int restoreReuseCapability = 0;
 
     public BackendHbResponse() {
         super(HeartbeatResponse.Type.BACKEND);
@@ -153,6 +155,15 @@ public class BackendHbResponse extends HeartbeatResponse implements Writable {
 
     public long getBeMemory() {
         return beMemory;
+    }
+
+    public int getRestoreReuseCapability() {
+        return restoreReuseCapability;
+    }
+
+    public BackendHbResponse setRestoreReuseCapability(int restoreReuseCapability) {
+        this.restoreReuseCapability = restoreReuseCapability;
+        return this;
     }
 
     @Override

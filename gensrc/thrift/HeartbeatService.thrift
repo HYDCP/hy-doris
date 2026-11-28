@@ -62,6 +62,9 @@ struct TBackendInfo {
     8: optional bool is_shutdown
     9: optional Types.TPort arrow_flight_sql_port
     10: optional i64 be_mem // The physical memory available for use by BE.
+    // The version of the restore reuse protocol the BE understands (see RestoreJob), 0 or not set for a BE without
+    // it. A high field number to keep away from the fields added by the upstream.
+    7601: optional i32 restore_reuse_capability
     // For cloud
     1000: optional i64 fragment_executing_count
     1001: optional i64 fragment_last_active_time

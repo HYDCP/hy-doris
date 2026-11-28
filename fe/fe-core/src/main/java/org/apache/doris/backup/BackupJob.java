@@ -29,9 +29,11 @@ import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
 import org.apache.doris.catalog.OdbcTable;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.Table;
+import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.catalog.View;
 import org.apache.doris.common.Config;
@@ -54,6 +56,7 @@ import org.apache.doris.thrift.TFinishTaskRequest;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TTaskType;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
@@ -309,6 +312,8 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                     taskProgress.remove(task.getSignature());
                     taskErrMsg.remove(task.getSignature());
                     Long oldValue = unfinishedTaskIds.remove(task.getSignature());
+                    // it may be the last task the state waits for, like a finished one
+                    nudgeIfIdle(oldValue != null && unfinishedTaskIds.isEmpty());
                     return oldValue != null;
                 } else {
                     // Not caused by drop, follow original logic
@@ -350,6 +355,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                     info, unfinishedTaskIds.size(), (oldValue != null), this);
         }
 
+        nudgeIfIdle(oldValue != null && unfinishedTaskIds.isEmpty());
         return oldValue != null;
     }
 
@@ -408,6 +414,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             LOG.debug("get finished upload snapshot task, unfinished tasks num: {}, remove result: {}. {}",
                     unfinishedTaskIds.size(), (oldValue != null), this);
         }
+        nudgeIfIdle(oldValue != null && unfinishedTaskIds.isEmpty());
         return oldValue != null;
     }
 
@@ -498,35 +505,59 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             }
         }
 
-        // run job base on current state
-        switch (state) {
-            case PENDING:
-                prepareAndSendSnapshotTask();
+        // run job base on current state. With backup_restore_merge_idle_ticks the next state is run in this round
+        // as well when the state reached waits for nothing (status is not reset: a failure ends the round as before).
+        int steps = 0;
+        do {
+            BackupJobState before = state;
+            switch (state) {
+                case PENDING:
+                    prepareAndSendSnapshotTask();
+                    break;
+                case SNAPSHOTING:
+                    waitingAllSnapshotsFinished();
+                    break;
+                case UPLOAD_SNAPSHOT:
+                    uploadSnapshot();
+                    break;
+                case UPLOADING:
+                    waitingAllUploadingFinished();
+                    break;
+                case SAVE_META:
+                    saveMetaInfo(false);
+                    break;
+                case UPLOAD_INFO:
+                    uploadMetaAndJobInfoFile();
+                    break;
+                default:
+                    break;
+            }
+            if (!Config.backup_restore_merge_idle_ticks || !status.ok() || state == before || isWaitingState()
+                    || ++steps >= MAX_MERGED_STEPS_BACKUP) {
                 break;
-            case SNAPSHOTING:
-                waitingAllSnapshotsFinished();
-                break;
-            case UPLOAD_SNAPSHOT:
-                uploadSnapshot();
-                break;
-            case UPLOADING:
-                waitingAllUploadingFinished();
-                break;
-            case SAVE_META:
-                saveMetaInfo(false);
-                break;
-            case UPLOAD_INFO:
-                uploadMetaAndJobInfoFile();
-                break;
-            default:
-                break;
-        }
+            }
+            LOG.info("go on with state {} in the same round. {}", state, this);
+        } while (true);
 
         // we don't want to cancel the job if we already in state UPLOAD_INFO,
         // which is the final step of backup job. just retry it.
         // if it encounters some unrecoverable errors, just retry it until timeout.
         if (!status.ok() && state != BackupJobState.UPLOAD_INFO) {
             cancelInternal();
+        }
+    }
+
+    // Whether the state waits for the backends (or is done): the next round looks again, nothing to run now.
+    private boolean isWaitingState() {
+        switch (state) {
+            case SNAPSHOTING:
+            case UPLOADING:
+                return !unfinishedTaskIds.isEmpty();
+            case FINISHED:
+            case CANCELLED:
+                return true;
+            default:
+                return false;
         }
     }
 
@@ -576,6 +607,10 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                 continue;
             }
             hasValidTables = true;
+            if (tbl.getType() == TableType.OLAP && getContent() == BackupContent.ALL) {
+                // a partition whose state token was invalidated gets a new one before the versions are taken
+                env.namePartitionsWithoutStateToken(db, (OlapTable) tbl);
+            }
             tbl.readLock();
             try {
                 switch (tbl.getType()) {
@@ -951,6 +986,41 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                          "repo__" + repoId, label + "__" + createTimeStr).normalize();
     }
 
+    /**
+     * The tokens of the job info are those of the partitions copied before the snapshots were taken. A partition
+     * tainted since then (a replica lost and recovered as an empty one at the same version, see
+     * Env#taintPartitionOfLostReplica) may have its snapshot taken from that replica: its token does not name the
+     * data of the backup, record none. Called when all snapshots are taken; a partition still tainted from before the
+     * copy has no token in the job info already.
+     */
+    @VisibleForTesting
+    public void omitStateTokenOfTaintedPartitions() {
+        Database db = env.getInternalCatalog().getDbNullable(dbId);
+        if (db == null) {
+            return;
+        }
+        for (BackupJobInfo.BackupOlapTableInfo tblInfo : jobInfo.backupOlapTableObjects.values()) {
+            Table tbl = db.getTableNullable(tblInfo.id);
+            if (!(tbl instanceof OlapTable)) {
+                continue;
+            }
+            OlapTable olapTbl = (OlapTable) tbl;
+            olapTbl.readLock();
+            try {
+                for (BackupJobInfo.BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
+                    Partition part = olapTbl.getPartition(partInfo.id);
+                    if (partInfo.stateToken != null && part != null && PartitionStateToken.isTainted(part)) {
+                        LOG.info("partition {} is tainted after its metadata was copied, no state token in the backup."
+                                + " {}", part.getId(), this);
+                        partInfo.stateToken = null;
+                    }
+                }
+            } finally {
+                olapTbl.readUnlock();
+            }
+        }
+    }
+
     private void saveMetaInfo(boolean replay) {
         String createTimeStr = TimeUtils.longToTimeString(createTime,
                 TimeUtils.getDatetimeFormatWithHyphenWithTimeZone());
@@ -1021,6 +1091,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
 
             jobInfo = BackupJobInfo.fromCatalog(createTime, label, dbName, dbId,
                     getContent(), backupMeta, filteredSnapshotInfos, tableCommitSeqMap);
+            omitStateTokenOfTaintedPartitions();
             if (LOG.isDebugEnabled()) {
                 LOG.debug("job info: {}. {}", jobInfo, this);
             }

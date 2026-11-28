@@ -82,6 +82,10 @@ public class DownloadTask extends AgentTask {
         return brokerProperties;
     }
 
+    public List<TRemoteTabletSnapshot> getRemoteTabletSnapshots() {
+        return remoteTabletSnapshots;
+    }
+
     public void updateBrokerProperties(Map<String, String> brokerProperties) {
         this.brokerProperties = new java.util.HashMap<>(brokerProperties);
     }
