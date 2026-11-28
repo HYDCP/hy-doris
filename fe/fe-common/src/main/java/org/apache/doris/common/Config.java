@@ -2954,6 +2954,24 @@ public class Config extends ConfigBase {
             "The number of concurrent restore tasks per be"})
     public static int restore_task_concurrency_per_be = 5000;
 
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "master 是否跟踪分区的状态令牌（见 PartitionStateToken）：可见的事务给它写的每个分区一个令牌，"
+                    + "CCR 增量在延续本地状态时沿用源版本的令牌，恢复沿用备份的令牌。只改变元数据。"
+                    + "只在 master 记录事务日志时读取，回放时不读。为 false（默认）时不写任何新的元数据"
+                    + "（没有新的日志类型，备份里没有令牌），可以回滚到没有这个功能的 FE。为 true 时，只有所有 FE"
+                    + "（包括 observer）都在线且能回放 OP_SET_PARTITION_STATE_TOKEN，备份前才给分区起名并写这种日志；"
+                    + "写过之后要回滚，先关掉它，等每个 FE 的镜像都越过最后一条这种日志，再换回旧版本。",
+            "Whether the master tracks the state token of the partitions (see PartitionStateToken): a transaction "
+                    + "made visible gives each partition it writes a token, a CCR increment adopts the token of the "
+                    + "source version when it continues the local state, and a restore adopts the token of the "
+                    + "backup. It only changes the metadata. Read only when the master logs a transaction, never on "
+                    + "replay. If false (the default) nothing new is persisted (no new kind of log, no token in a "
+                    + "backup), so the frontends can be rolled back to a version without it. If true, a backup names "
+                    + "the partitions and logs OP_SET_PARTITION_STATE_TOKEN only when every frontend, the observers "
+                    + "included, is alive and replays it. To roll back after such a log was written, switch it off "
+                    + "first and wait until the image of every frontend is past the last such log."})
+    public static boolean restore_state_token_track = false;
+
     @ConfField(mutable = true, description = {"执行 agent task 时，BE心跳超过多长时间，认为BE不可用",
             "The time after which BE is considered unavailable if the heartbeat is not received"})
     public static int agent_task_be_unavailable_heartbeat_timeout_second = 300;

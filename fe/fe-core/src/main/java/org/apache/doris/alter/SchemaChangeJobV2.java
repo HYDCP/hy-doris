@@ -724,6 +724,9 @@ public class SchemaChangeJobV2 extends AlterJobV2 {
     }
 
     private void onFinished(OlapTable tbl) {
+        // the job rewrote the data of the partitions in the new schema and the versions stay the same: the state
+        // tokens no longer name the data
+        tbl.invalidatePartitionStateTokens();
         // replace the origin index with shadow index, set index state as NORMAL
         for (Partition partition : tbl.getPartitions()) {
             // drop the origin index from partitions

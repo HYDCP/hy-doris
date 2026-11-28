@@ -28,6 +28,7 @@ import org.apache.doris.catalog.OdbcCatalogResource;
 import org.apache.doris.catalog.OdbcTable;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.TableIf.TableType;
@@ -165,6 +166,8 @@ public class BackupJobInfo implements Writable, GsonPostProcessable {
         for (BackupOlapTableInfo backupOlapTableInfo : backupOlapTableObjects.values()) {
             for (BackupPartitionInfo backupPartitionInfo : backupOlapTableInfo.partitions.values()) {
                 for (BackupIndexInfo backupIndexInfo : backupPartitionInfo.indexes.values()) {
+                    // a job info read from the edit log has the list already
+                    backupIndexInfo.sortedTabletInfoList.clear();
                     List<Long> sortedTabletIds = backupIndexInfo.getSortedTabletIds();
                     for (Long tabletId : sortedTabletIds) {
                         List<String> files = backupIndexInfo.getTabletFiles(tabletId);
@@ -409,6 +412,10 @@ public class BackupJobInfo implements Writable, GsonPostProcessable {
         public long id;
         @SerializedName("version")
         public long version;
+        // the effective state token of the partition at the backup version, see PartitionStateToken; null if it
+        // has none, or the source does not track the tokens
+        @SerializedName("stk")
+        public String stateToken;
         @SerializedName("indexes")
         public Map<String, BackupIndexInfo> indexes = Maps.newHashMap();
 
@@ -633,6 +640,10 @@ public class BackupJobInfo implements Writable, GsonPostProcessable {
                     BackupPartitionInfo partitionInfo = new BackupPartitionInfo();
                     partitionInfo.id = partition.getId();
                     partitionInfo.version = partition.getVisibleVersion();
+                    // a cluster that does not track the tokens records none (master only, the job info is logged),
+                    // nor does a backup of the metadata only: it has no data the token could name
+                    partitionInfo.stateToken = Config.restore_state_token_track && content == BackupContent.ALL
+                            ? PartitionStateToken.effective(partition) : null;
                     tableInfo.partitions.put(partition.getName(), partitionInfo);
                     // indexes
                     for (MaterializedIndex index : partition.getMaterializedIndices(IndexExtState.VISIBLE)) {

@@ -45,6 +45,7 @@ import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.OlapTable.OlapTableState;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Partition.PartitionState;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.catalog.PrimitiveType;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.ScalarType;
@@ -158,6 +159,9 @@ public class SchemaChangeJobV2Test {
         Database db = masterEnv.getInternalCatalog().getDbOrDdlException(CatalogTestUtil.testDbId1);
         OlapTable olapTable = (OlapTable) db.getTableOrDdlException(CatalogTestUtil.testTableId1);
         Partition testPartition = olapTable.getPartition(CatalogTestUtil.testPartitionId1);
+        long version = testPartition.getVisibleVersion();
+        testPartition.setStateToken(new PartitionStateToken("aaaa", version, testPartition.getVisibleVersionTime()));
+        Assert.assertEquals("aaaa", PartitionStateToken.effective(testPartition));
         schemaChangeHandler.process(alterClauses,  db, olapTable);
         Map<Long, AlterJobV2> alterJobsV2 = schemaChangeHandler.getAlterJobsV2();
         Assert.assertEquals(1, alterJobsV2.size());
@@ -219,6 +223,9 @@ public class SchemaChangeJobV2Test {
 
         schemaChangeHandler.runAfterCatalogReady();
         Assert.assertEquals(JobState.FINISHED, schemaChangeJob.getJobState());
+        // the data is rewritten in the new schema at the same version: the state token no longer names it
+        Assert.assertEquals(version, testPartition.getVisibleVersion());
+        Assert.assertNull(PartitionStateToken.effective(testPartition));
     }
 
     @Test

@@ -46,6 +46,9 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.function.Consumer;
 
@@ -162,5 +165,44 @@ public class TransactionStateTest {
             Assert.assertEquals(1, readKafkaProgress.getOffsetByPartition().size());
             Assert.assertEquals(100L, (long) readKafkaProgress.getOffsetByPartition().getOrDefault(1, -1L));
         });
+    }
+
+    @Test
+    public void testCcrNotContinuousPartitions() {
+        UUID uuid = UUID.randomUUID();
+        TransactionState transactionState = new TransactionState(1000L, Lists.newArrayList(20000L),
+                3000, "label_ccr", new TUniqueId(uuid.getMostSignificantBits(), uuid.getLeastSignificantBits()),
+                LoadJobSourceType.BACKEND_STREAMING,
+                new TxnCoordinator(TxnSourceType.BE, 0, "127.0.0.1", System.currentTimeMillis()),
+                50000L, 60 * 1000L);
+        TableCommitInfo tableCommitInfo = new TableCommitInfo(20000L);
+        // continued: adopted the token of the source
+        PartitionCommitInfo adopted = new PartitionCommitInfo(1L, "", 5, 1000L, false);
+        adopted.setStateTokens("src4", "src5");
+        // not continued: the partition had another token before the write and got a new one
+        PartitionCommitInfo fresh = new PartitionCommitInfo(2L, "", 5, 1000L, false);
+        fresh.setStateTokens("local4", "local5");
+        // tainted, or not tracked: no token
+        PartitionCommitInfo none = new PartitionCommitInfo(3L, "", 5, 1000L, false);
+        // a local write in the same transaction: no source, not told
+        PartitionCommitInfo local = new PartitionCommitInfo(4L, "", 5, 1000L, false);
+        local.setStateTokens("x4", "x5");
+        tableCommitInfo.addPartitionCommitInfo(adopted);
+        tableCommitInfo.addPartitionCommitInfo(fresh);
+        tableCommitInfo.addPartitionCommitInfo(none);
+        tableCommitInfo.addPartitionCommitInfo(local);
+        transactionState.putIdToTableCommitInfo(20000L, tableCommitInfo);
+
+        // not a CCR increment
+        Assert.assertTrue(transactionState.getCcrNotContinuousPartitionIds().isEmpty());
+
+        Map<Long, TransactionState.CcrPartitionSource> sources = Maps.newHashMap();
+        sources.put(1L, new TransactionState.CcrPartitionSource(101L, 5, "src4", "src5"));
+        sources.put(2L, new TransactionState.CcrPartitionSource(102L, 5, "src4", "src5"));
+        sources.put(3L, new TransactionState.CcrPartitionSource(103L, 5, "src4", "src5"));
+        transactionState.setCcrPartitionSources(sources);
+        List<Long> ids = transactionState.getCcrNotContinuousPartitionIds();
+        Collections.sort(ids);
+        Assert.assertEquals(Lists.newArrayList(2L, 3L), ids);
     }
 }

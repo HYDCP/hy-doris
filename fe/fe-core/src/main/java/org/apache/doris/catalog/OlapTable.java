@@ -1333,6 +1333,17 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
         return partitions;
     }
 
+    /**
+     * No partition of the table has a state token until its next write, restore or backup, see PartitionStateToken.
+     * For a change of the table that, at the same versions, changes the data of the partitions or the data an index
+     * name stands for. Called with the write lock of the table, on the master and on replay.
+     */
+    public void invalidatePartitionStateTokens() {
+        for (Partition partition : idToPartition.values()) {
+            PartitionStateToken.invalidate(partition);
+        }
+    }
+
     // get all partitions' name except the temp partitions
     public Set<String> getPartitionNames() {
         return Sets.newHashSet(nameToPartition.keySet());

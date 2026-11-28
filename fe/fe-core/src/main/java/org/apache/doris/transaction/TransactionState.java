@@ -18,9 +18,12 @@
 package org.apache.doris.transaction;
 
 import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.MaterializedIndexMeta;
 import org.apache.doris.catalog.OlapTable;
+import org.apache.doris.catalog.Partition;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.UserException;
@@ -320,6 +323,107 @@ public class TransactionState implements Writable {
     @Getter
     @Setter
     private Set<Long> involvedBackends = Sets.newHashSet();
+
+    /**
+     * The source of a partition written by a CCR increment: the state token the source partition had before and
+     * after the version applied, see PartitionStateToken. Set on the master from the commit request of ccr-syncer.
+     */
+    public static class CcrPartitionSource {
+        @SerializedName("sp")
+        public long srcPartitionId;
+        @SerializedName("sv")
+        public long srcVersion;
+        @SerializedName("ptk")
+        public String prevToken;
+        @SerializedName("tk")
+        public String token;
+
+        public CcrPartitionSource() {
+        }
+
+        public CcrPartitionSource(long srcPartitionId, long srcVersion, String prevToken, String token) {
+            this.srcPartitionId = srcPartitionId;
+            this.srcVersion = srcVersion;
+            this.prevToken = prevToken;
+            this.token = token;
+        }
+    }
+
+    // target partition id -> the CCR source of the version this transaction writes into it, null if not a CCR
+    // increment (or the master did not accept the source, see FrontendServiceImpl#commitTxnImpl)
+    @Getter
+    @Setter
+    @SerializedName(value = "ccrsrc")
+    private Map<Long, CcrPartitionSource> ccrPartitionSources;
+
+    /**
+     * The target partitions of a CCR increment that did not continue the state token of the source (see
+     * PartitionStateToken): the token of the partition before the write was not the one the source had (or the
+     * partition had none, or is tainted), so it got a new token and not the one of the source. Only meaningful once
+     * the transaction is visible: the tokens are set when it is made visible, with the lock of this object, which
+     * the caller holds. Empty if the transaction is not a CCR increment the master accepted the sources of.
+     */
+    public List<Long> getCcrNotContinuousPartitionIds() {
+        List<Long> ids = Lists.newArrayList();
+        if (ccrPartitionSources == null) {
+            return ids;
+        }
+        for (TableCommitInfo tableCommitInfo : idToTableCommitInfos.values()) {
+            for (PartitionCommitInfo info : tableCommitInfo.getIdToPartitionCommitInfo().values()) {
+                CcrPartitionSource source = ccrPartitionSources.get(info.getPartitionId());
+                if (source != null && !source.token.equals(info.getStateToken())) {
+                    ids.add(info.getPartitionId());
+                }
+            }
+        }
+        return ids;
+    }
+
+    /**
+     * The same before the transaction is visible (a commit that does not wait for the publish, or whose publish
+     * timed out), for the partitions it can be told for: the transaction writes the version next to the visible one
+     * of the partition, so no transaction before it will change the token, and the token the partition has now is
+     * the one this transaction will be checked against when it is made visible. A partition with a transaction
+     * before this one not visible yet is not told this time: the commits after it are, as a partition that did not
+     * continue its source does not continue it later either.
+     *
+     * <p>The caller holds no lock: the read lock of each table is taken here. If the transaction is made visible in
+     * between, the partition is at the version of the transaction and is not told.
+     */
+    public List<Long> getCcrNotContinuousPartitionIdsBeforeVisible(Database db) {
+        List<Long> ids = Lists.newArrayList();
+        if (ccrPartitionSources == null) {
+            return ids;
+        }
+        // not over idToTableCommitInfos: the publish removes the tables dropped after the commit from it
+        for (long tableId : tableIdList) {
+            OlapTable table = (OlapTable) db.getTableNullable(tableId);
+            TableCommitInfo tableCommitInfo = idToTableCommitInfos.get(tableId);
+            if (table == null || tableCommitInfo == null) {
+                // dropped after the commit, or not written
+                continue;
+            }
+            table.readLock();
+            try {
+                for (PartitionCommitInfo info : tableCommitInfo.getIdToPartitionCommitInfo().values()) {
+                    CcrPartitionSource source = ccrPartitionSources.get(info.getPartitionId());
+                    Partition partition = table.getPartition(info.getPartitionId());
+                    // a temporary partition gets no token, as DatabaseTransactionMgr#assignStateTokens
+                    if (source == null || partition == null || info.isTempPartition()
+                            || partition.getVisibleVersion() + 1 != info.getVersion()) {
+                        continue;
+                    }
+                    // as DatabaseTransactionMgr#assignStateTokens adopts: a tainted partition has no token
+                    if (!source.prevToken.equals(PartitionStateToken.effective(partition))) {
+                        ids.add(info.getPartitionId());
+                    }
+                }
+            } finally {
+                table.readUnlock();
+            }
+        }
+        return ids;
+    }
 
     public TransactionState() {
         this.dbId = -1;

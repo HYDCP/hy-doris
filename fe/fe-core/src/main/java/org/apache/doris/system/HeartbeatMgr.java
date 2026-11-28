@@ -19,6 +19,7 @@ package org.apache.doris.system;
 
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.FsBroker;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.common.ClientPool;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
@@ -53,6 +54,7 @@ import org.apache.doris.thrift.TPaloBrokerService;
 import org.apache.doris.thrift.TStatus;
 import org.apache.doris.thrift.TStatusCode;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -380,6 +382,16 @@ public class HeartbeatMgr extends MasterDaemon {
         }
     }
 
+    /**
+     * Whether the frontend is the master itself: the host and the edit log port. Another frontend may run on the host
+     * of the master, it answers the heartbeat for itself (its version, its ports, whether it replays the state token
+     * logs).
+     */
+    @VisibleForTesting
+    static boolean isSelf(Frontend fe, HostInfo selfNode) {
+        return fe.getHost().equals(selfNode.getHost()) && fe.getEditLogPort() == selfNode.getPort();
+    }
+
     // frontend heartbeat
     public static class FrontendHeartbeatHandler implements Callable<HeartbeatResponse> {
         private Frontend fe;
@@ -394,8 +406,7 @@ public class HeartbeatMgr extends MasterDaemon {
 
         @Override
         public HeartbeatResponse call() {
-            HostInfo selfNode = Env.getCurrentEnv().getSelfNode();
-            if (fe.getHost().equals(selfNode.getHost())) {
+            if (isSelf(fe, Env.getCurrentEnv().getSelfNode())) {
                 // heartbeat to self
                 if (Env.getCurrentEnv().isReady()) {
                     return new FrontendHbResponse(fe.getNodeName(), Config.query_port, Config.rpc_port,
@@ -403,7 +414,8 @@ public class HeartbeatMgr extends MasterDaemon {
                             System.currentTimeMillis(),
                             Version.DORIS_BUILD_VERSION + "-" + Version.DORIS_BUILD_SHORT_HASH,
                             ExecuteEnv.getInstance().getStartupTime(), ExecuteEnv.getInstance().getDiskInfos(),
-                            ExecuteEnv.getInstance().getProcessUUID());
+                            ExecuteEnv.getInstance().getProcessUUID())
+                            .setPartitionStateTokenCapability(PartitionStateToken.CAPABILITY);
                 } else {
                     return new FrontendHbResponse(fe.getNodeName(), "not ready");
                 }
@@ -426,7 +438,9 @@ public class HeartbeatMgr extends MasterDaemon {
                     return new FrontendHbResponse(fe.getNodeName(), result.getQueryPort(),
                             result.getRpcPort(), result.getArrowFlightSqlPort(), result.getReplayedJournalId(),
                             System.currentTimeMillis(), result.getVersion(), result.getLastStartupTime(),
-                            FeDiskInfo.fromThrifts(result.getDiskInfos()), result.getProcessUUID());
+                            FeDiskInfo.fromThrifts(result.getDiskInfos()), result.getProcessUUID())
+                            .setPartitionStateTokenCapability(result.isSetPartitionStateTokenCapability()
+                                    ? result.getPartitionStateTokenCapability() : 0);
                 } else {
                     return new FrontendHbResponse(fe.getNodeName(), result.getMsg());
                 }

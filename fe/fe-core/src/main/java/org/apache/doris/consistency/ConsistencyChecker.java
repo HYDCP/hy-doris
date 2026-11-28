@@ -24,6 +24,7 @@ import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
 import org.apache.doris.catalog.MetaObject;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.common.Config;
@@ -391,6 +392,10 @@ public class ConsistencyChecker extends MasterDaemon {
             tablet.setCheckedVersion(info.getCheckedVersion());
 
             tablet.setIsConsistent(info.isConsistent());
+            if (!info.isConsistent()) {
+                // as CheckConsistencyJob#tryFinishJob does
+                PartitionStateToken.taint(partition);
+            }
         } finally {
             table.writeUnlock();
         }
